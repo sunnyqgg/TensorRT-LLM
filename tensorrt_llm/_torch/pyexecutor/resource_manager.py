@@ -573,11 +573,12 @@ class KVCacheManager(BaseResourceManager):
         run_kv_cache_rellocation = False
         for request in scheduled_batch.generation_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:
-                if request.py_num_accepted_draft_tokens > 0:
+                if request.py_num_accepted_draft_tokens > 0 and len(
+                        request.py_num_accepted_draft_tokens_indices) > 0:
                     run_kv_cache_rellocation = True
         if not run_kv_cache_rellocation:
             return
-        requests = scheduled_batch.context_requests + scheduled_batch.generation_requests
+        requests = scheduled_batch.all_requests()
         accepted_draft_token_offsets, packed_accepted_draft_tokens_indices, rewind_draft_token_separate_adjustments = self.locate_accepted_draft_tokens(
             requests)
         past_key_value_lengths = attn_metadata.kv_lens_cuda
@@ -593,22 +594,14 @@ class KVCacheManager(BaseResourceManager):
         if use_paged_kv_cache:
             torch.ops.tensorrt_llm.update_kv_cache_draft_token_location(
                 accepted_draft_token_offsets,
-                packed_accepted_draft_tokens_indices,
-                past_key_value_lengths,
-                True,
-                self.num_layers,
-                self.num_kv_heads,
+                packed_accepted_draft_tokens_indices, past_key_value_lengths,
+                True, self.num_layers, self.num_kv_heads,
                 int(self.head_dim * kv_cache_dtype_byte_size),
-                self.max_draft_len,
-                self.max_attention_window_vec[0],
-                rewind_draft_token_separate_adjustments,
-                None,
+                self.max_draft_len, self.max_attention_window_vec[0],
+                rewind_draft_token_separate_adjustments, None,
                 self.kv_cache_pool_pointers,
-                attn_metadata.kv_cache_block_offsets,
-                self.max_blocks_per_seq,
-                self.tokens_per_block,
-                None,
-            )
+                attn_metadata.kv_cache_block_offsets, self.max_blocks_per_seq,
+                self.tokens_per_block, None, None)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         return self.impl.remove_sequence(request.py_request_id, request,
