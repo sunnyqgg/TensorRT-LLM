@@ -259,11 +259,6 @@ bool XqaDispatcher::isSupported()
             TLLM_LOG_WARNING("Unsupported data type combination.");
             return false;
         }
-        if (mFixedParams.isSpecDecoding)
-        {
-            TLLM_LOG_WARNING("TRTLLM-GEN does not support Speculative decoding.");
-            return false;
-        }
         if (mFixedParams.hasAlibi)
         {
             TLLM_LOG_WARNING("TRTLLM-GEN does not support ALiBi.");
@@ -486,6 +481,8 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.stream = params.stream;
         tllmRunnerParams.mSfStartTokenIdx = params.start_token_idx_sf;
+        tllmRunnerParams.is_spec_dec_tree = params.is_spec_dec_tree && params.multi_query_tokens;
+        tllmRunnerParams.layer_idx = params.layer_idx;
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }

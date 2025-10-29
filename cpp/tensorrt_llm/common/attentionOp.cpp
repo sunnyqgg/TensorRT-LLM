@@ -201,6 +201,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     // Medusa mode will have multiple query tokens.
     xqaParams.multi_query_tokens = mIsSpecDecodingEnabled && mUseSpecDecoding;
     xqaParams.is_spec_dec_tree = mIsSpecDecTree;
+    xqaParams.layer_idx = generationsParams.layer_idx;
 
     if (mKVCacheQuantMode.hasInt8KvCache())
     {
@@ -278,6 +279,9 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.spec_decoding_is_generation_length_variable
         = generationsParams.spec_decoding_is_generation_length_variable;
     xqaParams.spec_decoding_max_generation_length = generationsParams.spec_decoding_max_generation_length;
+    xqaParams.spec_decoding_bl_tree_mask_offset = generationsParams.spec_decoding_bl_tree_mask_offset;
+    xqaParams.spec_decoding_bl_tree_mask = generationsParams.spec_decoding_bl_tree_mask;
+    xqaParams.spec_bl_tree_first_sparse_mask_offset_kv = generationsParams.spec_bl_tree_first_sparse_mask_offset_kv;
     xqaParams.mrope_position_deltas = generationsParams.mrope_position_deltas;
 
     xqaParams.logn_scaling_ptr = generationsParams.logn_scaling_ptr;
@@ -1100,6 +1104,11 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.stream = stream;
         tllmRunnerParams.mSfStartTokenIdx = generation_params.start_token_idx_sf;
+
+        tllmRunnerParams.generalPackedCustoMaskPtr = generation_params.spec_decoding_packed_mask;
+        tllmRunnerParams.customMaskPtr = generation_params.spec_decoding_bl_tree_mask;
+        tllmRunnerParams.customMaskOffsetsPtr = generation_params.spec_decoding_bl_tree_mask_offset;
+        tllmRunnerParams.firstSparseMaskOffsetsKvPtr = generation_params.spec_bl_tree_first_sparse_mask_offset_kv;
 
         // Scales for quantization
         if (mFP8GenerationMLA)

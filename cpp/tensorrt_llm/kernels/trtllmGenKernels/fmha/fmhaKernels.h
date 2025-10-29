@@ -29,6 +29,7 @@
 #include "fmhaReduction.h"
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
+#include "prepareCustomMask.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
 namespace tc = tensorrt_llm::common;
@@ -207,7 +208,10 @@ public:
 
             // Prepare the kernel parameters.
             auto kernelParams = KernelParams::setKernelParams(params, kernelMeta, maxNumCtasQ, maxNumCtasKv);
-
+            if (params.layer_idx == 0 && params.is_spec_dec_tree)
+            {
+                runPrepareCustomMask(kernelMeta, params, params.stream);
+            }
             // Prepare kernel parameters list for cuLaunchKernelEx.
             void* kernelParamsList[] = {&kernelParams};
             CUlaunchConfig launch_config;
