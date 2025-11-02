@@ -201,6 +201,7 @@ protected:
         std::vector<int32_t> seqLensKv(batchSize);
         std::vector<int32_t> firstSparseMaskOffsetsKv(batchSize);
         std::vector<int32_t> cumSeqLensQ(batchSize + 1, 0);
+        std::vector<int32_t> specDecodingGenerationLengths(batchSize);
 
         // Generate a uniform seqLenQ for all batches
         int32_t uniformSeqLenQ = seqLenQDist(gen);
@@ -211,6 +212,7 @@ protected:
             seqLensKv[i] = seqLenKvDist(gen);
             firstSparseMaskOffsetsKv[i] = seqLensKv[i] - seqLensQ[i];
             cumSeqLensQ[i + 1] = cumSeqLensQ[i] + seqLensQ[i];
+            specDecodingGenerationLengths[i] = seqLensQ[i];
         }
 
         // Generate random tree mask input
@@ -263,6 +265,8 @@ protected:
         auto seqLensQDevice = mBufferManager->copyFrom(seqLensQ, MemoryType::kGPU);
         auto seqLensKvDevice = mBufferManager->copyFrom(seqLensKv, MemoryType::kGPU);
         auto cumSeqLensQDevice = mBufferManager->copyFrom(cumSeqLensQ, MemoryType::kGPU);
+        auto specDecodingGenerationLengthsDevice
+            = mBufferManager->copyFrom(specDecodingGenerationLengths, MemoryType::kGPU);
         auto firstSparseMaskOffsetsKvDevice = mBufferManager->copyFrom(firstSparseMaskOffsetsKv, MemoryType::kGPU);
         auto inputPackedMaskDevice = mBufferManager->copyFrom(inputPackedMaskHost, MemoryType::kGPU);
 
@@ -308,6 +312,7 @@ protected:
         runnerParams.mMaxSeqLenKv = *std::max_element(seqLensKv.begin(), seqLensKv.end());
         runnerParams.seqLensKvPtr = bufferCast<int32_t>(*seqLensKvDevice);
         runnerParams.cumSeqLensQPtr = bufferCast<int32_t>(*cumSeqLensQDevice);
+        runnerParams.spec_decoding_generation_lengths = bufferCast<int32_t>(*specDecodingGenerationLengthsDevice);
         runnerParams.firstSparseMaskOffsetsKvPtr = bufferCast<int32_t>(*firstSparseMaskOffsetsKvDevice);
         runnerParams.generalPackedCustoMaskPtr = bufferCast<int32_t>(*inputPackedMaskDevice);
         runnerParams.customMaskOffsetsPtr = bufferCast<int64_t>(*customMaskOffsetsDevice);

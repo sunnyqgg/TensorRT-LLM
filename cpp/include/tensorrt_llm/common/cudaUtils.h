@@ -1415,3 +1415,44 @@ DEFINE_MEMBER_CHECKER(high_preciecion_normed_output)
     {                                                                                                                  \
         tensorrt_llm::common::checkEx((stat), {cudaSuccess, cudaErrorCudartUnloading}, #stat, __FILE__, __LINE__);     \
     } while (0)
+
+// #define check_cuda_error(val) TLLM_CUDA_CHECK(val)
+
+template <typename T>
+void printAbsMean(T const* buf, uint64_t size, cudaStream_t stream, std::string name = "")
+{
+    if (buf == nullptr)
+    {
+        TLLM_LOG_WARNING("%s is an nullptr, skip!", name.c_str());
+        return;
+    }
+    cudaDeviceSynchronize();
+    // check_cuda_error(cudaGetLastError());
+    T* h_tmp = new T[size];
+    cudaMemcpyAsync(h_tmp, buf, sizeof(T) * size, cudaMemcpyDeviceToHost, stream);
+    cudaDeviceSynchronize();
+    // check_cuda_error(cudaGetLastError());
+    double sum = 0.0f;
+    uint64_t zero_count = 0;
+    float max_val = -1e10;
+    bool find_inf = false;
+    for (uint64_t i = 0; i < size; i++)
+    {
+        if (std::isinf((float) (h_tmp[i])))
+        {
+            find_inf = true;
+            continue;
+        }
+        sum += abs((double) h_tmp[i]);
+        if ((float) h_tmp[i] == 0.0f)
+        {
+            zero_count++;
+        }
+        max_val = max_val > abs(float(h_tmp[i])) ? max_val : abs(float(h_tmp[i]));
+    }
+    TLLM_LOG_INFO("%20s size: %u, abs mean: %f, abs sum: %f, abs max: %f, find inf: %s", name.c_str(), size, sum / size,
+        sum, max_val, find_inf ? "true" : "false");
+    delete[] h_tmp;
+    cudaDeviceSynchronize();
+    // check_cuda_error(cudaGetLastError());
+}

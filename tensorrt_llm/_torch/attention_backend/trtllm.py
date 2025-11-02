@@ -1090,10 +1090,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         )
         max_kv_len = self.kv_lens[:self.num_seqs].max()
         self.spec_bl_tree_first_sparse_mask_offset_kv = (
-            self.kv_lens_cuda_runtime[:self.num_seqs] -
+            self.kv_lens_cuda[:self.num_seqs] -
             self._seq_lens_cuda[:self.num_seqs]).to(torch.int32)
         min_first_sparse_mask_offset_kv = self.spec_bl_tree_first_sparse_mask_offset_kv.min(
         )
+        # tile_size_kv * tile_size_q * num_instances_q * num_instances_kv is the largest value that is used in the trtllm-gen kernels
         tile_size_kv = 128
         tile_size_q = 128
         # num_instances_q * num_instances_kv <= 2
@@ -1103,8 +1104,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         tile_size_q_per_cta = tile_size_q * num_instances_q
         max_num_custom_mask_tiles_kv = self.compute_max_num_custom_mask_tiles_kv_upper_bound(
             max_kv_len, min_first_sparse_mask_offset_kv, tile_size_kv_per_cta)
+        self.num_heads_per_kv = 4
         max_num_tiles_q = math.ceil(
-            (self.seq_lens[:self.num_seqs].max() * self.num_heads) /
+            (self.seq_lens[:self.num_seqs].max() * self.num_heads_per_kv) /
             tile_size_q_per_cta)
         self.spec_decoding_bl_tree_mask = torch.zeros(
             [
@@ -1114,6 +1116,24 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             ],
             dtype=torch.uint32,
             device='cuda',
+        )
+        print(
+            f"====gqq self.spec_decoding_bl_tree_mask shape: {self.spec_decoding_bl_tree_mask.shape}"
+        )
+        print(
+            f"====gqq self.spec_decoding_bl_tree_mask: {self.spec_decoding_bl_tree_mask}"
+        )
+        print(
+            f"====gqq self.spec_bl_tree_first_sparse_mask_offset_kv shape: {self.spec_bl_tree_first_sparse_mask_offset_kv.shape}"
+        )
+        print(
+            f"====gqq self.spec_bl_tree_first_sparse_mask_offset_kv: {self.spec_bl_tree_first_sparse_mask_offset_kv}"
+        )
+        print(
+            f"====gqq self.spec_decoding_bl_tree_mask_offset shape: {self.spec_decoding_bl_tree_mask_offset.shape}"
+        )
+        print(
+            f"====gqq self.spec_decoding_bl_tree_mask_offset: {self.spec_decoding_bl_tree_mask_offset}"
         )
 
     def update_spec_dec_param(
@@ -1138,6 +1158,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if get_sm_version(
         ) >= 100 and not is_spec_dec_tree and not is_spec_dec_dynamic_tree:
             self.is_spec_decoding_enabled = False
+        # self.is_spec_decoding_enabled = False # TODO: remove this after testing
 
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
         self.use_spec_decoding = self.is_spec_decoding_enabled

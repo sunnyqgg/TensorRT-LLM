@@ -16,6 +16,7 @@
 
 #include "fmhaRunnerParams.h"
 #include "prepareCustomMask.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include <cstdint>
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
@@ -32,7 +33,7 @@ __device__ __host__ inline int32_t ceilDiv(int32_t a, int32_t b)
 }
 
 __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
-    TllmGenFmhaRunnerParams const& runnerParams, TllmGenFmhaKernelMetaInfo const& kernelMeta)
+    TllmGenFmhaRunnerParams runnerParams, TllmGenFmhaKernelMetaInfo kernelMeta)
 {
     int32_t batchSize = runnerParams.mBatchSize;
     int32_t numHeadsQPerKv = runnerParams.mNumHeadsQPerKv;
@@ -46,7 +47,7 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
     int32_t tileSizeQPerCta = tileSizeQ * numInstsQ;
     int32_t tileSizeKvPerCta = tileSizeKvPadded * numInstsKv;
     int32_t const* seqLensKvPtr = runnerParams.seqLensKvPtr;
-    int32_t const* cumSeqLensQPtr = runnerParams.cumSeqLensQPtr;
+    // int32_t const* cumSeqLensQPtr = runnerParams.cumSeqLensQPtr;
     int64_t* customMaskOffsetsPtr = runnerParams.customMaskOffsetsPtr;
     uint32_t* customMaskPtr = runnerParams.customMaskPtr;
     int32_t const* customMaskInputPtr = runnerParams.generalPackedCustoMaskPtr;
@@ -59,7 +60,8 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
     if (batchIdx >= batchSize)
         return;
 
-    int32_t seqLenQ = cumSeqLensQPtr[batchIdx + 1] - cumSeqLensQPtr[batchIdx];
+    // int32_t seqLenQ = cumSeqLensQPtr[batchIdx + 1] - cumSeqLensQPtr[batchIdx];
+    int32_t seqLenQ = runnerParams.spec_decoding_generation_lengths[batchIdx];
     int32_t seqLenKv = seqLensKvPtr[batchIdx];
     int32_t totalQTokens = seqLenQ * numHeadsQPerKv;
 
@@ -120,8 +122,8 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
     }
 }
 
-__global__ void computeCustomMaskOffsetsKernel(TllmGenFmhaKernelMetaInfo const& kernelMeta,
-    TllmGenFmhaRunnerParams const& runnerParams, unsigned long long* globalCounter)
+__global__ void computeCustomMaskOffsetsKernel(
+    TllmGenFmhaKernelMetaInfo kernelMeta, TllmGenFmhaRunnerParams runnerParams, unsigned long long* globalCounter)
 {
     int32_t batchSize = runnerParams.mBatchSize;
     int32_t numHeadsQPerKv = runnerParams.mNumHeadsQPerKv;
@@ -134,7 +136,7 @@ __global__ void computeCustomMaskOffsetsKernel(TllmGenFmhaKernelMetaInfo const& 
     int32_t tileSizeQPerCta = tileSizeQ * numInstsQ;
     int32_t tileSizeKvPerCta = tileSizeKvPadded * numInstsKv;
     int32_t const* seqLensKvPtr = runnerParams.seqLensKvPtr;
-    int32_t const* cumSeqLensQPtr = runnerParams.cumSeqLensQPtr;
+    // int32_t const* cumSeqLensQPtr = runnerParams.cumSeqLensQPtr;
     int32_t const* firstSparseMaskOffsetsKvPtr = runnerParams.firstSparseMaskOffsetsKvPtr;
 
     typedef cub::BlockScan<int64_t, 256> BlockScan;
@@ -143,11 +145,26 @@ __global__ void computeCustomMaskOffsetsKernel(TllmGenFmhaKernelMetaInfo const& 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int64_t maskSize = 0;
 
+    if (idx == 0)
+    {
+        printf(
+            "batchSize: %d, seqLensKvPtr: %p, firstSparseMaskOffsetsKvPtr: %p, spec_decoding_generation_lengths: %p, "
+            "customMaskOffsetsPtr: %p\n",
+            batchSize, seqLensKvPtr, firstSparseMaskOffsetsKvPtr, runnerParams.spec_decoding_generation_lengths,
+            runnerParams.customMaskOffsetsPtr);
+    }
+
     if (idx < batchSize)
     {
-        int32_t seqLenQ = cumSeqLensQPtr[idx + 1] - cumSeqLensQPtr[idx];
+        // int32_t seqLenQ = cumSeqLensQPtr[idx + 1] - cumSeqLensQPtr[idx];
+        int32_t seqLenQ = runnerParams.spec_decoding_generation_lengths[idx];
         int32_t seqLenKv = seqLensKvPtr[idx];
         int32_t firstSparseMaskOffsetKv = firstSparseMaskOffsetsKvPtr[idx];
+        if (idx == 0)
+        {
+            printf(
+                "seqLenQ: %d, seqLenKv: %d, firstSparseMaskOffsetKv: %d\n", seqLenQ, seqLenKv, firstSparseMaskOffsetKv);
+        }
 
         int32_t numTilesQ = (seqLenQ * numHeadsQPerKv + tileSizeQPerCta - 1) / tileSizeQPerCta;
         int32_t firstSparseTile = firstSparseMaskOffsetKv / tileSizeKvPerCta;
@@ -168,6 +185,10 @@ __global__ void computeCustomMaskOffsetsKernel(TllmGenFmhaKernelMetaInfo const& 
 
     if (idx < batchSize)
         runnerParams.customMaskOffsetsPtr[idx] = static_cast<int64_t>(blockBase) + prefixOffset;
+    if (idx == 0)
+    {
+        printf("runnerParams.customMaskOffsetsPtr[idx]: %lld\n", runnerParams.customMaskOffsetsPtr[idx]);
+    }
 }
 
 void launchComputeCustomMaskOffsetsKernel(
@@ -210,13 +231,31 @@ void launchPrepareCustomMaskBuffersKernelForKeepsMmaAb(
 void runPrepareCustomMask(
     TllmGenFmhaKernelMetaInfo const& kernelMeta, TllmGenFmhaRunnerParams const& runnerParams, cudaStream_t stream)
 {
-    if (isKeepsMmaAbForGenerationKernel(runnerParams.mKernelType))
+    if (isKeepsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType)))
     {
         // Step 1: Compute offsets on GPU using prefix sum
         launchComputeCustomMaskOffsetsKernel(kernelMeta, runnerParams, stream);
         // Step 2: Compute custom mask buffers
         launchPrepareCustomMaskBuffersKernelForKeepsMmaAb(runnerParams, kernelMeta, stream);
         TLLM_CUDA_CHECK(cudaGetLastError());
+        printAbsMean(runnerParams.customMaskOffsetsPtr, 1, stream,
+            "====gqq runnerParams.customMaskOffsetsPtr at after runPrepareCustomMask ===");
+        printAbsMean(runnerParams.firstSparseMaskOffsetsKvPtr, 1, stream,
+            "====gqq runnerParams.firstSparseMaskOffsetsKvPtr at after runPrepareCustomMask ===");
+        printAbsMean(runnerParams.seqLensKvPtr, 1, stream,
+            "====gqq runnerParams.seqLensKvPtr at after runPrepareCustomMask ===");
+        printAbsMean(runnerParams.spec_decoding_generation_lengths, 1, stream,
+            "====gqq runnerParams.spec_decoding_generation_lengths at after runPrepareCustomMask ===");
+        for (int i = 0; i < 10; i++)
+        {
+            printAbsMean(runnerParams.customMaskPtr + i, 1, stream,
+                "====gqq runnerParams.customMaskPtr at after runPrepareCustomMask ===");
+        }
+        for (int i = 0; i < 10; i++)
+        {
+            printAbsMean(runnerParams.generalPackedCustoMaskPtr + i, 1, stream,
+                "====gqq runnerParams.generalPackedCustoMaskPtr at after runPrepareCustomMask ===");
+        }
     }
     else
     {

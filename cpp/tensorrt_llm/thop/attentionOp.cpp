@@ -403,6 +403,7 @@ public:
 
         if (is_context) // context stage
         {
+            printf("=====context stage=====\n");
             common_enqueue_params.input_seq_length = max_context_q_len;
             AttentionOp::EnqueueContextParams<T> enqueue_params{common_enqueue_params};
             enqueue_params.host_block_offsets = host_block_offsets;
@@ -425,6 +426,7 @@ public:
         }
         else // generation stage
         {
+            printf("=====generation stage=====\n");
             int32_t const batch_beam = num_seqs;
             TLLM_CHECK(batch_beam % beam_width == 0);
             int32_t const num_requests = batch_beam / beam_width;
@@ -434,6 +436,11 @@ public:
             int32_t const input_seq_length = num_tokens / num_seqs;
 
             common_enqueue_params.input_seq_length = input_seq_length;
+            printf("====== attentionOp.cpp: in generation stage, input_seq_length: %d\n", input_seq_length);
+            printAbsMean(
+                common_enqueue_params.sequence_lengths, 1, stream, "====gqq sequence_lengths at enqueueGeneration ===");
+            printAbsMean(
+                common_enqueue_params.context_lengths, 1, stream, "====gqq context_lengths at enqueueGeneration ===");
             AttentionOp::EnqueueGenerationParams<T> enqueue_params{common_enqueue_params};
             enqueue_params.layer_idx = op.mLayerIdx;
             enqueue_params.beam_width = beam_width;
@@ -470,6 +477,7 @@ public:
                         "Expecting spec_decoding_bl_tree_mask spec-dec mode.");
                     TORCH_CHECK(spec_decoding_tensor_params[5].has_value(),
                         "Expecting spec_bl_tree_first_sparse_mask_offset_kv spec-dec mode.");
+                    printf("========spec_decoding 6 inputs=====\n");
                     enqueue_params.spec_decoding_bl_tree_mask_offset
                         = spec_decoding_tensor_params[3].value().data_ptr<int64_t>();
                     enqueue_params.spec_decoding_bl_tree_mask

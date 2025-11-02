@@ -16,6 +16,7 @@
  */
 #include "attentionOp.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -1104,11 +1105,6 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.stream = stream;
         tllmRunnerParams.mSfStartTokenIdx = generation_params.start_token_idx_sf;
-
-        tllmRunnerParams.generalPackedCustoMaskPtr = generation_params.spec_decoding_packed_mask;
-        tllmRunnerParams.customMaskPtr = generation_params.spec_decoding_bl_tree_mask;
-        tllmRunnerParams.customMaskOffsetsPtr = generation_params.spec_decoding_bl_tree_mask_offset;
-        tllmRunnerParams.firstSparseMaskOffsetsKvPtr = generation_params.spec_bl_tree_first_sparse_mask_offset_kv;
 
         // Scales for quantization
         if (mFP8GenerationMLA)
@@ -2279,6 +2275,8 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         // self attn
         XQAParams xqaParams{};
         this->template convertMMHAParamsToXQAParams<T, KVCacheBuffer>(xqaParams, params, /*forConfigurePlugin=*/false);
+        printf("========mEnableXQA: %d and mXqaDispatcher->shouldUse(xqaParams): %d\n", mEnableXQA,
+            mXqaDispatcher->shouldUse(xqaParams));
         if (mEnableXQA && mXqaDispatcher->shouldUse(xqaParams))
         {
             TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
@@ -2887,7 +2885,7 @@ int AttentionOp::initialize() noexcept
         {
             fixedParams.outputDataType = DATA_TYPE_E4M3;
         }
-        if (mIsSpecDecodingEnabled)
+        if (mIsSpecDecodingEnabled && !mUseTllmGen)
         {
             fixedParams.outputDataType = DATA_TYPE_E4M3;
             TLLM_CHECK_WITH_INFO(mNumHeads % mNumKVHeads == 0, "mNumHeads should be multiples of mNumKVHeads.");

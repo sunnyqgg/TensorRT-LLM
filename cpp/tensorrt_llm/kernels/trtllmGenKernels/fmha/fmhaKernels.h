@@ -210,6 +210,7 @@ public:
             auto kernelParams = KernelParams::setKernelParams(params, kernelMeta, maxNumCtasQ, maxNumCtasKv);
             if (params.layer_idx == 0 && params.is_spec_dec_tree)
             {
+                printf("==================runPrepareCustomMask==========and params.is_spec_dec_tree is true========\n");
                 runPrepareCustomMask(kernelMeta, params, params.stream);
             }
             // Prepare kernel parameters list for cuLaunchKernelEx.
@@ -473,6 +474,8 @@ private:
     {
         // The updated kernel type.
         FmhaKernelType& kernelType = selectKernelParams.mKernelType;
+        printf("========params.mKernelType: %d and params.mNumHeadsQPerKv is %d\n", params.mKernelType,
+            params.mNumHeadsQPerKv);
         // Generation kernelType will use either SwapsMmaAbForGeneration or KeepsMmaAbForGeneration.
         if (isGenerationKernel(params.mKernelType) && isMlaGenKernel(params))
         {
@@ -507,9 +510,26 @@ private:
         }
         else if (isGenerationKernel(params.mKernelType))
         {
-            kernelType = (params.mNumHeadsQPerKv <= 16 && params.mHeadDimQk != 32)
-                ? FmhaKernelType::SwapsMmaAbForGeneration
-                : FmhaKernelType::KeepsMmaAbForGeneration;
+            if (params.is_spec_dec_tree)
+            {
+
+                if (params.mNumHeadsQPerKv <= 16 && (params.mHeadDimQk == 64 || params.mHeadDimQk == 128))
+                {
+                    printf("======11111=====\n");
+                    kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+                }
+                else
+                {
+                    printf("======22222=====\n");
+                    kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+                }
+            }
+            else
+            {
+                kernelType = (params.mNumHeadsQPerKv <= 16 && params.mHeadDimQk != 32)
+                    ? FmhaKernelType::SwapsMmaAbForGeneration
+                    : FmhaKernelType::KeepsMmaAbForGeneration;
+            }
         }
 
         // The maximum number of headsQPerKv that the kernel can support in one Cta.
@@ -527,6 +547,10 @@ private:
         {
             // Use the maxNumHeadsQPerKvInCta (tileSizeQ) = 64 for MLA high-throughput generation kernels.
             maxNumHeadsQPerKvInCta = isMlaGenKernel(params) ? 64 : 32;
+            if (params.is_spec_dec_tree)
+            {
+                maxNumHeadsQPerKvInCta = 128;
+            }
             TLLM_CHECK_WITH_INFO((params.mNumHeadsQPerKv < maxNumHeadsQPerKvInCta
                                      || params.mNumHeadsQPerKv % maxNumHeadsQPerKvInCta == 0),
                 "Not supported");
@@ -551,6 +575,10 @@ private:
         }
         // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
         int numTokensPerPage = (!isPagedKv(params.mQkvLayout)) ? 0 : params.mNumTokensPerPage;
+        printf(
+            "========kernelType: %d and selectKernelParams.mMaskType is %d and params.mHeadDimQk is %d and "
+            "params.mHeadDimV is %d\n",
+            kernelType, selectKernelParams.mMaskType, params.mHeadDimQk, params.mHeadDimV);
 
         // Debug info.
         std::string info = "dtypeQ=" + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeKv="

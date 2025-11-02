@@ -895,7 +895,9 @@ class PyTorchModelEngine(ModelEngine):
                 enable_context_mla_with_cached_kv=
                 enable_context_mla_with_cached_kv,
                 cache_indirection=cache_indirection,
-                sparse_attention_config=self.sparse_attention_config)
+                sparse_attention_config=self.sparse_attention_config,
+                num_heads_per_kv=self.model.model_config.num_attention_heads //
+                self.model.model_config.num_kv_heads)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -913,7 +915,9 @@ class PyTorchModelEngine(ModelEngine):
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             cache_indirection=cache_indirection,
-            sparse_attention_config=self.sparse_attention_config)
+            sparse_attention_config=self.sparse_attention_config,
+        )
+        #num_heads_per_kv=self.model.model_config.num_attention_heads // self.model.model_config.num_kv_heads
 
         return self.attn_metadata
 

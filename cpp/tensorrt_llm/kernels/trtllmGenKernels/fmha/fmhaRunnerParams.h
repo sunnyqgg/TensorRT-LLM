@@ -242,6 +242,8 @@ struct TllmGenFmhaRunnerParams
     void* oPtr;
     // The output scaling factor buffer.
     void* oSfPtr;
+    // The spec-decoding generation lengths.
+    int const* spec_decoding_generation_lengths;
 
     // Head dimension for Q and K.
     int mHeadDimQk;

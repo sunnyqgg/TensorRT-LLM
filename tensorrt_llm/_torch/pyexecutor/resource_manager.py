@@ -601,7 +601,7 @@ class KVCacheManager(BaseResourceManager):
                 rewind_draft_token_separate_adjustments, None,
                 self.kv_cache_pool_pointers,
                 attn_metadata.kv_cache_block_offsets, self.max_blocks_per_seq,
-                self.tokens_per_block, None, None)
+                self.tokens_per_block, None)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         return self.impl.remove_sequence(request.py_request_id, request,

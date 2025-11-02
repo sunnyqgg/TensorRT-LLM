@@ -9,7 +9,7 @@ from parameterized import parameterized
 from transformers import LlamaConfig
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 from utils.llm_data import llm_models_root
-from utils.util import default_dtype, getSMVersion, skip_blackwell
+from utils.util import default_dtype, getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -379,7 +379,6 @@ class TestLlama(unittest.TestCase):
             graph_runner.clear()
         kv_cache_manager.shutdown()
 
-    @skip_blackwell
     @torch.no_grad()
     def test_llama_verification_with_kv_cache_relocation(self) -> None:
         """
@@ -409,8 +408,8 @@ class TestLlama(unittest.TestCase):
 
             llama = LlamaForCausalLM(model_config).to(dtype).to(device)
             llama.load_weights(hf_llama.state_dict())
-        num_blocks = 1
-        tokens_per_block = 128
+        num_blocks = 100
+        tokens_per_block = 32
         head_dim = llama.config.hidden_size // llama.config.num_attention_heads
         num_layers = llama.config.num_hidden_layers
         num_kv_heads = llama.config.num_key_value_heads
@@ -555,6 +554,7 @@ class TestLlama(unittest.TestCase):
         gen_position_ids_0 = torch.cat(gen_position_ids_0).unsqueeze(0).cuda()
 
         with torch.inference_mode():
+            # breakpoint()
             gen_logits_0 = run_forward(input_ids=gen_input_ids_0,
                                        position_ids=gen_position_ids_0,
                                        attn_metadata=attn_metadata_gen_phase_0)
