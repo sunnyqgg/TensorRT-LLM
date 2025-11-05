@@ -273,7 +273,7 @@ public:
         KVBlockArray::DataType* block_offsets
             = static_cast<KVBlockArray::DataType*>(op.useKVCache() && kv_cache_block_offsets.has_value()
                     ? kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
-                    : nullptr);
+                    : nullptr); // 当前layer的block_offsets
         KVBlockArray::DataType* host_block_offsets
             = static_cast<KVBlockArray::DataType*>(op.useKVCache() && host_kv_cache_block_offsets.has_value()
                     ? host_kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()

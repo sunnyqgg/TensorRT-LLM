@@ -2166,6 +2166,19 @@ template int AttentionOp::enqueueContext<__nv_bfloat16, KVBlockArray>(
 template <typename T, typename KVCacheBuffer>
 int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cudaStream_t stream)
 {
+    // 添加类型检测代码
+    if (std::is_same_v<T, half>)
+    {
+        printf("cpp/tensorrt_llm/common/attentionOp.cpp: enqueueGeneration: Type T is half (FP16)\n");
+    }
+    else if (std::is_same_v<T, float>)
+    {
+        printf("cpp/tensorrt_llm/common/attentionOp.cpp: enqueueGeneration: Type T is float (FP32)\n");
+    }
+    else if (std::is_same_v<T, __nv_bfloat16>)
+    {
+        printf("cpp/tensorrt_llm/common/attentionOp.cpp: enqueueGeneration: Type T is __nv_bfloat16 (BF16)\n");
+    }
     int const headSize = getHeadSize();
     float const q_scaling = mQScaling;
     float const* logn_scaling_ptr = isLognScaling() ? params.logn_scaling_ptr : nullptr;
@@ -2890,6 +2903,10 @@ int AttentionOp::initialize() noexcept
             fixedParams.outputDataType = DATA_TYPE_E4M3;
             TLLM_CHECK_WITH_INFO(mNumHeads % mNumKVHeads == 0, "mNumHeads should be multiples of mNumKVHeads.");
         }
+        printf(
+            "==== cpp/tensorrt_llm/common/attentionOp.cpp fixedParams.outputDataType: %d and fixedParams.kvDataType is "
+            "%d\n",
+            fixedParams.outputDataType, fixedParams.kvDataType);
         fixedParams.numQHeads = mNumAttnHeads;
         fixedParams.numKvHeads = mNumAttnKVHeads;
         fixedParams.numTokensPerBlock = mTokensPerBlock;

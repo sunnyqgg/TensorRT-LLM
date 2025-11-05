@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include <algorithm>
 #include <cassert>
@@ -1456,3 +1457,121 @@ void printAbsMean(T const* buf, uint64_t size, cudaStream_t stream, std::string 
     cudaDeviceSynchronize();
     // check_cuda_error(cudaGetLastError());
 }
+
+inline void _checkCuda(cudaError_t result, char const* const func, char const* const file, int const line)
+{
+    if (result)
+    {
+        throw std::runtime_error(
+            tensorrt_llm::common::fmtstr("CUDA runtime error in %s: %s", func, cudaGetErrorString(result)));
+    }
+}
+
+/*
+ * Macros compliant with TensorRT coding conventions
+ */
+#define CUDA_CHECK(stat)                                                                                               \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        _checkCuda((stat), #stat, __FILE__, __LINE__);                                                                 \
+    } while (0)
+
+class DumpTool
+{
+public:
+    DumpTool(char const* file = nullptr)
+    {
+        if (file)
+        {
+            open(file);
+        }
+    }
+
+    virtual ~DumpTool()
+    {
+        close();
+    }
+
+    void close()
+    {
+        if (handle_)
+        {
+            fclose(handle_);
+            handle_ = nullptr;
+        }
+    }
+
+    bool open(char const* file)
+    {
+        close();
+        file_ = file;
+        handle_ = fopen(file, "wb");
+        if (handle_ == nullptr)
+        {
+            printf("Failed to open: %s\n", file);
+            return false;
+        }
+        printf("Open file: %s\n", file);
+        return true;
+    }
+
+    bool write(void const* ptr, size_t size, bool cuda = true)
+    {
+
+        if (handle_ == nullptr)
+        {
+            printf("No file has been opened.\n");
+            return false;
+        }
+
+        char* host = nullptr;
+        if (cuda)
+        {
+            host = (char*) malloc(size);
+            // CUDA_CHECK(cudaMallocHost(&host, size));
+            CUDA_CHECK(cudaMemcpy(host, ptr, size, cudaMemcpyDeviceToHost));
+        }
+        else
+        {
+            host = (char*) ptr;
+        }
+
+        bool ok = size == fwrite(host, 1, size, handle_);
+        if (!ok)
+        {
+            printf("Failed to write %d bytes to file.\n", size);
+        }
+        else
+        {
+            printf("Write %d bytes from %s\n", size, cuda ? "cuda" : "host");
+        }
+
+        if (cuda)
+        {
+            // CUDA_CHECK(cudaFreeHost(host));
+            free(host);
+        }
+        return ok;
+    }
+
+    template <typename T>
+    DumpTool& operator<<(T const& value)
+    {
+        write_host(&value, sizeof(T));
+        return *this;
+    }
+
+    bool write_cuda(void const* ptr, size_t size)
+    {
+        return this->write(ptr, size, true);
+    }
+
+    bool write_host(void const* ptr, size_t size)
+    {
+        return this->write(ptr, size, false);
+    }
+
+private:
+    std::string file_;
+    FILE* handle_ = nullptr;
+};

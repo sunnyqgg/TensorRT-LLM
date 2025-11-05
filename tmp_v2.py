@@ -131,7 +131,7 @@ def test_llama_verification_with_kv_cache_relocation():
 
         hf_llama = HFLlamaForCausalLM.from_pretrained(
             model_dir,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float16,
             device_map="cuda",
         ).eval()
 
@@ -249,17 +249,33 @@ def test_llama_verification_with_kv_cache_relocation():
 
     print(f"生成 token 数: {gen_input_ids_0.size(-1)}")
 
+    # spec_decoding_position_offsets = torch.tensor([
+    #     0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    #     3
+    # ],
+    #                                               dtype=torch.int,
+    #                                               device=device)
+    # spec_decoding_packed_mask = torch.tensor(
+    #     [
+    #         1, 3, 5, 9, 17, 33, 65, 129, 257, 513, 1025, 2051, 4099, 8195,
+    #         16387, 32771, 65541, 131077, 262153, 524297, 1048593, 2097169,
+    #         4194321, 8388641, 16842757
+    #     ],
+    #     dtype=torch.int,
+    #     device=device).unsqueeze(0).unsqueeze(2)
+
     spec_decoding_position_offsets = torch.tensor([
-        0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-        3
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0
     ],
                                                   dtype=torch.int,
                                                   device=device)
     spec_decoding_packed_mask = torch.tensor(
         [
-            1, 3, 5, 9, 17, 33, 65, 129, 257, 513, 1025, 2051, 4099, 8195,
-            16387, 32771, 65541, 131077, 262153, 524297, 1048593, 2097169,
-            4194321, 8388641, 16842757
+            33554431, 33554431, 33554431, 33554431, 33554431, 33554431,
+            33554431, 33554431, 33554431, 33554431, 33554431, 33554431,
+            33554431, 33554431, 33554431, 33554431, 33554431, 33554431,
+            33554431, 33554431, 33554431, 33554431, 33554431, 33554431, 33554431
         ],
         dtype=torch.int,
         device=device).unsqueeze(0).unsqueeze(2)

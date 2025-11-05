@@ -1089,6 +1089,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cuda',
         )
         max_kv_len = self.kv_lens[:self.num_seqs].max()
+        assert self.kv_lens_cuda[:self.
+                                 num_seqs] >= self._seq_lens_cuda[:self.
+                                                                  num_seqs], "kv_lens should be greater than seq_lens,please run prepare() first"
         self.spec_bl_tree_first_sparse_mask_offset_kv = (
             self.kv_lens_cuda[:self.num_seqs] -
             self._seq_lens_cuda[:self.num_seqs]).to(torch.int32)
@@ -1108,12 +1111,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         max_num_tiles_q = math.ceil(
             (self.seq_lens[:self.num_seqs].max() * self.num_heads_per_kv) /
             tile_size_q_per_cta)
+        mask_size = int(self.max_num_requests * max_num_tiles_q *
+                        max_num_custom_mask_tiles_kv * num_instances_q *
+                        num_instances_kv * tile_size_q * tile_size_kv / 32)
         self.spec_decoding_bl_tree_mask = torch.zeros(
-            [
-                self.max_num_requests * max_num_tiles_q *
-                max_num_custom_mask_tiles_kv * num_instances_q *
-                num_instances_kv * tile_size_q * tile_size_kv
-            ],
+            mask_size,
             dtype=torch.uint32,
             device='cuda',
         )

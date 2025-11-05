@@ -470,18 +470,19 @@ void XqaDispatcher::runImpl(
         // xqaDispatcher::runImpl ===");
 
         printAbsMean(launchParams.cu_kv_seq_lens, 1, params.stream,
-            "====gqq launchParams.cu_kv_seq_lens at xqaDispatcher::runImpl ===");
+            "====gqq xqaDispatcher.cpp runImpl(): launchParams.cu_kv_seq_lens at xqaDispatcher::runImpl ===");
         printAbsMean(launchParams.cu_kv_seq_lens + 1, 1, params.stream,
-            "====gqq launchParams.cu_kv_seq_lens at xqaDispatcher::runImpl ===");
+            "====gqq xqaDispatcher.cpp runImpl(): launchParams.cu_kv_seq_lens at xqaDispatcher::runImpl ===");
         printAbsMean(launchParams.cu_seq_lens, 1, params.stream,
-            "====gqq launchParams.cu_seq_lens at xqaDispatcher::runImpl ===");
+            "====gqq xqaDispatcher.cpp runImpl(): launchParams.cu_seq_lens at xqaDispatcher::runImpl ===");
         printAbsMean(launchParams.cu_seq_lens + 1, 1, params.stream,
-            "====gqq launchParams.cu_seq_lens at xqaDispatcher::runImpl ===");
+            "====gqq xqaDispatcher.cpp runImpl(): launchParams.cu_seq_lens at xqaDispatcher::runImpl ===");
 
         printAbsMean(params.spec_decoding_generation_lengths, 1, params.stream,
-            "====gqq params.spec_decoding_generation_lengths at xqaDispatcher::runImpl ===");
+            "====gqq xqaDispatcher.cpp runImpl(): params.spec_decoding_generation_lengths at xqaDispatcher::runImpl "
+            "===");
         printAbsMean(tllmRunnerParams.seqLensKvPtr, 1, params.stream,
-            "====gqq tllmRunnerParams.seqLensKvPtr at xqaDispatcher::runImpl ===");
+            "====gqq xqaDispatcher.cpp runImpl(): tllmRunnerParams.seqLensKvPtr at xqaDispatcher::runImpl ===");
         tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(launchParams.bmm2_scale_ptr);
         // TRTLLM-GEN kernels always use the Log2 scale
         tllmRunnerParams.scaleSoftmaxLog2Ptr
@@ -515,6 +516,11 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.stream = params.stream;
         tllmRunnerParams.mSfStartTokenIdx = params.start_token_idx_sf;
         tllmRunnerParams.is_spec_dec_tree = params.is_spec_dec_tree && params.multi_query_tokens;
+        printf(
+            " ====xqaDispatcher::runImpl tllmRunnerParams.mMaxSeqLenQ is %d and tllmRunnerParams.mSumOfSeqLensQ is %d "
+            "and tllmRunnerParams.mMaxSeqLenKv is %d and tllmRunnerParams.mSumOfSeqLensKv is %d\n",
+            tllmRunnerParams.mMaxSeqLenQ, tllmRunnerParams.mSumOfSeqLensQ, tllmRunnerParams.mMaxSeqLenKv,
+            tllmRunnerParams.mSumOfSeqLensKv);
         if (tllmRunnerParams.is_spec_dec_tree)
         {
             printf(" is_spec_dec_tree is true in xqaDispatcher::runImpl with custom mask\n");
@@ -531,6 +537,17 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.customMaskPtr = params.spec_decoding_bl_tree_mask;
         tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;
         tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;
+        tllmRunnerParams.cache_type = cache_type;
+
+        // Set the KV cache buffer object based on type
+        if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+        {
+            tllmRunnerParams.kv_cache_block_array = kv_cache_buffer;
+        }
+        else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
+        {
+            tllmRunnerParams.kv_cache_linear_buffer = kv_cache_buffer;
+        }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }

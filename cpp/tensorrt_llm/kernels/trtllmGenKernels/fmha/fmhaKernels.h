@@ -30,7 +30,10 @@
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
 #include "prepareCustomMask.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 
 namespace tc = tensorrt_llm::common;
 
@@ -176,6 +179,7 @@ public:
 
     void run(RunnerParams const& params) const
     {
+
         // The selectKernelParams that might be updated.
         SelectKernelParams selectKernelParams{params};
         // The iteration index (used to detect a deadlock of selecting new kernels).
@@ -208,11 +212,121 @@ public:
 
             // Prepare the kernel parameters.
             auto kernelParams = KernelParams::setKernelParams(params, kernelMeta, maxNumCtasQ, maxNumCtasKv);
+            printf(
+                "==== fmha/fmhaKernels.h run(): params.cache_type is %d and params.mHeadDimQk is %d and "
+                "params.mHeadDimV is %d and params.mNumHeadsQ is %d and params.mNumHeadsKv is %d and "
+                "params.mNumHeadsQPerKv is %d\n",
+                params.cache_type, params.mHeadDimQk, params.mHeadDimV, params.mNumHeadsQ, params.mNumHeadsKv,
+                params.mNumHeadsQPerKv);
             if (params.layer_idx == 0 && params.is_spec_dec_tree)
             {
                 printf("==================runPrepareCustomMask==========and params.is_spec_dec_tree is true========\n");
                 runPrepareCustomMask(kernelMeta, params, params.stream);
             }
+
+            // dump Tool
+            if (params.layer_idx == 0 && params.is_spec_dec_tree && params.kv_cache_block_array.has_value())
+            {
+                // 拷贝 KVBlockArray 结构和索引数据到 CPU
+                KVBlockArray h_kv = params.kv_cache_block_array.value();
+                size_t dataSize = h_kv.mMaxSeqs * h_kv.mMaxBlocksPerSeq * 2;
+                int32_t* h_data = new int32_t[dataSize];
+                cudaMemcpy(h_data, h_kv.data, dataSize * sizeof(int32_t), cudaMemcpyDeviceToHost);
+                h_kv.data = reinterpret_cast<KVCacheIndex*>(h_data);
+
+                // 获取 KV cache 参数
+                int32_t const num_kv_heads = params.mNumHeadsKv; // KV head 数量
+                int32_t const head_dim = params.mHeadDimQk;      // 每个 head 的维度
+                int32_t const batch_idx = 0;                     // batch 索引
+                int32_t const total_k_v_tokens = 61;             // 总共要保存 61 个 token
+
+                // 计算每个 token 的数据大小（字节）
+                size_t bytes_per_element = 0;
+                if (params.cache_type == KvCacheDataType::NVFP4)
+                {
+                    bytes_per_element = 1; // FP4: 0.5 bytes per element, 但实际按 1 字节对齐
+                }
+                else if (params.cache_type == KvCacheDataType::FP8 || params.cache_type == KvCacheDataType::INT8)
+                {
+                    bytes_per_element = 1; // int8_t, FP8
+                }
+                else
+                {
+                    bytes_per_element = 2; // half or bf16
+                }
+
+                // 每个 token 的总大小 = num_kv_heads × head_dim × bytes_per_element
+                size_t token_data_size = num_kv_heads * head_dim * bytes_per_element;
+
+                // 分配临时 GPU buffer 用于存储单个 token 的连续数据
+                void* d_temp_k_buffer = nullptr;
+                void* d_temp_v_buffer = nullptr;
+                cudaMalloc(&d_temp_k_buffer, token_data_size);
+                cudaMalloc(&d_temp_v_buffer, token_data_size);
+
+                printf("==== Dumping KV cache for %d tokens ====\n", total_k_v_tokens);
+                printf("  num_kv_heads=%d, head_dim=%d, bytes_per_element=%zu\n", num_kv_heads, head_dim,
+                    bytes_per_element);
+                printf("  token_data_size=%zu bytes\n", token_data_size);
+                // 因为 KV cache 在 GPU 内存中是按 [numHeads, tokensPerBlock, hiddenSizePerHead] 布局的，数据不连续。
+                //  //需要重新排列成 [numHeads, hiddenSizePerHead] 的连续布局才能保存。
+                //  遍历所有要保存的 token
+                for (int32_t token_idx = 0; token_idx < total_k_v_tokens; token_idx++)
+                {
+                    // 获取 K cache 和 V cache 的 block 起始地址，步骤 1: 获取该 token 所在 block 的起始地址
+                    auto kBlockPtr = reinterpret_cast<uint8_t*>(h_kv.getKBlockPtr(batch_idx, token_idx));
+                    auto vBlockPtr = reinterpret_cast<uint8_t*>(h_kv.getVBlockPtr(batch_idx, token_idx));
+
+                    // 提取该 token 在所有 head 上的数据到临时 buffer
+                    // KV cache layout: [numHeads, tokensPerBlock, hiddenSizePerHead]
+                    for (int32_t head_idx = 0; head_idx < num_kv_heads; head_idx++)
+                    {
+                        // 计算该 token 在该 head 中的偏移量
+                        int32_t offset_in_block = h_kv.getKVLocalIdx(token_idx, head_idx, head_dim, 0);
+                        // offset = head_idx * tokensPerBlock * head_dim + (token_idx % tokensPerBlock) * head_dim + 0
+
+                        // 计算源地址和目标地址,源地址 (k_src)：在 GPU block 中的原始位置（分散的）
+                        void* k_src = kBlockPtr + offset_in_block * bytes_per_element;
+                        void* k_dst
+                            = reinterpret_cast<uint8_t*>(d_temp_k_buffer) + head_idx * head_dim * bytes_per_element;
+
+                        void* v_src = vBlockPtr + offset_in_block * bytes_per_element;
+                        void* v_dst
+                            = reinterpret_cast<uint8_t*>(d_temp_v_buffer) + head_idx * head_dim * bytes_per_element;
+
+                        // 拷贝该 head 的数据（GPU to GPU）
+                        cudaMemcpy(k_dst, k_src, head_dim * bytes_per_element, cudaMemcpyDeviceToDevice);
+                        cudaMemcpy(v_dst, v_src, head_dim * bytes_per_element, cudaMemcpyDeviceToDevice);
+                    }
+
+                    // 保存 K cache
+                    std::string k_path = "./dump_data/key_token_idx_[" + std::to_string(token_idx) + "].bin";
+                    DumpTool(k_path.c_str()).write_cuda(d_temp_k_buffer, token_data_size);
+
+                    // 保存 V cache
+                    std::string v_path = "./dump_data/v_key_token_idx_[" + std::to_string(token_idx) + "].bin";
+                    DumpTool(v_path.c_str()).write_cuda(d_temp_v_buffer, token_data_size);
+                }
+
+                printf("==== KV cache dump completed for %d tokens ====\n", total_k_v_tokens);
+
+                // 清理临时 buffer
+                cudaFree(d_temp_k_buffer);
+                cudaFree(d_temp_v_buffer);
+                delete[] h_data;
+
+                // dump q buffer
+                std::string q_path = "./dump_data/q_buffer.bin";
+                DumpTool(q_path.c_str())
+                    .write_cuda(static_cast<void const*>(params.qPtr), 25 * 32 * 128 * sizeof(half));
+
+                // dump custom mask, size = （2 * 128 * 128 / 32）* 4=总字节数目
+                std::string custom_mask_path = "./dump_data/custom_mask.bin";
+                DumpTool(custom_mask_path.c_str())
+                    .write_cuda(static_cast<void const*>(params.customMaskPtr),
+                        2 * 128 * 128 / 8); // 2 * 128 * 128 * sizeof(int32_t)/32
+            }
+
             // Prepare kernel parameters list for cuLaunchKernelEx.
             void* kernelParamsList[] = {&kernelParams};
             CUlaunchConfig launch_config;
@@ -515,12 +629,12 @@ private:
 
                 if (params.mNumHeadsQPerKv <= 16 && (params.mHeadDimQk == 64 || params.mHeadDimQk == 128))
                 {
-                    printf("======11111=====\n");
+                    printf("======select kernel with KeepsMmaAbForGeneration =====\n");
                     kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
                 }
                 else
                 {
-                    printf("======22222=====\n");
+                    printf("======select kernel with SwapsMmaAbForGeneration =====\n");
                     kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
                 }
             }

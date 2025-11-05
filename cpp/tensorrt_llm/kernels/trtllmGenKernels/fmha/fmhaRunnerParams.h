@@ -17,8 +17,11 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/kernels/kvCacheUtils.h"
+#include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <optional>
 
 namespace tensorrt_llm
 {
@@ -288,6 +291,12 @@ struct TllmGenFmhaRunnerParams
     int32_t layer_idx = 0;
     // Whether the spec-dec tree is used.
     bool is_spec_dec_tree = false;
+
+    KvCacheDataType cache_type{KvCacheDataType::BASE};
+
+    // KV cache buffer objects (only one will be set depending on the cache type)
+    std::optional<KVBlockArray> kv_cache_block_array;
+    std::optional<KVLinearBuffer> kv_cache_linear_buffer;
 
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)

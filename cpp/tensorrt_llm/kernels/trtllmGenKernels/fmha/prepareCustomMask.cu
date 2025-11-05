@@ -32,6 +32,10 @@ __device__ __host__ inline int32_t ceilDiv(int32_t a, int32_t b)
     return (a + b - 1) / b;
 }
 
+// tileSizeQ = 128, tileSizeKv = 128, numInstsQ = 1, numInstsKv = 2
+//  customMaskPtr shape :[numTilesQ, numCustomMaskTilesKv, 1, 2, 128*128]
+// numTilesQ = ceil(seqLenQ * numHeadsQPerKv / tileSizeQPerCta) = ceil(25 * 4 / 256) = 1，，61 = 36 + 25，，36/128=0
+// numCustomMaskTilesKv = ceil(seqLenKv / tileSizeKvPerCta) - firstSparseTile = ceil(61 / 128) - 0 = 1
 __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
     TllmGenFmhaRunnerParams runnerParams, TllmGenFmhaKernelMetaInfo kernelMeta)
 {
@@ -77,6 +81,8 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
 
     if (flattenedThreadIdx == 0)
     {
+        printf("====firstSparseMaskOffsetKv is %d and seqLenQ is %d and seqLenKv is %d and totalQTokens is %d\n",
+            firstSparseMaskOffsetKv, seqLenQ, seqLenKv, totalQTokens);
         firstSparseMaskOffsetsKvPtr[batchIdx] = adjustedFirstSparseMaskOffsetKv;
     }
 
@@ -100,9 +106,10 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
         }
         else
         {
-            int32_t packedMaskIdx = qMaskBaseIdx + ((tokenIdxKv - firstSparseMaskOffsetKv) >> 5);
-            int32_t bitPos = (tokenIdxKv - firstSparseMaskOffsetKv) & 0x1F;
-            randomMask = (customMaskInputPtr[packedMaskIdx] >> bitPos) & 1;
+            // int32_t packedMaskIdx = qMaskBaseIdx + ((tokenIdxKv - firstSparseMaskOffsetKv) >> 5);
+            // int32_t bitPos = (tokenIdxKv - firstSparseMaskOffsetKv) & 0x1F;
+            // randomMask = (customMaskInputPtr[packedMaskIdx] >> bitPos) & 1;
+            randomMask = 1; // TODO: for testing
         }
 
         int32_t customMaskTokenIdxKv = tokenIdxKv - adjustedFirstSparseMaskOffsetKv;
@@ -117,6 +124,8 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
 
         int64_t offsetAsUInt32 = maskOffset >> 5;
         int64_t bitPosInUInt32 = maskOffset & 0x1F;
+        printf("====offsetAsUInt32 is %lld and bitPosInUInt32 is %lld and randomMask is %d\n", offsetAsUInt32,
+            bitPosInUInt32, randomMask);
 
         atomicOr(&localCustomMaskPtr[offsetAsUInt32], (uint32_t(randomMask) << bitPosInUInt32));
     }
@@ -238,6 +247,7 @@ void runPrepareCustomMask(
         // Step 2: Compute custom mask buffers
         launchPrepareCustomMaskBuffersKernelForKeepsMmaAb(runnerParams, kernelMeta, stream);
         TLLM_CUDA_CHECK(cudaGetLastError());
+
         printAbsMean(runnerParams.customMaskOffsetsPtr, 1, stream,
             "====gqq runnerParams.customMaskOffsetsPtr at after runPrepareCustomMask ===");
         printAbsMean(runnerParams.firstSparseMaskOffsetsKvPtr, 1, stream,

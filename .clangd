@@ -1,0 +1,63 @@
+CompileFlags:
+  CompilationDatabase: ./
+  Compiler: clang++
+  Add:
+    - "-std=c++17"
+    - "-DENABLE_BF16"
+    - "-DENABLE_FP4"
+    - "-DENABLE_FP8"
+    - "-DENABLE_MULTI_DEVICE=1"
+    - "-DTLLM_ENABLE_CUDA"
+    - "-DTORCH_CUDA=1"
+    - "-D__CUDACC__"
+    - "-D__NVCC__"
+    - "-I/home/scratch.qgai_sw/qgai/project/TensorRT-LLM-RewindKV-debug-v2/cpp"
+    - "-I/home/scratch.qgai_sw/qgai/project/TensorRT-LLM-RewindKV-debug-v2/cpp/include"
+    - "-I/home/scratch.qgai_sw/qgai/project/TensorRT-LLM-RewindKV-debug-v2/cpp/tensorrt_llm"
+    - "-I/home/scratch.qgai_sw/qgai/project/TensorRT-LLM-RewindKV-debug-v2/3rdparty/cutlass/include"
+    - "-I/usr/local/cuda/targets/x86_64-linux/include"
+    - "-I/usr/local/tensorrt/include"
+    - "-I/usr/include/python3.12"
+  Remove:
+    - "-mcmodel=medium"
+    - "-forward-unknown-to-host-compiler"
+    - "--generate-code=*"
+    - "-Werror"
+    - "--options-file"
+    - "--expt-*"
+    - "--fatbin-options"
+    - "-compress-all"
+    - "-Xcudafe"
+    - "--diag_suppress=*"
+    - "-Xcompiler=*"
+    - "-x"
+    - "cuda"
+    - "/usr/local/cuda-*"
+
+Diagnostics:
+  ClangTidy:
+    Add:
+      - readability-*
+      - modernize-*
+    Remove:
+      - modernize-use-trailing-return-type
+  UnusedIncludes: None
+  Suppress:
+    - "variadic_device_fn"
+    - "attributes_not_allowed"
+    - "unknown-cuda-version"
+
+Index:
+  Background: Build
+  StandardLibrary: Yes
+
+Hover:
+  ShowAKA: Yes
+
+InlayHints:
+  Enabled: Yes
+  ParameterNames: Yes
+  DeducedTypes: Yes
+
+Completion:
+  AllScopes: Yes

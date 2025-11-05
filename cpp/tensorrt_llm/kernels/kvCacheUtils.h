@@ -190,7 +190,7 @@ struct KVBlockArray : public KVBlockArrayForContextFMHA
 
     __host__ __device__ [[nodiscard]] inline int32_t getLocalIdx(int32_t globalIdx) const
     {
-        return globalIdx & ((1 << mTokensPerBlockLog2) - 1);
+        return globalIdx & ((1 << mTokensPerBlockLog2) - 1); // globalIdx % tokensPerBlock
     }
 
     __host__ __device__ [[nodiscard]] inline int32_t getKVLocalIdx(
@@ -202,6 +202,8 @@ struct KVBlockArray : public KVBlockArrayForContextFMHA
         // NOTE: we have remapped K layout as the same of V.
         return headIdx * mTokensPerBlock * dimsPerHead + getLocalIdx(globalTokenIdx) * dimsPerHead + channelIdx;
     }
+
+    // offset = head_idx * tokensPerBlock * head_dim + (token_idx % tokensPerBlock) * head_dim + 0;
 
 private:
     __host__ __device__ [[nodiscard]] void* getPoolPtr(DataType offset) const
