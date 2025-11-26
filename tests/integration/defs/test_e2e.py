@@ -2183,7 +2183,7 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
     ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
      "EAGLE3-LLaMA3.1-Instruct-8B"),
 ])
-def test_draft_token_tree_quickstart_advanced_eagle3(llm_root, llm_venv,
+def test_static_draft_token_tree_quickstart_advanced_eagle3(llm_root, llm_venv,
                                                      model_name, model_path,
                                                      eagle_model_path):
     print(f"Testing {model_name}.")
@@ -2218,8 +2218,9 @@ def test_draft_token_tree_quickstart_advanced_eagle3(llm_root, llm_venv,
     ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
      "EAGLE3-LLaMA3.1-Instruct-8B"),
 ])
-def test_draft_token_tree_quickstart_advanced_eagle3_depth_1_tree(
-        llm_root, llm_venv, model_name, model_path, eagle_model_path):
+def test_dynamic_draft_token_tree_quickstart_advanced_eagle3(llm_root, llm_venv,
+                                                     model_name, model_path,
+                                                     eagle_model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     with tempfile.NamedTemporaryFile(mode='w+t',
@@ -2241,12 +2242,14 @@ def test_draft_token_tree_quickstart_advanced_eagle3_depth_1_tree(
             f"{llm_models_root()}/{eagle_model_path}",
             "--disable_kv_cache_reuse",
             "--disable_overlap_scheduler",
-            "--eagle_choices",
-            "[[0], [1], [2]]",
+            "--use_dynamic_tree", 
+            "--dynamic_tree_max_topK",
+            "3",
+            "--max_total_draft_tokens",
+            "12",
         ],
                          stdout=running_log)
         _check_mem_usage(running_log, [27, 0, 0, 0])
-
 
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),

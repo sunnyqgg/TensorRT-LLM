@@ -166,6 +166,7 @@ def add_llm_args(parser):
                         default="llama3",
                         choices=["llama3", "mistral_large3"],
                         help="The model architecture of the eagle3 model.")
+    parser.add_argument('--max_total_draft_tokens', type=int, default=None)
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
@@ -236,7 +237,8 @@ def setup_llm(args, **kwargs):
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
             allow_advanced_sampling=args.allow_advanced_sampling,
-            eagle3_model_arch=args.eagle3_model_arch)
+            eagle3_model_arch=args.eagle3_model_arch,
+            max_total_draft_tokens=args.max_total_draft_tokens)
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
