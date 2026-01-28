@@ -103,6 +103,9 @@ class LinearDraftingLoopWrapper(BaseDraftingLoopWrapper):
     def __init__(self, max_draft_len: int, max_total_draft_tokens: int,
                  draft_model: torch.nn.Module):
         super().__init__()
+        print(
+            f"LinearDraftingLoopWrapper init: max_draft_len={max_draft_len}, max_total_draft_tokens={max_total_draft_tokens}"
+        )
         self.draft_model = draft_model
         self.config = self.draft_model.config
         self.model_config = self.draft_model.model_config
@@ -208,6 +211,9 @@ class StaticTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
     def __init__(self, max_draft_len: int, max_total_draft_tokens: int,
                  max_batch_size: int, draft_model: torch.nn.Module):
         super().__init__()
+        print(
+            f"StaticTreeDraftingLoopWrapper init: max_draft_len={max_draft_len}, max_total_draft_tokens={max_total_draft_tokens}, max_batch_size={max_batch_size}"
+        )
         self.draft_model = draft_model
         self.config = self.draft_model.config
         self.model_config = self.draft_model.model_config
@@ -527,6 +533,9 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                  max_batch_size: int, dynamic_tree_max_topK,
                  draft_model: torch.nn.Module):
         super().__init__()
+        print(
+            f"DynamicTreeDraftingLoopWrapper init: max_draft_len={max_draft_len}, max_total_draft_tokens={max_total_draft_tokens}, max_batch_size={max_batch_size}, dynamic_tree_max_topK={dynamic_tree_max_topK}"
+        )
         self.draft_model = draft_model
         self.config = self.draft_model.config
         self.model_config = self.draft_model.model_config
@@ -537,17 +546,17 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
         self.logsoftmax = nn.LogSoftmax(dim=-1)
 
         self.draft_tokens_buffer = torch.zeros(
-            (max_batch_size, max_total_draft_tokens + 1),
+            (max_batch_size * (max_total_draft_tokens + 1)),
             dtype=torch.int64,
             device='cuda')
         self.position_ids_buffer = torch.zeros(
-            (max_batch_size, max_total_draft_tokens + 1),
+            (max_batch_size * (max_total_draft_tokens + 1)),
             dtype=torch.int64,
             device='cuda')
         self.history_draft_tokens_buffer = torch.zeros(
-            (max_batch_size, dynamic_tree_max_topK +
-             dynamic_tree_max_topK * dynamic_tree_max_topK *
-             (max_draft_len - 1)),
+            (max_batch_size, (dynamic_tree_max_topK +
+                              dynamic_tree_max_topK * dynamic_tree_max_topK *
+                              (max_draft_len - 1))),
             dtype=torch.int64,
             device='cuda')
         self.history_score_buffer = torch.zeros(
@@ -566,6 +575,9 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor,
                 attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,
                 **kwargs) -> dict[str, torch.Tensor]:
+        print(
+            f"DynamicTreeDraftingLoopWrapper forward: input_ids.shape={input_ids.shape}, position_ids.shape={position_ids.shape}, attn_metadata.num_seqs={attn_metadata.num_seqs}, spec_metadata.num_tokens={spec_metadata.num_tokens}"
+        )
 
         assert isinstance(spec_metadata, Eagle3SpecMetadata)
         spec_tree_manager = spec_metadata.eagle3_resource_manager.spec_tree_manager
@@ -606,19 +618,23 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                 # input_ids: [batch_size * (max_total_draft_tokens + 1)]
                 # position_ids: [batch_size * (max_total_draft_tokens + 1)]
                 # logits: [batch_size * (max_total_draft_tokens + 1), vocab_size]
+                tokens_num_per_layer = batch_size * layer_idx * self.dynamic_tree_max_topK
                 logits = self.draft_model.forward(
-                    input_ids=self.draft_tokens_buffer[:batch_size, :].reshape(
-                        -1),
-                    position_ids=self.position_ids_buffer[:batch_size, :].
-                    reshape(-1),
+                    input_ids=self.draft_tokens_buffer[:batch_size * (
+                        self.max_total_draft_tokens + 1)],
+                    position_ids=self.position_ids_buffer[:batch_size * (
+                        self.max_total_draft_tokens + 1)],
+                    # input_ids=self.draft_tokens_buffer[:tokens_num_per_layer],
+                    # position_ids=self.position_ids_buffer[:tokens_num_per_layer],
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata,
-                    return_context_logits=True)
+                    return_context_logits=True,
+                    is_debug=False)
 
                 # new_draft_tokens: [batch_size * (max_total_draft_tokens + 1) * dynamic_tree_max_topK]
                 # new_draft_scores: [batch_size * (max_total_draft_tokens + 1) * dynamic_tree_max_topK]
                 new_draft_tokens, new_draft_scores = self.sample(
-                    logits=logits,
+                    logits=logits[:tokens_num_per_layer],
                     max_top_k=spec_tree_manager.dynamic_tree_max_topK)
                 # Keep updating
                 cur_scores = self.update_draft_tokens_and_scores(
@@ -674,10 +690,10 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
         topk_values, topk_indices = torch.topk(
             last_p, k=max_top_k, dim=-1
         )  # [batch_size, max_top_k] or [batch_size * max_total_draft_tokens, max_top_k]
-
+        print(f"sample: topk_indices = {topk_indices}")
         tokens = topk_indices.reshape(-1)
         scores = topk_values.reshape(-1)
-
+        print(f"sample: topk_values = {topk_values}")
         if hasattr(self.draft_model.model, "d2t"):
             d2t = self.draft_model.model.d2t.data
             tokens = tokens + d2t[tokens]
@@ -727,16 +743,18 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
         if cur_draft_idx == 0:
             # new_draft_tokens: [batch_size, self.dynamic_tree_max_topK]
             # new_draft_scores: [batch_size, self.dynamic_tree_max_topK]
-            new_draft_tokens = new_draft_tokens.reshape(
-                batch_size, self.dynamic_tree_max_topK)
+            # new_draft_tokens = new_draft_tokens.reshape(
+            #     batch_size, self.dynamic_tree_max_topK)
             new_draft_scores = new_draft_scores.reshape(
                 batch_size, self.dynamic_tree_max_topK)
 
             # 2) & 3) Update draft tokens and scores buffer.
-            self.draft_tokens_buffer[:batch_size, :self.
-                                     dynamic_tree_max_topK] = new_draft_tokens[:, :]
+            self.draft_tokens_buffer[:batch_size * self.
+                                     dynamic_tree_max_topK] = new_draft_tokens
             self.history_draft_tokens_buffer[:batch_size, :self.
-                                             dynamic_tree_max_topK] = new_draft_tokens[:, :]
+                                             dynamic_tree_max_topK] = new_draft_tokens.reshape(
+                                                 batch_size,
+                                                 self.dynamic_tree_max_topK)
             self.history_score_buffer[:batch_size, :self.
                                       dynamic_tree_max_topK] = new_draft_scores[:, :]
 
@@ -747,9 +765,12 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                                      device='cuda')
             packed_mask = torch.pow(2,
                                     dummy_idx)  # [self.dynamic_tree_max_topK]
-            attn_metadata.spec_decoding_packed_mask[:batch_size, :self.
-                                                    dynamic_tree_max_topK, :] = packed_mask.unsqueeze(
-                                                        1)
+
+            attn_metadata.spec_decoding_packed_mask = attn_metadata.spec_decoding_packed_mask.flatten(
+            )
+            packed_mask = packed_mask.repeat(batch_size)
+            attn_metadata.spec_decoding_packed_mask[:packed_mask.
+                                                    size(0)] = packed_mask
 
             # 5) Update the attn_metadata.hidden_states_read_indices
             ## Will be updated in the prepare_for_generation function. Because it will need the information of the old_write_indices and so on.
@@ -846,8 +867,7 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                 attn_metadata.
                 spec_decoding_packed_mask[:batch_size,
                                           gather_draft_tokens_start_offset:
-                                          gather_draft_tokens_end_offset, :].
-                squeeze(-1),
+                                          gather_draft_tokens_end_offset, 0],
                 dim=1,
                 index=selected_parents
             )  # [batch_size, self.dynamic_tree_max_topK]
@@ -973,9 +993,11 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
             dtype=torch.long) - seq_lens + num_accepted_draft_tokens
         position_start_idx = position_ids[0,
                                           last_tokens_idx] + 1  # [batch_size]
-        self.position_ids_buffer[:batch_size, :] = position_start_idx.unsqueeze(
+        self.position_ids_buffer[:batch_size * (
+            self.max_total_draft_tokens + 1
+        )] = position_start_idx.unsqueeze(
             1) + spec_tree_manager.spec_dec_position_offsets_for_drafter_model[
-                0, :].unsqueeze(0)  # [batch_size, max_total_draft_tokens + 1]
+                0, :]  # [batch_size, max_total_draft_tokens + 1]
 
         # 2) Prepare the attn_metadata
         ## 2.1) kv_lens_cuda

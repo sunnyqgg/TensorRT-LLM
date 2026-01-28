@@ -435,6 +435,19 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                                                                     : token_idx_in_seq)
                 + (params.mrope_position_deltas != nullptr ? params.mrope_position_deltas[batch_idx] : 0);
 
+            // DEBUG: Print spec_decoding_position_offsets values (only first few threads)
+            if (params.spec_decoding_position_offsets != nullptr && threadIdx.x == 0 && local_token_idx < 10)
+            {
+                int const offset_idx = local_token_idx + batch_idx * params.max_input_seq_len;
+                int const position_offset_value = params.spec_decoding_position_offsets[offset_idx];
+                printf(
+                    "[DEBUG-applyBiasRopeUpdateKVCache] global_token_idx=%d, batch_idx=%d, local_token_idx=%d, "
+                    "token_idx_in_seq=%d, offset_idx=%d, position_offset=%d, past_seq_len=%d, cache_seq_len=%d, "
+                    "actual_seq_len=%d, rotary_position=%d, valid_token=%d\n",
+                    global_token_idx, batch_idx, local_token_idx, token_idx_in_seq, offset_idx, position_offset_value,
+                    past_seq_len, cache_seq_len, actual_seq_len, rotary_position, (int) valid_token);
+            }
+
             if (!valid_token)
             {
                 continue;
@@ -815,17 +828,45 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         {
             batch_idx = bounded_global_token_idx;
             token_idx_in_seq = 0;
+            // DEBUG: Show how GEN_PHASE is computing indices
+            if (params.spec_decoding_position_offsets != nullptr && threadIdx.x == 0 && threadIdx.y == 0
+                && global_token_idx < 16)
+            {
+                printf(
+                    "[DEBUG-V2-INDEX-GEN_PHASE] global_token_idx=%d, bounded_global_token_idx=%d -> batch_idx=%d, "
+                    "token_idx_in_seq=%d (FORCED TO 0!)\n",
+                    global_token_idx, bounded_global_token_idx, batch_idx, token_idx_in_seq);
+            }
         }
         else if (variable_sequence_length)
         {
             auto token_info = params.tokens_info[bounded_global_token_idx];
             batch_idx = token_info.x;
             token_idx_in_seq = token_info.y;
+            // DEBUG: Show tokens_info
+            if (params.spec_decoding_position_offsets != nullptr && threadIdx.x == 0 && threadIdx.y == 0
+                && global_token_idx < 16)
+            {
+                printf(
+                    "[DEBUG-V2-INDEX-VAR_LEN] global_token_idx=%d, bounded_global_token_idx=%d, tokens_info=(%d,%d) -> "
+                    "batch_idx=%d, token_idx_in_seq=%d\n",
+                    global_token_idx, bounded_global_token_idx, token_info.x, token_info.y, batch_idx,
+                    token_idx_in_seq);
+            }
         }
         else
         {
             batch_idx = bounded_global_token_idx / params.max_input_seq_len;
             token_idx_in_seq = bounded_global_token_idx % params.max_input_seq_len;
+            // DEBUG: Show fixed length calculation
+            if (params.spec_decoding_position_offsets != nullptr && threadIdx.x == 0 && threadIdx.y == 0
+                && global_token_idx < 16)
+            {
+                printf(
+                    "[DEBUG-V2-INDEX-FIXED_LEN] global_token_idx=%d, bounded_global_token_idx=%d, max_input_seq_len=%d "
+                    "-> batch_idx=%d, token_idx_in_seq=%d\n",
+                    global_token_idx, bounded_global_token_idx, params.max_input_seq_len, batch_idx, token_idx_in_seq);
+            }
         }
         // The cache sequence length that includes the input sequence length.
         int const cache_seq_len = params.cache_seq_lens[batch_idx];
@@ -848,6 +889,21 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             ? (params.spec_decoding_position_offsets[token_idx_in_seq + batch_idx * params.max_input_seq_len]
                 + cache_seq_len - actual_seq_len)
             : token_idx_in_kv_cache;
+
+        // DEBUG: Print spec_decoding_position_offsets values (only first thread of each batch)
+        // Print for all global tokens to see what's being processed
+        if (params.spec_decoding_position_offsets != nullptr && threadIdx.x == 0 && threadIdx.y == 0
+            && global_token_idx < 10)
+        {
+            int const offset_idx = token_idx_in_seq + batch_idx * params.max_input_seq_len;
+            int const position_offset_value = params.spec_decoding_position_offsets[offset_idx];
+            printf(
+                "[DEBUG-applyBiasRopeUpdateKVCacheV2] global_token_idx=%d, bounded_global_token_idx=%d, batch_idx=%d, "
+                "token_idx_in_seq=%d, offset_idx=%d, position_offset=%d, cache_seq_len=%d, actual_seq_len=%d, "
+                "past_seq_len=%d, rotary_position=%d, GEN_PHASE=%d\n",
+                global_token_idx, bounded_global_token_idx, batch_idx, token_idx_in_seq, offset_idx,
+                position_offset_value, cache_seq_len, actual_seq_len, past_seq_len, rotary_position, (int) GEN_PHASE);
+        }
 
         // head_num == kv_head_num:
         //   src QKV: [batch, time, 3, head_num, size_per_head]

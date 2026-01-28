@@ -227,10 +227,13 @@ class Eagle3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         spec_metadata: SpecMetadata,
+        is_debug: bool = False,
     ) -> torch.Tensor:
         residual = hidden_states
 
         hidden_states = self.hidden_norm(hidden_states)
+        if is_debug:
+            hidden_states = hidden_states[:10, :]
         if not self._next_layer_regular:
             embeds = self.input_layernorm(embeds)
             hidden_states = torch.cat([embeds, hidden_states], dim=-1)
@@ -371,6 +374,7 @@ class Eagle3DraftModel(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
+        is_debug: bool = False,
     ) -> torch.Tensor:
         assert self.embed_tokens is not None
 
@@ -405,13 +409,12 @@ class Eagle3DraftModel(DecoderModel):
                     spec_metadata=spec_metadata,
                 )
         else:
-            hidden_states, residual = self.midlayer(
-                position_ids=position_ids,
-                embeds=inputs_embeds,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-            )
+            hidden_states, residual = self.midlayer(position_ids=position_ids,
+                                                    embeds=inputs_embeds,
+                                                    hidden_states=hidden_states,
+                                                    attn_metadata=attn_metadata,
+                                                    spec_metadata=spec_metadata,
+                                                    is_debug=is_debug)
 
         hidden_states, hidden_states_to_save = self.norm(
             hidden_states, residual)
@@ -462,6 +465,7 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
+        is_debug: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = self.apply_eagle3_fc(spec_metadata.get_hidden_states())
@@ -472,6 +476,7 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
             inputs_embeds=inputs_embeds,
             spec_metadata=spec_metadata,
             hidden_states=hidden_states,
+            is_debug=is_debug,
         )
 
         return self.logits_processor.forward(

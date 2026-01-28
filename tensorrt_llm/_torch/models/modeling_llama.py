@@ -1037,7 +1037,9 @@ class LlamaModel(DecoderModel):
 
         hidden_states = inputs_embeds
         residual = None
-
+        print(
+            f"LlamaModel forward: inputs_embeds.shape={inputs_embeds.shape} and min value={inputs_embeds.min()} and max value={inputs_embeds.max()} mean value={inputs_embeds.mean()}"
+        )
         for decoder_layer in self.layers[:self.num_hidden_layers]:
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
@@ -1047,7 +1049,9 @@ class LlamaModel(DecoderModel):
                 spec_metadata=spec_metadata,
                 lora_params=lora_params,
             )
-
+        print(
+            f"LlamaModel forward: hidden_states.shape={hidden_states.shape} and min value={hidden_states.min()} and max value={hidden_states.max()} mean value={hidden_states.mean()}"
+        )
         return hidden_states
 
 

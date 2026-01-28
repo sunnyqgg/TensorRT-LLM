@@ -257,6 +257,7 @@ public:
         preprocessingParams.multi_processor_count = multiprocessor_count;
         preprocessingParams.rotary_vision_start = xqaParams.rotary_vision_start;
         preprocessingParams.rotary_vision_length = xqaParams.rotary_vision_length;
+        printf("====come decoderXQAImplPrecompiled.cpp xqa running and qkv preprocessing params====\n");
 
         invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParams, stream);
         sync_check_cuda_error(stream);

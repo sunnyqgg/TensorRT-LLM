@@ -18,6 +18,7 @@
 #include "compileEngine.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cubin/xqa_kernel_cubin.h"
@@ -31,6 +32,7 @@
 namespace
 {
 
+using ::tensorrt_llm::common::printArrayInfo;
 using ::tensorrt_llm::kernels::XQAKernelRuntimeHashKey;
 using ::tensorrt_llm::kernels::XQAParams;
 using ::tensorrt_llm::kernels::XQAKernelMetaInfo;
@@ -233,6 +235,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     TLLM_CHECK(cubinObj != nullptr && cubinObj->isInitialized());
     bool const isSpecDec = xqaParams.multi_query_tokens;
     bool const isSkipSoftmax = xqaParams.skip_softmax_threshold_scale_factor != 0;
+    printf("====come decoderXQAImplJIT.cpp xqa running and isSpecDec %d ====\n", isSpecDec);
     bool const isHMMAKernel = (cubinObj->getKernelType() == XQAKernelType::kAMPERE_WARP_SPECIALIZED);
     bool const isGMMAKernel = (cubinObj->getKernelType() == XQAKernelType::kHOPPER_WARP_SPECIALIZED);
     bool const isMLAKernel = (cubinObj->getKernelType() == XQAKernelType::kSM120_MLA);
@@ -358,6 +361,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             preprocessingParams.multi_processor_count = multiprocessor_count;
             preprocessingParams.rotary_vision_start = xqaParams.rotary_vision_start;
             preprocessingParams.rotary_vision_length = xqaParams.rotary_vision_length;
+            printf("====come decoderXQAImplJIT.cpp xqa running and qkv preprocessing params====\n");
 
             invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParams, stream);
             sync_check_cuda_error(stream);
@@ -367,6 +371,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             xqa_q_input_ptr = xqaParams.quant_q_buffer_ptr;
         }
     }
+    printf("====come decoderXQAImplJIT.cpp xqa running====\n");
 
     auto const makeSpecDecParams = [&]() -> SpecDecParams
     {
@@ -374,6 +379,43 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         uint32_t maxQSeqLen = xqaParams.spec_decoding_is_generation_length_variable
             ? xqaParams.spec_decoding_max_generation_length
             : qSeqLen;
+
+        // DEBUG: Print speculative decoding parameters
+        TLLM_LOG_DEBUG("=== SpecDecParams Debug Info ===");
+        TLLM_LOG_DEBUG("qSeqLen=%u, maxQSeqLen=%u", qSeqLen, maxQSeqLen);
+        TLLM_LOG_DEBUG("generation_input_length=%d, max_generation_length=%d, is_variable=%d",
+            xqaParams.generation_input_length, xqaParams.spec_decoding_max_generation_length,
+            xqaParams.spec_decoding_is_generation_length_variable);
+        TLLM_LOG_DEBUG("batch_size=%d, is_spec_dec_tree=%d, multi_query_tokens=%d", xqaParams.batch_size,
+            xqaParams.is_spec_dec_tree, xqaParams.multi_query_tokens);
+
+        if (xqaParams.spec_decoding_generation_lengths != nullptr)
+        {
+            printArrayInfo(xqaParams.spec_decoding_generation_lengths, xqaParams.batch_size,
+                "spec_decoding_generation_lengths", true);
+        }
+
+        if (launchParams.cu_seq_lens != nullptr)
+        {
+            printArrayInfo(launchParams.cu_seq_lens, 1, "cu_seq_lens", true);
+            printArrayInfo(launchParams.cu_seq_lens + 1, 1, "cu_seq_lens", true);
+        }
+
+        if (xqaParams.spec_decoding_position_offsets != nullptr)
+        {
+            int offset_elements = std::min(128, static_cast<int>(xqaParams.batch_size * maxQSeqLen));
+            printArrayInfo(
+                xqaParams.spec_decoding_position_offsets, offset_elements, "spec_decoding_position_offsets", true);
+        }
+
+        if (xqaParams.spec_decoding_packed_mask != nullptr)
+        {
+            // Print first few elements of packed mask
+            for (int i = 0; i < 10; i++)
+            {
+                printArrayInfo(xqaParams.spec_decoding_packed_mask + i, 1, "spec_decoding_packed_mask + i", true);
+            }
+        }
         return {.qSeqLen = maxQSeqLen,
             .qCuSeqLens = reinterpret_cast<uint32_t const*>(launchParams.cu_seq_lens),
             .mask = reinterpret_cast<SpecDecParams::MaskType const*>(xqaParams.spec_decoding_packed_mask)};
@@ -417,6 +459,8 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     }
     else if (isSpecDec && isHMMAKernel)
     {
+        printf(
+            "====come decoderXQAImplJIT.cpp xqa running and isHMMAKernel isSpecDec isSpecDec && isHMMAKernel ====\n");
         // MultiQueryTokens (generation_input_length > 1) need extra parameters (like qSeqLen, headGrpSize, and
         // mask). Input parameters for MultiQueryTokens kernels.
         unsigned int headGrpSize = num_q_heads_over_kv;
@@ -428,10 +472,31 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             xqaParams.spec_decoding_max_generation_length
                                                                                         : qSeqLen;
 
+        // DEBUG: Print key parameters for XQA kernel
+        TLLM_LOG_DEBUG("=== XQA Kernel Parameters (JIT)  and isSpecDec  is %d and xqaParams.is_spec_dec_tree %d ===",
+            isSpecDec, xqaParams.is_spec_dec_tree);
+        TLLM_LOG_DEBUG("generation_input_length=%d, qSeqLen=%u, maxQSeqLen=%u", xqaParams.generation_input_length,
+            qSeqLen, maxQSeqLen);
+        TLLM_LOG_DEBUG(
+            "mTileSize=%u, headGrpSize=%u, nbTokenBlocksPerGrp=%u", mTileSize, headGrpSize, nbTokenBlocksPerGrp);
+        TLLM_LOG_DEBUG("batch_size=%d, num_k_heads=%u", xqaParams.batch_size, launchParams.num_k_heads);
+
         appendParam(&maxQSeqLen);
         appendParam(&launchParams.num_k_heads);
         appendParam(&headGrpSize);
         appendParam(&launchParams.cu_seq_lens);
+
+        // DEBUG: Print cu_seq_lens
+        if (launchParams.cu_seq_lens != nullptr)
+        {
+            TLLM_LOG_DEBUG("cu_seq_lens address: %p", launchParams.cu_seq_lens);
+            printArrayInfo(launchParams.cu_seq_lens, 1, "cu_seq_lens (at appendParam)", true);
+            printArrayInfo(launchParams.cu_seq_lens + 1, 1, "cu_seq_lens (at appendParam) + 1", true);
+        }
+        else
+        {
+            TLLM_LOG_DEBUG("cu_seq_lens is nullptr");
+        }
         bool const allowSlidingWindow
             = !(isSpecDec && xqaParams.is_spec_dec_tree); // sliding windows does not support spec dec with tree-based
                                                           // token, only chained tokens
@@ -447,6 +512,16 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         }
         appendParam(&kernel_input_tokens);
         appendParam(&xqaParams.spec_decoding_packed_mask);
+
+        // DEBUG: Print spec_decoding_packed_mask
+        if (xqaParams.spec_decoding_packed_mask != nullptr)
+        {
+            TLLM_LOG_DEBUG("spec_decoding_packed_mask address: %p", xqaParams.spec_decoding_packed_mask);
+            for (int i = 0; i < 10; i++)
+            {
+                printArrayInfo(xqaParams.spec_decoding_packed_mask + i, 1, "spec_decoding_packed_mask + i", true);
+            }
+        }
         appendParam(&xqaParams.attention_sinks);
         appendParam(&launchParams.kvCacheParams);
         if (xqaParams.beam_width > 1)

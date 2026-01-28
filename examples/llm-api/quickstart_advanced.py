@@ -11,8 +11,8 @@ from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
 
 example_prompts = [
     "Hello, my name is",
-    "The capital of France is",
-    "The future of AI is",
+    # "The capital of France is",
+    # "The future of AI is",
 ]
 
 
@@ -340,9 +340,14 @@ def main():
             messages = [{"role": "user", "content": f"{prompt}"}]
             new_prompts.append(
                 llm.tokenizer.apply_chat_template(messages,
-                                                  tokenize=False,
+                                                  tokenize=True,
                                                   add_generation_prompt=True))
         prompts = new_prompts
+    prompts = [[
+        128000, 32, 6369, 1990, 264, 22999, 1217, 323, 459, 21075, 11478, 18328,
+        13, 578, 18328, 6835, 11190, 11, 11944, 11, 323, 48887, 11503, 311, 279,
+        1217, 596, 4860, 13, 14194, 25, 22691, 36660, 3931, 2891, 25
+    ]]
     outputs = llm.generate(prompts, sampling_params)
 
     for i, output in enumerate(outputs):

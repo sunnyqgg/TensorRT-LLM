@@ -267,7 +267,10 @@ class SpecTreeManager:
 
     # Get the eagle_paths
     def get_eagle_paths(self, tree_idx=0):
-        return self.eagle_paths[tree_idx]
+        # For static tree, all requests share the same tree (index 0)
+        # For dynamic tree, each request has its own tree
+        actual_idx = tree_idx if self.use_dynamic_tree else 0
+        return self.eagle_paths[actual_idx]
 
     # Get the topK list for the specific draft layer
     def get_top_k_list(self, draft_layer_id):
@@ -276,9 +279,12 @@ class SpecTreeManager:
 
     # Compute the spec decoding mask matrix according to the eagle_paths
     def compute_spec_dec_mask_matrix(self, tree_idx=0):
-        for i, path in enumerate(self.eagle_paths[tree_idx]):
+        # For static tree, all requests share the same tree (index 0)
+        # For dynamic tree, each request has its own tree
+        actual_idx = tree_idx if self.use_dynamic_tree else 0
+        for i, path in enumerate(self.eagle_paths[actual_idx]):
             indices = path[path > -1]
-            self.spec_dec_mask_matrix[tree_idx][i, indices] = 1
+            self.spec_dec_mask_matrix[actual_idx][i, indices] = 1
 
     # Compute the packed mask according to the mask matrix
     def compute_spec_dec_packed_mask(self, mask_matrix, packed_mask):
