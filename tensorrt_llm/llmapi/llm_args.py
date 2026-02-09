@@ -892,13 +892,11 @@ class EagleDecodingConfig(DecodingBaseConfig):
                     )
         return v
 
-<<<<<<< HEAD
     @model_validator(mode='after')
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None:
             raise ValueError("max_draft_len is required for Eagle")
         self.num_eagle_layers = self.max_draft_len
-        self.max_total_draft_tokens = self.max_draft_len  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
             # FIXME find a better way to setup it.
@@ -1641,6 +1639,7 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
 
 SpeculativeConfig: TypeAlias = Optional[Union[
     DraftTargetDecodingConfig,
+    Eagle3DecodingConfig,  # Must be before EagleDecodingConfig since it's a subclass
     EagleDecodingConfig,
     LookaheadDecodingConfig,
     MedusaDecodingConfig,
@@ -2213,8 +2212,52 @@ class BaseLlmArgs(StrictBaseModel):
         Returns:
             tensorrt_llm.llmapi.llm_utils.BaseLlmArgs: The `BaseLlmArgs` instance.
         """
+        from tensorrt_llm.logger import logger
+        logger.info(
+            f"[DEBUG from_kwargs] Before _check_consistency: speculative_config type = {type(kwargs.get('speculative_config'))}"
+        )
+        logger.info(
+            f"[DEBUG from_kwargs] Before _check_consistency: speculative_config = {kwargs.get('speculative_config')}"
+        )
+
+        # Save speculative_config before it might get lost
+        saved_spec_config = kwargs.get('speculative_config')
+
         kwargs = BaseLlmArgs._check_consistency(dict(kwargs))
-        ret = cls(**kwargs)
+        logger.info(
+            f"[DEBUG from_kwargs] After _check_consistency: speculative_config type = {type(kwargs.get('speculative_config'))}"
+        )
+        logger.info(
+            f"[DEBUG from_kwargs] After _check_consistency: speculative_config = {kwargs.get('speculative_config')}"
+        )
+        logger.info(f"[DEBUG from_kwargs] Creating instance of class: {cls}")
+
+        # Try model_construct to bypass validation temporarily
+        try:
+            ret = cls(**kwargs)
+        except Exception as e:
+            logger.error(f"[DEBUG from_kwargs] Error during cls(**kwargs): {e}")
+            logger.error(
+                f"[DEBUG from_kwargs] Attempting model_construct as fallback")
+            ret = cls.model_construct(**kwargs)
+
+        logger.info(
+            f"[DEBUG from_kwargs] After cls(**kwargs): ret.speculative_config type = {type(ret.speculative_config) if ret.speculative_config else None}"
+        )
+        logger.info(
+            f"[DEBUG from_kwargs] After cls(**kwargs): ret.speculative_config = {ret.speculative_config}"
+        )
+
+        # If speculative_config is None but we had it before, restore it
+        if ret.speculative_config is None and saved_spec_config is not None:
+            logger.warning(
+                f"[DEBUG from_kwargs] speculative_config was lost during initialization! Restoring..."
+            )
+            object.__setattr__(ret, 'speculative_config', saved_spec_config)
+            logger.info(
+                f"[DEBUG from_kwargs] After restore: ret.speculative_config = {ret.speculative_config}"
+            )
+
         return ret
 
     @staticmethod
@@ -3084,7 +3127,14 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_speculative_config(self):
+        from tensorrt_llm.logger import logger
+        logger.info(
+            f"[DEBUG TorchLlmArgs.validate_speculative_config] self.speculative_config = {self.speculative_config}, type = {type(self.speculative_config) if self.speculative_config else None}"
+        )
         if self.speculative_config:
+            logger.info(
+                f"[DEBUG TorchLlmArgs.validate_speculative_config] speculative_config is truthy"
+            )
             if not self.speculative_config.supports_backend(self.backend):
                 raise ValueError(
                     f"Speculation type {self.speculative_config.decoding_type} does not "
@@ -3130,8 +3180,16 @@ class TorchLlmArgs(BaseLlmArgs):
                 )
 
         else:
+            from tensorrt_llm.logger import logger
+            logger.info(
+                f"[DEBUG TorchLlmArgs.validate_speculative_config] speculative_config is falsy, setting decoding_config to None"
+            )
             self.decoding_config = None
 
+        from tensorrt_llm.logger import logger
+        logger.info(
+            f"[DEBUG TorchLlmArgs.validate_speculative_config] returning, self.speculative_config = {self.speculative_config}"
+        )
         return self
 
     @model_validator(mode="after")

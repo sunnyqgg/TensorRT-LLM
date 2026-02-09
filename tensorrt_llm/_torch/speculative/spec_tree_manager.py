@@ -139,7 +139,27 @@ class SpecTreeManager:
                 non_blocking=True,
             )
 
-    # For the static tree
+
+# batch_size = 2
+# max_draft_len = 3  # 3 层 draft layers
+# dynamic_tree_max_topK = 4  # 每层生成 4 个候选
+# max_total_draft_tokens = 12  # 3 层 × 4 tokens/层
+# # 第 131-133 行的代码
+# tmp_position_offsets = []
+# for i in range(3):  # max_draft_len = 3
+#     tmp_position_offsets.extend([i] * 4)  # 每层 4 个节点
+
+# # 结果：
+# tmp_position_offsets = [0, 0, 0, 0,  # 第 0 层的 4 个节点，offset = 0
+#                          1, 1, 1, 1,  # 第 1 层的 4 个节点，offset = 1
+#                          2, 2, 2, 2]  # 第 2 层的 4 个节点，offset = 2
+
+# # 加上根节点（offset = 0）===》为啥会有root node？
+# spec_dec_position_offsets_for_drafter_model[0, :] = [0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]
+# #                                                     ↑  ←─── 12 个 draft tokens ───→
+# #                                                   根节点
+# For the static tree
+
     def init_tree_info_for_static_tree(self):
         self.index_mapping_set = {}
         self.nodes_list_per_layer = [[] for _ in range(self.max_draft_len + 1)]
@@ -286,46 +306,68 @@ class SpecTreeManager:
             indices = path[path > -1]
             self.spec_dec_mask_matrix[actual_idx][i, indices] = 1
 
-    # Compute the packed mask according to the mask matrix
+    # # Compute the packed mask according to the mask matrix
+    # def compute_spec_dec_packed_mask(self, mask_matrix, packed_mask):
+    #     # mask_matrix: shape: [bs, num_tokens, num_tokens]
+    #     # packed_mask: output buffer, shape: [bs, max_total_draft_tokens + 1, num_blocks]
+    #     # This function pads last dim to padded_len and packs each row into 32-bit integers
+    #     # Only the first num_tokens rows of packed_mask are filled
+
+    #     num_tokens = mask_matrix.shape[1]
+    #     padded_len = self.max_total_draft_tokens + 1
+    #     num_blocks = math.ceil(padded_len / 32)
+
+    #     # Pad last dim: [bs, num_tokens, num_tokens] -> [bs, num_tokens, padded_len]
+
+    #     pad_cols = padded_len - num_tokens
+    #     padded_matrix = torch.nn.functional.pad(mask_matrix, (0, pad_cols), value=0)
+
+    #     # Flatten to [bs * num_tokens, padded_len] for packing
+    #     int_tensor = padded_matrix.reshape(-1, padded_len)
+    #     packed_mask = packed_mask[:,:num_tokens,:].reshape(-1, num_blocks)
+
+    #     # Pack each 32-bit block
+    #     for block_idx in range(num_blocks):
+    #         start_idx = block_idx * 32
+    #         end_idx = min(start_idx + 32, padded_len)
+    #         block_bits = int_tensor[:, start_idx:end_idx]
+    #         weight = torch.pow(
+    #             2,
+    #             torch.arange(end_idx - start_idx,
+    #                          dtype=torch.int32,
+    #                          device=int_tensor.device))
+    #         block_value = torch.sum(block_bits * weight, dim=-1)
+    #         packed_mask[:, block_idx] = block_value
+
     def compute_spec_dec_packed_mask(self, mask_matrix, packed_mask):
-        # mask_matrix: shape: [num_trees, max_total_draft_tokens + 1, max_total_draft_tokens + 1]
-        # packed_mask: shape: [num_trees, max_total_draft_tokens + 1, math.ceil((max_total_draft_tokens + 1) / 32)]
-        assert mask_matrix.ndim == 3
-        assert packed_mask.ndim == 3
+        bs, num_tokens, num_tokens_attend = mask_matrix.shape
+        num_blocks = packed_mask.shape[-1]
 
-        num_trees = mask_matrix.shape[0]
-        assert mask_matrix.shape == (num_trees, self.max_total_draft_tokens + 1,
-                                     self.max_total_draft_tokens + 1)
-        assert packed_mask.shape == (num_trees, self.max_total_draft_tokens + 1,
-                                     math.ceil(
-                                         (self.max_total_draft_tokens + 1) /
-                                         32))
+        # 1. 准备权重 (1, 1, 32)
+        weights = (
+            1 << torch.arange(32, device=mask_matrix.device, dtype=torch.int32))
 
-        num_blocks = math.ceil((self.max_total_draft_tokens + 1) / 32)
-        int_tensor = mask_matrix.reshape(
-            -1, self.max_total_draft_tokens + 1
-        )  # shape: [num_trees * (self.max_total_draft_tokens + 1), self.max_total_draft_tokens + 1]
-        packed_mask = packed_mask.reshape(
-            -1, num_blocks
-        )  # shape: [num_trees * (self.max_total_draft_tokens + 1), num_blocks]
+        # 2. 构造一个临时的补齐矩阵，避免复杂的索引逻辑
+        # 仅仅补齐最后一维到 32 * num_blocks
+        total_bits = num_blocks * 32
+        pad_cols = total_bits - num_tokens_attend
 
-        for block_idx in range(num_blocks):
-            start_idx = block_idx * 32
-            end_idx = min(start_idx + 32, self.max_total_draft_tokens + 1)
-            if end_idx < start_idx:
-                break
-            block_bits = int_tensor[:, start_idx:end_idx]
-            weight = torch.pow(
-                2,
-                torch.arange(end_idx - start_idx,
-                             dtype=torch.int32,
-                             device=int_tensor.device))
-            block_value = torch.sum(block_bits * weight, dim=-1)
-            packed_mask[:, block_idx] = block_value
+        # F.pad 在右边补 0: (left_pad, right_pad) - LSB first 打包方式
+        padded_m = torch.nn.functional.pad(mask_matrix.to(torch.int32),
+                                           (0, pad_cols),
+                                           value=0)
 
-        packed_mask = packed_mask.reshape(num_trees,
-                                          self.max_total_draft_tokens + 1,
-                                          num_blocks)
+        # 3. 核心魔法：将最后一维拆分为 [num_blocks, 32]
+        # 形状变化: [bs, num_tokens, num_blocks * 32] -> [bs, num_tokens, num_blocks, 32]
+        blocked_matrix = padded_m.view(bs, num_tokens, num_blocks, 32)
+
+        # 4. 向量化计算：对最后一维做点积 (使用 einsum 或 matmul)
+        # [bs, num_tokens, num_blocks, 32] * [32] -> [bs, num_tokens, num_blocks]
+        result = torch.sum(blocked_matrix * weights, dim=-1)
+
+        # 5. 写回输出 buffer 的有效区域
+        packed_mask[:, :num_tokens, :] = result
+        return packed_mask
 
     # Print the tree info
     def dump_tree_info(self):

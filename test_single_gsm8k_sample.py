@@ -80,31 +80,50 @@ Answer:"""
 def test_single_sample():
     """测试单个GSM8K样本."""
     # 模型路径配置（使用和测试文件相同的路径）
-    model_path = f"{llm_models_root()}/Qwen3/Qwen3-8B"
-    eagle_model_dir = f"{llm_models_root()}/Qwen3/qwen3_8b_eagle3"
+    model_path = "/home/scratch.qgai_sw/qgai/project/LLM/Meta-Llama-3.1-8B-Instruct"
+    eagle_model_dir = "/home/scratch.qgai_sw/qgai/project/LLM/EAGLE3-LLaMA3.1-Instruct-8B"
 
     # KV Cache配置
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.4)
 
     # EAGLE配置
+    eagle_choices = [
+        # Layer 1: 10个节点 (Root 有 10 个子节点)
+        [0],
+        [1],
+        [2],
+        [3],
+        [4],
+        [5],
+        [6],
+        [7],
+        [8],
+        [9],
+        # Layer 2: 可选，添加一些子节点
+        [0, 0],
+        [0, 1],
+        # Layer 3: 可选
+        [0, 0, 0],
+    ]
     spec_config = EagleDecodingConfig(
         max_draft_len=3,
         speculative_model_dir=eagle_model_dir,
         eagle3_one_model=False,
-        eagle_choices=[
-            [0],
-            [1],
-            [2],
-            [0, 0],
-            [0, 1],
-            [0, 2],
-            [1, 0],
-            [1, 1],
-            [2, 0],
-            [0, 0, 0],
-            [0, 1, 0],
-            [1, 0, 0],
-        ],
+        eagle_choices=eagle_choices,
+        # eagle_choices=[
+        #     [0],
+        #     [1],
+        #     [2],
+        #     [0, 0],
+        #     [0, 1],
+        #     [0, 2],
+        #     [1, 0],
+        #     [1, 1],
+        #     [2, 0],
+        #     [0, 0, 0],
+        #     [0, 1, 0],
+        #     [1, 0, 0],
+        # ],
     )
 
     # PyTorch配置
@@ -131,7 +150,8 @@ def test_single_sample():
         **pytorch_config,
     ) as llm:
         # 获取prompt
-        prompt = get_gsm8k_prompt()
+        # prompt = get_gsm8k_prompt()
+        prompt = "Hello, my name is"
 
         print("\n" + "=" * 80)
         print("测试Prompt:")
@@ -143,9 +163,48 @@ def test_single_sample():
 
         try:
             print("\n开始生成...")
-
+            prompts = [
+                [
+                    128000,
+                    32,
+                    6369,
+                    1990,
+                    264,
+                    22999,
+                    1217,
+                    323,
+                    459,
+                    21075,
+                    11478,
+                    18328,
+                    13,
+                    578,
+                    18328,
+                    6835,
+                    11190,
+                    11,
+                    11944,
+                    11,
+                    323,
+                    48887,
+                    11503,
+                    311,
+                    279,
+                    1217,
+                    596,
+                    4860,
+                    13,
+                    14194,
+                    25,
+                    22691,
+                    36660,
+                    3931,
+                    2891,
+                    25,
+                ]
+            ]
             # 生成
-            outputs = llm.generate(prompt, sampling_params=sampling_params)
+            outputs = llm.generate(prompts, sampling_params=sampling_params)
 
             print("\n" + "=" * 80)
             print("生成成功！")

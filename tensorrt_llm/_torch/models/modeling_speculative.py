@@ -232,8 +232,7 @@ class Eagle3DecoderLayer(DecoderLayer):
         residual = hidden_states
 
         hidden_states = self.hidden_norm(hidden_states)
-        if is_debug:
-            hidden_states = hidden_states[:10, :]
+
         if not self._next_layer_regular:
             embeds = self.input_layernorm(embeds)
             hidden_states = torch.cat([embeds, hidden_states], dim=-1)
@@ -469,6 +468,12 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = self.apply_eagle3_fc(spec_metadata.get_hidden_states())
+        num = int(hidden_states.shape[0] / 10)
+        for i in range(num):
+            current_hs = hidden_states[i * 10:(i + 1) * 10, :]
+            print(
+                f"======input_hidden {i} min: {current_hs.min()} and max: {current_hs.max()} and mean: {current_hs.mean()} and std: {current_hs.std()}"
+            )
         output, _ = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,

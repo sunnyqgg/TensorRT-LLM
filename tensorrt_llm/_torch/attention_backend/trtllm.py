@@ -474,9 +474,18 @@ class TrtllmAttentionWrapper:
             self.is_spec_decoding_enabled, self.use_spec_decoding,
             self.is_spec_dec_tree
         ]
+        # For dynamic tree, reshape 1D position_offsets to 2D for C++ kernel compatibility
+        position_offsets_for_cpp = self.spec_decoding_position_offsets
+        if (self.spec_decoding_position_offsets is not None
+                and self.spec_decoding_position_offsets.dim() == 1):
+            # Reshape 1D [max_num_requests * N] to 2D [max_num_requests, N]
+            # C++ kernel requires 2D to extract max_generation_length from sizes()[1]
+            position_offsets_for_cpp = self.spec_decoding_position_offsets.view(
+                self.max_num_requests, -1)
+
         spec_decoding_tensor_params = [
-            self.spec_decoding_generation_lengths,
-            self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
+            self.spec_decoding_generation_lengths, position_offsets_for_cpp,
+            self.spec_decoding_packed_mask
         ]
         if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
             spec_decoding_tensor_params.append(
@@ -1284,12 +1293,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # These buffers are accessed more like removing input padding,
             # rather than using max_total_draft_tokens + 1 as the offset between different requests.
             if self.spec_decoding_position_offsets is None:
-                self.spec_decoding_position_offsets = torch.empty(
-                    [self.max_num_requests, max_total_draft_tokens + 1],
-                    dtype=torch.int,
-                    device='cuda',
-                )
+                if spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree:
+                    # Dynamic tree: 1D layout to match packed_mask design
+                    self.spec_decoding_position_offsets = torch.empty(
+                        (self.max_num_requests *
+                         (max_total_draft_tokens + 1), ),
+                        dtype=torch.int,
+                        device='cuda',
+                    )
+                else:
+                    # Static tree / Linear tree: keep 2D layout
+                    self.spec_decoding_position_offsets = torch.empty(
+                        [self.max_num_requests, max_total_draft_tokens + 1],
+                        dtype=torch.int,
+                        device='cuda',
+                    )
             if self.spec_decoding_packed_mask is None:
+
                 self.spec_decoding_packed_mask = torch.empty(
                     [
                         self.max_num_requests, max_total_draft_tokens + 1,
@@ -1298,6 +1318,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int,
                     device='cuda',
                 )
+
             if self.spec_decoding_generation_lengths is None:
                 self.spec_decoding_generation_lengths = torch.empty(
                     [self.max_num_requests],
@@ -1323,10 +1344,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                         # - For the context requests, we do not need to prepare these spec-dec parameters.
                         # - For the generation requests, their relative spec-dec parameters are update in 'model_drafter.py::reconstruct_dynamic_tree()'
                         #   And the XQA kernel will only handle the generation requests.
-                        self.spec_decoding_position_offsets[:batch_size, :].copy_(
-                            spec_tree_manager.
-                            spec_dec_position_offsets[:batch_size, :],
-                            non_blocking=True)
+                        # Dynamic tree: copy to 1D buffer using view for efficiency
+                        # spec_tree_manager.spec_dec_position_offsets: [num_trees, max_total_draft_tokens+1]
+                        # self.spec_decoding_position_offsets: 1D [max_num_requests * (max_total_draft_tokens+1)]
+                        tokens_per_req = spec_tree_manager.max_total_draft_tokens + 1
+                        self.spec_decoding_position_offsets.view(
+                            self.max_num_requests,
+                            tokens_per_req)[:batch_size, :].copy_(
+                                spec_tree_manager.
+                                spec_dec_position_offsets[:batch_size, :],
+                                non_blocking=True)
+                        # Both spec_decoding_packed_mask and spec_tree_manager.spec_dec_packed_mask are 3D:
+                        # [max_num_requests/num_trees, max_total_draft_tokens + 1, num_blocks]
+                        # Dynamic tree: each request has its own mask (different tree structure)
                         self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
                             spec_tree_manager.
                             spec_dec_packed_mask[:batch_size, :, :],

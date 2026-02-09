@@ -395,10 +395,10 @@ class PyExecutor:
         self.is_warmup = True
 
         self.execution_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.execution_stream):
-            self.model_engine.warmup(self.resource_manager)
-            if self.draft_model_engine is not None:
-                self.draft_model_engine.warmup(self.resource_manager)
+        # with torch.cuda.stream(self.execution_stream):
+        #     self.model_engine.warmup(self.resource_manager)
+        #     if self.draft_model_engine is not None:
+        #         self.draft_model_engine.warmup(self.resource_manager)
 
         # Ensure the default stream waits for execution_stream to complete
         # before subsequent operations.
@@ -1553,8 +1553,9 @@ class PyExecutor:
                     batch_outputs = self._forward_step(scheduled_batch)
 
                     guided_decoder_failed_requests = None
-                    print(f"============================ after _forward_step ============================")
-                    import pdb; pdb.set_trace()
+                    print(
+                        f"============================ after _forward_step ============================"
+                    )
                     if self.guided_decoder is not None:
                         guided_decoder_failed_requests = self.guided_decoder.execute(
                             batch_outputs['logits'])

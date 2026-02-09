@@ -42,7 +42,7 @@ def add_llm_args(parser):
     parser.add_argument(
         "--max_num_tokens",
         type=int,
-        default=8192,
+        default=2048,
         help=
         "The maximum total tokens (context + generation) across all sequences in a batch."
     )
@@ -229,6 +229,7 @@ def setup_llm(args, **kwargs):
             mtp_eagle_one_model=args.use_one_model,
             speculative_model=args.model_dir)
     elif spec_decode_algo == "EAGLE3":
+        print(f"[DEBUG] args.use_one_model = {args.use_one_model}")
         spec_config = Eagle3DecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             speculative_model=args.draft_model_dir,
@@ -239,6 +240,9 @@ def setup_llm(args, **kwargs):
             allow_advanced_sampling=args.allow_advanced_sampling,
             eagle3_model_arch=args.eagle3_model_arch,
             max_total_draft_tokens=args.max_total_draft_tokens)
+        print(
+            f"[DEBUG] spec_config.eagle3_one_model = {spec_config.eagle3_one_model}"
+        )
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
@@ -267,6 +271,7 @@ def setup_llm(args, **kwargs):
         batching_wait_iters=args.attention_dp_batching_wait_iters,
     )
 
+    print(f"[DEBUG] Before LLM creation, spec_config = {spec_config}")
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -303,6 +308,9 @@ def setup_llm(args, **kwargs):
         max_beam_width=args.max_beam_width,
         orchestrator_type=args.orchestrator_type,
         **kwargs)
+    print(
+        f"[DEBUG] After LLM creation, llm.args.speculative_config = {llm.args.speculative_config}"
+    )
 
     use_beam_search = args.max_beam_width > 1
     best_of = args.best_of or args.n

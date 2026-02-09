@@ -1027,6 +1027,7 @@ class LlamaModel(DecoderModel):
         lora_params=None,
         **kwargs,
     ) -> torch.Tensor:
+        print(f"LlamaModel forward: input_ids={input_ids}")
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -1037,9 +1038,7 @@ class LlamaModel(DecoderModel):
 
         hidden_states = inputs_embeds
         residual = None
-        print(
-            f"LlamaModel forward: inputs_embeds.shape={inputs_embeds.shape} and min value={inputs_embeds.min()} and max value={inputs_embeds.max()} mean value={inputs_embeds.mean()}"
-        )
+
         for decoder_layer in self.layers[:self.num_hidden_layers]:
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,

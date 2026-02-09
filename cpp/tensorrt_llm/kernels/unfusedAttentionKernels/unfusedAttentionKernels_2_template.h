@@ -829,8 +829,8 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             batch_idx = bounded_global_token_idx;
             token_idx_in_seq = 0;
             // DEBUG: Show how GEN_PHASE is computing indices
-            if (params.spec_decoding_position_offsets != nullptr && threadIdx.x == 0 && threadIdx.y == 0
-                && global_token_idx < 16)
+            if (params.spec_decoding_position_offsets != nullptr && head_dim_vec_idx == 0 && head_idx == 0
+                && bounded_global_token_idx < 10)
             {
                 printf(
                     "[DEBUG-V2-INDEX-GEN_PHASE] global_token_idx=%d, bounded_global_token_idx=%d -> batch_idx=%d, "
@@ -843,15 +843,16 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             auto token_info = params.tokens_info[bounded_global_token_idx];
             batch_idx = token_info.x;
             token_idx_in_seq = token_info.y;
-            // DEBUG: Show tokens_info
-            if (params.spec_decoding_position_offsets != nullptr && threadIdx.x == 0 && threadIdx.y == 0
-                && global_token_idx < 16)
+            // DEBUG: Show tokens_info - use head_dim_vec_idx == 0 to print once per token
+            // Each token is processed by VECS_PER_HEAD threads, so use head_dim_vec_idx == 0 to print once
+            if (params.spec_decoding_position_offsets != nullptr && head_dim_vec_idx == 0 && head_idx == 0
+                && bounded_global_token_idx < 10)
             {
                 printf(
                     "[DEBUG-V2-INDEX-VAR_LEN] global_token_idx=%d, bounded_global_token_idx=%d, tokens_info=(%d,%d) -> "
-                    "batch_idx=%d, token_idx_in_seq=%d\n",
-                    global_token_idx, bounded_global_token_idx, token_info.x, token_info.y, batch_idx,
-                    token_idx_in_seq);
+                    "batch_idx=%d, token_idx_in_seq=%d, blockIdx.x=%d, threadIdx.x=%d\n",
+                    global_token_idx, bounded_global_token_idx, token_info.x, token_info.y, batch_idx, token_idx_in_seq,
+                    blockIdx.x, threadIdx.x);
             }
         }
         else
@@ -900,9 +901,10 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             printf(
                 "[DEBUG-applyBiasRopeUpdateKVCacheV2] global_token_idx=%d, bounded_global_token_idx=%d, batch_idx=%d, "
                 "token_idx_in_seq=%d, offset_idx=%d, position_offset=%d, cache_seq_len=%d, actual_seq_len=%d, "
-                "past_seq_len=%d, rotary_position=%d, GEN_PHASE=%d\n",
+                "past_seq_len=%d, rotary_position=%d, GEN_PHASE=%d and params.max_input_seq_len=%d\n",
                 global_token_idx, bounded_global_token_idx, batch_idx, token_idx_in_seq, offset_idx,
-                position_offset_value, cache_seq_len, actual_seq_len, past_seq_len, rotary_position, (int) GEN_PHASE);
+                position_offset_value, cache_seq_len, actual_seq_len, past_seq_len, rotary_position, (int) GEN_PHASE,
+                params.max_input_seq_len);
         }
 
         // head_num == kv_head_num:
@@ -922,6 +924,18 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             = *reinterpret_cast<VecT const*>(&params.qkv_input[src_q_idx + rotated_head_dim_offset]);
         [[maybe_unused]] auto k_pair
             = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx + rotated_head_dim_offset]);
+
+        // ========== DEBUG: Print Q values after loading (Step 1: Original Q) ==========
+        if (params.spec_decoding_position_offsets != nullptr && threadIdx.x == 0 && threadIdx.y == 0
+            && global_token_idx < 8 && head_idx == 0) // Only first 8 tokens, first head
+        {
+            printf(
+                "[DEBUG-Q-STEP1-LOAD] token=%d, batch=%d, token_in_seq=%d, head=%d, head_dim_vec=%d, "
+                "q[0:4]=(%.6f, %.6f, %.6f, %.6f)\n",
+                global_token_idx, batch_idx, token_idx_in_seq, head_idx, head_dim_vec_idx,
+                float(reinterpret_cast<T*>(&q)[0]), float(reinterpret_cast<T*>(&q)[1]),
+                float(reinterpret_cast<T*>(&q)[2]), float(reinterpret_cast<T*>(&q)[3]));
+        }
 
         // Bias should have been fused with QKV projection, but we keep the logic here for unit tests.
         if constexpr (ADD_BIAS)
@@ -1042,6 +1056,18 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             else
             {
                 *q_ptr = q;
+
+                // ========== DEBUG: Print after writing Q (normal path) ==========
+                if (params.spec_decoding_position_offsets != nullptr && threadIdx.x == 0 && threadIdx.y == 0
+                    && global_token_idx < 8 && head_idx == 0)
+                {
+                    printf(
+                        "[DEBUG-Q-STEP7-WRITE] token=%d, batch=%d, STORE_QKV=%d, "
+                        "dst_ptr=%p, written_q[0:4]=(%.6f, %.6f, %.6f, %.6f)\n",
+                        global_token_idx, batch_idx, (int) STORE_QKV, (void*) q_ptr, float(reinterpret_cast<T*>(&q)[0]),
+                        float(reinterpret_cast<T*>(&q)[1]), float(reinterpret_cast<T*>(&q)[2]),
+                        float(reinterpret_cast<T*>(&q)[3]));
+                }
             }
             if ((params.head_num == params.kv_head_num) || (head_idx == (kv_head_idx * params.qheads_per_kv_head)))
             {
