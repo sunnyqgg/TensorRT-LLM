@@ -1313,13 +1313,14 @@ class MTPEagleWorker(MTPWorker):
                 # update metadata
                 # some attention metadata needs to be updated when changing seq_lens/kv_lens
                 attn_metadata.update_for_spec_dec()
+                # Disable spec-dec mode for subsequent iterations (i>0).
+                if hasattr(attn_metadata, 'use_spec_decoding'):
+                    attn_metadata.use_spec_decoding = False
             elif hasattr(attn_metadata, 'kv_lens_cuda'):
-
-                @torch.compile(options={"max-autotune": True})
-                def update_kv_lens(kv_lens_cuda, batch_size):
-                    kv_lens_cuda[:batch_size] += 1
-
-                update_kv_lens(attn_metadata.kv_lens_cuda, batch_size)
+                # NOTE: do NOT wrap this in @torch.compile defined inside the loop —
+                # creating a new compiled function object each iteration with max-autotune
+                # triggers autotuning with live tensors and can corrupt adjacent GPU memory.
+                attn_metadata.kv_lens_cuda[:batch_size] += 1
                 # update metadata
                 # some attention metadata needs to be updated when changing kv_lens
                 attn_metadata.update_for_spec_dec()
@@ -1329,6 +1330,11 @@ class MTPEagleWorker(MTPWorker):
                 "hidden_states": hidden_states,
                 "attn_metadata": attn_metadata,
             }
+
+        # Restore spec-dec mode after the draft loop (was disabled at end of
+        # i=0 for the 1-token-per-request iterations).
+        if hasattr(attn_metadata, 'use_spec_decoding'):
+            attn_metadata.use_spec_decoding = attn_metadata.is_spec_decoding_enabled
 
         # restore attn_metadata to support cuda graph
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
