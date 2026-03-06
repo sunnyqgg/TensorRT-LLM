@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.speculative.dynamic_tree_ops import \
+    create_dynamic_tree_ops_converter
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3SpecMetadata
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
@@ -559,7 +561,7 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
             dtype=torch.int64,
             device='cuda')
         self.position_ids_buffer = torch.zeros(
-            (max_batch_size * (max_total_draft_tokens)),
+            (max_batch_size * (max_total_draft_tokens + 1)),
             dtype=torch.int64,
             device='cuda')
         self.history_draft_tokens_buffer = torch.zeros(
@@ -574,29 +576,39 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
              (max_draft_len - 1)),
             dtype=torch.float32,
             device='cuda')
-        # self.history_draft_tokens_parent_buffer = torch.zeros(
-        #     (max_batch_size, self.dynamic_tree_max_topK * self.max_draft_len),
-        #     dtype=torch.int64,
-        #     device='cuda') #allocate 60, actually only use 51
-        self.history_draft_tokens_parent_buffer = torch.ones(
-            (max_batch_size, dynamic_tree_max_topK +
-             dynamic_tree_max_topK * dynamic_tree_max_topK *
-             (max_draft_len - 1)),
+        self.history_draft_tokens_parent_buffer = torch.zeros(
+            (max_batch_size, self.dynamic_tree_max_topK *
+             (self.max_draft_len - 1) + 1),
             dtype=torch.int64,
-            device='cuda') * -1
+            device='cuda')  #allocate 60, actually only use 51
+        # self.history_draft_tokens_parent_buffer = torch.ones(
+        #     (max_batch_size, dynamic_tree_max_topK +
+        #      dynamic_tree_max_topK * dynamic_tree_max_topK *
+        #      (max_draft_len - 1)),
+        #     dtype=torch.int64,
+        #     device='cuda') * -1
         self.tree_mask_buffer = torch.zeros(
             (max_batch_size * (max_total_draft_tokens + 1) *
              (max_total_draft_tokens + 1)),
-            dtype=torch.int64,
+            dtype=torch.int32,
             device='cuda')
         self.tree_mask_init_buffer = torch.eye(
-            dynamic_tree_max_topK, dtype=torch.int64,
+            dynamic_tree_max_topK, dtype=torch.int32,
             device='cuda').unsqueeze(0).repeat(max_batch_size, 1, 1)
         self.tree_mask_padding_zeros = torch.zeros(
             (max_batch_size, max_total_draft_tokens,
              max_total_draft_tokens + 1),
-            dtype=torch.int64,
+            dtype=torch.int32,
             device='cuda')
+
+        # Initialize dynamic tree ops converter for CUDA kernel integration
+        self.tree_ops_converter = create_dynamic_tree_ops_converter(
+            dynamic_tree_max_topK=dynamic_tree_max_topK,
+            max_draft_len=max_draft_len,
+            max_total_draft_tokens=max_total_draft_tokens,
+            max_batch_size=max_batch_size,
+            device=torch.device('cuda'),
+        )
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor,
                 attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,
@@ -638,11 +650,11 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                                         spec_metadata=spec_metadata,
                                         position_ids=position_ids,
                                         cur_draft_idx=0)
-
+            #infer: 5次，这边。。。1，2，3，4，5
             for layer_idx in range(1, self.max_draft_len):
                 num_infer_tokens = batch_size * (
                     self.dynamic_tree_max_topK) * layer_idx
-                print(f"======num_infer_tokens: {num_infer_tokens}")
+
                 print(
                     f"======input_ids: {self.draft_tokens_buffer[0:num_infer_tokens]}"
                 )
@@ -661,9 +673,9 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                 print(
                     f"======attn_metadata.spec_decoding_position_offsets: {attn_metadata.spec_decoding_position_offsets[:num_infer_tokens]}"
                 )
-                print(
-                    f"======attn_metadata.spec_decoding_packed_mask: {attn_metadata.spec_decoding_packed_mask[:num_infer_tokens]}"
-                )
+                # print(
+                #     f"======attn_metadata.spec_decoding_packed_mask: {attn_metadata.spec_decoding_packed_mask[:num_infer_tokens]}"
+                # )
                 print(
                     f"======attn_metadata.spec_decoding_generation_lengths: {attn_metadata.spec_decoding_generation_lengths[:batch_size]}"
                 )
@@ -686,7 +698,7 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                     logits=selected_logits,
                     max_top_k=spec_tree_manager.dynamic_tree_max_topK)
                 # Keep updating
-                print(f"======new_draft_tokens: {new_draft_tokens}")
+
                 cur_scores = self.update_draft_tokens_and_scores(
                     cur_draft_idx=layer_idx,
                     # batch_size=batch_size,
@@ -716,6 +728,44 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
         real_draft_tokens, topk_score_indices = self.resampling_final_draft_tokens(
             batch_size=batch_size)
 
+        # Build dynamic tree structure using CUDA kernel (in-place, writes to pre-allocated buffers)
+        tree_structure = None
+        if hasattr(
+                self,
+                'tree_ops_converter') and self.tree_ops_converter is not None:
+            try:
+                num_d = self.max_total_draft_tokens + 1
+                tree_structure = self.tree_ops_converter.build_dynamic_tree(
+                    history_draft_tokens_parent_buffer=self.
+                    history_draft_tokens_parent_buffer[:batch_size],
+                    topk_score_indices=topk_score_indices,
+                    tree_mask=self.tree_mask_buffer.view(
+                        self.max_batch_size, num_d, num_d)[:batch_size],
+                    positions=attn_metadata.spec_decoding_position_offsets.view(
+                        self.max_batch_size, num_d)[:batch_size],
+                    retrieve_index=spec_tree_manager.
+                    retrieve_index[:batch_size],
+                    retrieve_next_token=spec_tree_manager.
+                    retrieve_next_token[:batch_size],
+                    retrieve_next_sibling=spec_tree_manager.
+                    retrieve_next_sibling[:batch_size],
+                    use_packed_mask=False,
+                )
+                spec_tree_manager.compute_spec_dec_packed_mask(
+                    self.tree_mask_buffer.view(self.max_batch_size, num_d,
+                                               num_d)[:batch_size],
+                    attn_metadata.spec_decoding_packed_mask[:batch_size])
+
+                # Copy positions and packed mask to spec_tree_manager for target model verification
+                spec_tree_manager.spec_dec_position_offsets[:batch_size, :].copy_(
+                    attn_metadata.spec_decoding_position_offsets.view(
+                        self.max_batch_size, num_d)[:batch_size])
+                spec_tree_manager.spec_dec_packed_mask[:batch_size, :, :].copy_(
+                    attn_metadata.spec_decoding_packed_mask[:batch_size, :, :])
+
+            except Exception as e:
+                assert False, f"Dynamic tree CUDA kernel failed: {e}"
+
         # return_new_draft_tokens: [max_total_draft_tokens, batch_size]
         return_new_draft_tokens = torch.transpose(real_draft_tokens, 0, 1)
 
@@ -742,7 +792,9 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                 "topk_score_indices":
                 topk_score_indices,
                 "history_draft_tokens_parent_buffer":
-                self.history_draft_tokens_parent_buffer[:batch_size, :]
+                self.history_draft_tokens_parent_buffer[:batch_size, :],
+                "tree_structure":
+                tree_structure,  # CUDA kernel output or None
             }
         }
 
@@ -823,23 +875,16 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
             # 6) Process the parent buffer.
             # 6) Process the parent buffer.
             self.history_draft_tokens_parent_buffer[:batch_size, :self.
-                                                    dynamic_tree_max_topK] = -1  # Use -1 to represent the root node
-            # These selected nodes will expand into new nodes at the next layer.
-            # We update the parent nodes of these new nodes in advance.
-            parents_indices_for_next_layer_draft_tokens = torch.repeat_interleave(
-                torch.arange(0,
-                             self.dynamic_tree_max_topK,
-                             dtype=torch.int32,
-                             device='cuda'),
-                self.dynamic_tree_max_topK,
-                dim=0
-            )  # [self.dynamic_tree_max_topK * self.dynamic_tree_max_topK]
-            self.history_draft_tokens_parent_buffer[:batch_size,
-                                                    self.dynamic_tree_max_topK:
-                                                    self.dynamic_tree_max_topK +
-                                                    self.dynamic_tree_max_topK *
-                                                    self.
-                                                    dynamic_tree_max_topK] = parents_indices_for_next_layer_draft_tokens
+                                                    dynamic_tree_max_topK +
+                                                    1] = torch.arange(
+                                                        -1,
+                                                        self.
+                                                        dynamic_tree_max_topK,
+                                                        device='cuda',
+                                                        dtype=torch.int32
+                                                    ).unsqueeze(0).expand(
+                                                        batch_size, -1
+                                                    )  # Use -1 to represent the root node
 
             self.prepare_tree_mask_and_position_offset(cur_draft_idx,
                                                        attn_metadata,
@@ -912,25 +957,78 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
             self.update_hidden_states_indices(cur_draft_idx, attn_metadata,
                                               spec_metadata, selected_parents)
 
+            # 6) Update the parent nodes of the next layer's new nodes in advance.
+            # We need to know next layer's draft tokens are expanded from which parents.
             if cur_draft_idx < self.max_draft_len - 1:
-                # 6) Update the parent nodes of the next layer's new nodes in advance.
-                # We need to know next layer's draft tokens are expanded from which parents.
-                # i.e. calculate the index of the selected draft tokens in the entire tree (including all historical nodes, for subsequent reconstruction of the entire tree).
-                parents_indices = topk_indices + (
-                    self.dynamic_tree_max_topK + (cur_draft_idx - 1) *
-                    self.dynamic_tree_max_topK * self.dynamic_tree_max_topK
-                )  # [batch_size, self.dynamic_tree_max_topK]
-                parents_indices = torch.repeat_interleave(
-                    parents_indices, self.dynamic_tree_max_topK, dim=1
-                )  # [batch_size, self.dynamic_tree_max_topK * self.dynamic_tree_max_topK]
-                next_layer_draft_tokens_start_offset = self.dynamic_tree_max_topK + cur_draft_idx * self.dynamic_tree_max_topK * self.dynamic_tree_max_topK
-                next_layer_draft_tokens_end_offset = next_layer_draft_tokens_start_offset + self.dynamic_tree_max_topK * self.dynamic_tree_max_topK
+                next_layer_draft_tokens_start_offset = (
+                    cur_draft_idx) * self.dynamic_tree_max_topK + 1
+                next_layer_draft_tokens_end_offset = next_layer_draft_tokens_start_offset + self.dynamic_tree_max_topK
+                parents_relative_indices = topk_indices + self.dynamic_tree_max_topK**2 * (
+                    cur_draft_idx - 1) + self.dynamic_tree_max_topK
                 self.history_draft_tokens_parent_buffer[:batch_size,
                                                         next_layer_draft_tokens_start_offset:
-                                                        next_layer_draft_tokens_end_offset] = parents_indices[:, :]
+                                                        next_layer_draft_tokens_end_offset] = parents_relative_indices
 
             return_draft_scores = topk_values
         return return_draft_scores
+
+    def collect_parent_list_for_sglang(
+        self,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """
+        收集parent_list以兼容sglang的build_tree_kernel_efficient格式
+
+        sglang的parent_list格式:
+        - 这是一个concat的列表，包含每一层（除最后一层）的parent信息
+        - Layer 0: [-1, 0, 1, ..., K-1]  长度K+1
+            - -1表示root（verified token）
+            - 0到K-1表示Layer 0的K个tokens
+        - Layer i (i>=1): 长度K，表示该层每个token的parent在全局draft tokens中的索引
+            - 计算公式: topk_cs_index + (K^2 * (i-1) + K)
+
+        Returns:
+            parent_list: [batch_size, total_parents]
+                total_parents = (K+1) + K + K + ... + K  (前N-1层)
+                             = (K+1) + K*(N-2)
+                             = K*N - K + 1
+        """
+        K = self.dynamic_tree_max_topK
+        N = self.max_draft_len
+
+        # total_parents = (K+1) + K*(N-2) = K*N - K + 1
+        # 但从你给的例子看，parent_list.shape=[1, 51]
+        # 假设K=10, N=6: 应该是 (10+1) + 10*4 = 51 ✓
+        (K + 1) + K * (N - 2)
+        parent_list_parts = []
+
+        # Layer 0: [-1, 0, 1, 2, ..., K-1]
+        layer0_parents = torch.arange(-1, K, dtype=torch.int64, device='cuda')
+        layer0_parents = layer0_parents.unsqueeze(0).expand(
+            batch_size, -1)  # [batch_size, K+1]
+        parent_list_parts.append(layer0_parents)
+
+        # Layer 1 到 Layer N-2 (因为最后一层不需要parent信息)
+        # 注意：history_draft_tokens_parent_buffer的布局
+        # index 0: 未使用
+        # index 1 到 K: Layer 1 tokens的parents
+        # index K+1 到 2K: Layer 2 tokens的parents
+        # ...
+        for layer_idx in range(1, N - 1):
+            # 读取该层tokens的parent indices
+            read_start = 1 + (layer_idx - 1) * K
+            read_end = read_start + K
+
+            layer_parents = self.history_draft_tokens_parent_buffer[:batch_size,
+                                                                    read_start:
+                                                                    read_end]
+            parent_list_parts.append(layer_parents)  # [batch_size, K]
+
+        # 拼接所有层的parents
+        parent_list = torch.cat(parent_list_parts,
+                                dim=1)  # [batch_size, total_parents]
+
+        return parent_list
 
     def prepare_tree_mask_and_position_offset(
             self,

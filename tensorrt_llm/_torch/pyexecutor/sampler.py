@@ -1395,7 +1395,19 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         request: LlmRequest,
         new_tokens: list[list[list[int]]],
         finish_reasons: FinishReasonsList,
-    ) -> int:
+    ) -> int:  # new_tokens.shape = [max_total_draft_tokens + 1, max_num_sequences, max_beam_width]
+        # add_token(step=0) 取的是 new_tokens[0][seq_slot][beam_idx]。
+
+        #   new_tokens 是 target model 对整棵树做 forward 后的采样结果，
+        #   shape = [max_total_draft_tokens + 1, max_num_sequences,
+        #   max_beam_width]。
+
+        #   - new_tokens[0] = target model 在 root 位置（即已确认上下文的最后一个 token 位置）的预测 → 这就是 "cat"
+        #   - new_tokens[1] = target model 在 draft 位置 1（"cat"）的预测 → 这就是 "on"
+        #   - new_tokens[2] = target model 在 draft 位置 2（"dog"）的预测 → "went"
+        #   - ...
+
+        #   所以 add_token(step=0) 添加的是 "cat"，不是 root 本身。
         new_token = add_token(request, new_tokens, beam_idx=DEFAULT_BEAM_IDX)
         stop = self.finish_if_reason(request, finish_reasons, step=0, beam_idx=DEFAULT_BEAM_IDX)
         if stop or get_draft_token_length(request) == 0:
@@ -1415,6 +1427,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
                 ):
                     break
         else:
+            # come here
             for draft_token in request.py_draft_tokens:
                 if draft_token != new_token:
                     # Reject.
@@ -1429,6 +1442,54 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
                 ):
                     break
         return num_accepted
+
+    # step=0: new_token = add_token(step=0)  → 添加 target 在 root 位置的预测（即 "cat"）
+    #           new_token 现在 = "cat"
+
+    #   循环:
+    #     draft_tokens[0] = "cat" == new_token = "cat" ✓
+    #       num_accepted = 1
+    #       new_token = add_token(step=1)  → 添加 target 在位置 1 的预测（即 "on"）
+    #       new_token 现在 = "on"
+
+    #     draft_tokens[1] = "on" == new_token = "on" ✓
+    #       num_accepted = 2
+    #       new_token = add_token(step=2)  → 添加 target 在位置 2 的预测（即 "the"）← 这就是 bonus token
+    #       new_token 现在 = "the"
+
+    #     draft_tokens[2] = "is" != new_token = "the" ✗ → break
+
+    #   每次 draft token 匹配成功后，add_token(step=num_accepted)
+    #   添加的是 target model 在下一个位置的预测。当最后一个 draft
+    #   token 匹配时，add_token 添加的那个 token 就是 bonus token
+    #   — target model 的"免费"预测，即使后面没有 draft token
+    #   与之对应。
+
+    #   但 return num_accepted 返回的是 accepted draft token 数
+    #   （不含 bonus）。bonus token 已经通过 add_token 添加到
+    #   request 里了，只是不计入 num_accepted。
+    # accepted draft token 数（不含 bonus）===》包含root吗？
+
+    # ● 不包含 root。num_accepted 纯粹是被接受的 draft token 数量。
+
+    #   用例子说明：
+
+    #   root → "cat" → "on" → [bonus: "the"]
+
+    #   step=0: add_token(step=0) 添加 "cat"          ← target 在 root 位置的预测，不计入 num_accepted
+    #   循环:
+    #     draft="cat" == "cat" ✓ → num_accepted=1, add_token(step=1) 添加 "on"
+    #     draft="on"  == "on"  ✓ → num_accepted=2, add_token(step=2) 添加 "the" ← bonus
+    #     draft="is"  != "the" ✗ → break
+
+    #   return num_accepted = 2
+
+    #   实际添加了 3 个 token（"cat", "on", "the"），但 num_accepted = 2：
+    #   - 不含 root（root 是旧 token，不是新添加的）
+    #   - 不含 bonus（"the" 虽然被添加了，但不算 accepted draft token）
+    #   - 只计 draft token 中被接受的："cat" 和 "on"
+
+    #   这和 verify kernel 的 acceptTokenNum 语义一致：acceptTokenNum[0] = 2。
 
     def _process_draft_tokens_tree(
         self,
@@ -1524,6 +1585,133 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         request.py_num_accepted_draft_tokens_indices = (tree_node_indices - 1).tolist()
 
         return num_accepted_draft_tokens - 1
+
+    def _batch_verify_dynamic_tree(
+        self,
+        generation_requests: list[LlmRequest],
+        new_tokens: torch.Tensor,
+        spec_tree_manager: SpecTreeManager,
+    ) -> dict[int, tuple[int, torch.Tensor]]:
+        """Batch verify dynamic tree using CUDA kernel.
+
+        Uses spec_tree_manager retrieve buffers and new_tokens directly,
+        with num_trees as batch dimension to avoid per-request gather.
+        """
+        N = spec_tree_manager.max_total_draft_tokens + 1  # includes root
+        num_trees = spec_tree_manager.retrieve_index.shape[0]
+
+        # Collect eligible slots and their draft tokens
+        eligible_slots = []
+        eligible_drafts = []
+        for req in generation_requests:
+            if (
+                req.state == LlmRequestState.GENERATION_COMPLETE
+                or req.sampling_config.beam_width > 1
+                or get_draft_token_length(req) == 0
+            ):
+                continue
+            eligible_slots.append(req.py_seq_slot)
+            eligible_drafts.append([int(t) for t in req.py_draft_tokens])
+
+        if not eligible_slots:
+            return {}
+
+        # candidates [num_trees, N]: scatter draft tokens into seq_slot rows
+        candidates = torch.zeros(num_trees, N, dtype=torch.int64, device="cuda")
+        slots_t = torch.tensor(eligible_slots, dtype=torch.long, device="cuda")
+        candidates[slots_t, 1:] = torch.tensor(eligible_drafts, dtype=torch.int64, device="cuda")
+
+        # target_predict [num_trees, N]: directly from new_tokens
+        target_predict = (
+            new_tokens[:, :num_trees, 0].T.contiguous().to(dtype=torch.int64, device="cuda")
+        )
+        candidates[:, 0] = target_predict[:, 0]  # root always match
+
+        # Call kernel: pass spec_tree_manager buffers directly
+        _, accept_index, accept_token_num = torch.ops.trtllm.verify_dynamic_tree_greedy_op(
+            candidates,
+            spec_tree_manager.retrieve_index,
+            spec_tree_manager.retrieve_next_token,
+            spec_tree_manager.retrieve_next_sibling,
+            target_predict,
+            spec_tree_manager.max_draft_len + 1,
+        )
+
+        return {
+            slot: (int(accept_token_num[slot].item()), accept_index[slot])
+            for slot in eligible_slots
+        }
+
+    def _process_draft_tokens_dynamic_tree(
+        self,
+        request: LlmRequest,
+        new_tokens_list: list[list[list[int]]],
+        finish_reasons: FinishReasonsList,
+        verify_result: tuple[int, torch.Tensor],
+    ) -> int:
+        """Process a single request using pre-computed CUDA kernel verification result.
+
+        Args:
+            request: The request with draft tokens.
+            new_tokens_list: Target model predictions as nested list.
+            finish_reasons: Finish reasons for all requests.
+            verify_result: (num_accepted_draft_tokens, accept_index) from kernel.
+
+        Returns:
+            Number of accepted draft tokens (excluding root).
+        """
+        num_accepted, accept_index = verify_result
+        # accept_index now contains local tree positions (0, 1, 4, ...) directly,
+        # since retrieveIndex stores local indices after the kernel change.
+        #         //!   acceptTokenNum [bs=2]:  [2, 2]
+        # //!
+        # //!   acceptIndex [bs=2, numSpeculativeTokens=3]:
+        # //!     batch 0: [0, 1, 4]          ← 本地树位置[cat,on,the]
+        # //!       ===>这是target model token预测的token index
+        # //!     batch 1: [0, 1, 4]          ← 本地树位置，和 batch 0 相同 (因为树结构相同)
+        # //!   targetPredict [bs*numDraftTokens = 12], 连续存储:
+        # //!     index:    [  0,     1,      2,    3,     4,      5,   | 6,     7,      8,    9,    10,     11  ]
+        # //!     value:    ["cat", "on", "went",  "a", "the", "fast", |"cat", "on", "went",  "a", "the", "fast"]
+        # //!               |<------------ batch 0 ------------>|       |<------------ batch 1 ------------>|
+        num_added = 0
+        for j in range(num_accepted + 1):
+            step = int(
+                accept_index[j].item()
+            )  # local tree position,所以添加了cat，on，the三个token
+            add_token(request, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX, step=step)
+            num_added += 1
+            if self.finish_if_reason(request, finish_reasons, step=step, beam_idx=DEFAULT_BEAM_IDX):
+                break
+        # //!     candidates:          [  _,  cat, dog,  is,  on, ran]
+        # //!                            ^root占位  ^树内位置 1..5 对应 draft tokens
+        # //!     retrieveIndex:       [  0,   1,   2,   3,   4,   5]
+        # local tree position p -> draft index = p - 1 (root is position 0, first draft is position 1)
+        request.py_num_accepted_draft_tokens_indices = [
+            int(accept_index[j].item()) - 1 for j in range(1, min(num_added, num_accepted + 1))
+        ]
+        # 用上面的例子来说：
+
+        #   acceptIndex = [0, 1, 4], num_accepted = 2, num_added = 3
+
+        #   range(1, min(3, 3)) = range(1, 3) → j = 1, 2
+
+        #   j=1: accept_index[1] = 1  → 1 - 1 = 0
+        #   j=2: accept_index[2] = 4  → 4 - 1 = 3
+
+        #   py_num_accepted_draft_tokens_indices = [0, 3]
+
+        #   比如 num_accepted = 2, acceptIndex = [0, 1, 4]：
+
+        #   - 正常情况：循环跑满 3 次，num_added = 3 = num_accepted + 1，min(3, 3) = 3
+        #   - 提前结束：j=1 时 add_token 添加了 "on"，然后
+        #   finish_if_reason 检测到 EOS，break。
+        #   此时 num_added = 2 < num_accepted + 1 = 3，
+        #   min(2, 3) = 2
+
+        #   min 保证 py_num_accepted_draft_tokens_indices 只包含
+        #   实际已添加的 draft tokens，不包含因 EOS 提前终止而
+        #   未添加的部分。
+        return num_added - 1  # excluding root
 
     def setup_sampler_step(self, requests: ScheduledRequests):
         """Setup the sampler step for the requests
@@ -1682,6 +1870,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
                     spec_tree_manager=spec_tree_manager,
                 )
             else:
+                # come here
                 num_accepted = self._process_draft_tokens_greedy(
                     request, new_tokens=new_tokens_list, finish_reasons=finish_reasons
                 )
@@ -1975,7 +2164,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             state.sampler_event.synchronize()
 
         assert state.host is not None
-        new_tokens = state.host.new_tokens
+        new_tokens = state.host.new_tokens  # torch.Size([5, 2048, 1])
         finish_reasons = state.host.finish_reasons_list()
 
         new_tokens_list = new_tokens.tolist()
@@ -2002,6 +2191,14 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             self._handle_finish_reasons(req, state.host.finish_reasons, finish_reasons)
             req.py_decoding_iter += 1
 
+        # Batch verify dynamic tree before per-request loop
+        spec_tree_manager = self.get_spec_tree_manager(resource_manager)
+        dynamic_tree_results: dict[int, tuple[int, torch.Tensor]] = {}
+        if spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree:
+            dynamic_tree_results = self._batch_verify_dynamic_tree(
+                state.scheduled_requests.generation_requests, new_tokens, spec_tree_manager
+            )
+
         for req_idx, req in enumerate(
             state.scheduled_requests.generation_requests,
             len(state.scheduled_requests.context_requests),
@@ -2025,17 +2222,25 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
 
             else:
                 processed = 1
-                num_accepted = self.process_draft_tokens(
-                    req,
-                    new_tokens_tensor=new_tokens,
-                    new_tokens_list=new_tokens_list,
-                    finish_reasons=finish_reasons,
-                    resource_manager=resource_manager,
-                )
+                if req.py_seq_slot in dynamic_tree_results:
+                    num_accepted = self._process_draft_tokens_dynamic_tree(
+                        req, new_tokens_list, finish_reasons, dynamic_tree_results[req.py_seq_slot]
+                    )
+
+                else:
+                    num_accepted = self.process_draft_tokens(
+                        req,
+                        new_tokens_tensor=new_tokens,
+                        new_tokens_list=new_tokens_list,
+                        finish_reasons=finish_reasons,
+                        resource_manager=resource_manager,
+                    )
                 if get_draft_token_length(req) > 0:
                     req.py_num_accepted_draft_tokens = num_accepted
                     actual_draft_len = get_draft_token_length(req)
-                    req.py_rewind_len = actual_draft_len - num_accepted
+                    req.py_rewind_len = (
+                        actual_draft_len - num_accepted
+                    )  # num_accepted 只统计被接受的draft token 数量
                 else:
                     req.py_num_accepted_draft_tokens = 0
                     req.py_rewind_len = 0

@@ -138,7 +138,7 @@ def add_llm_args(parser):
                         action='store_true')
 
     # Sampling
-    parser.add_argument("--max_tokens", type=int, default=64)
+    parser.add_argument("--max_tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--top_p", type=float, default=None)
@@ -200,7 +200,12 @@ def parse_arguments():
     parser = argparse.ArgumentParser(
         description="LLM models with the PyTorch workflow.")
     parser = add_llm_args(parser)
-    parser.add_argument("--kv_cache_fraction", type=float, default=0.9)
+    parser.add_argument("--kv_cache_fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        default=False,
+        help="Use streaming generate_async instead of generate.")
     args = parser.parse_args()
     return args
 
@@ -356,41 +361,52 @@ def main():
         13, 578, 18328, 6835, 11190, 11, 11944, 11, 323, 48887, 11503, 311, 279,
         1217, 596, 4860, 13, 14194, 25, 22691, 36660, 3931, 2891, 25
     ]]
-    outputs = llm.generate(prompts, sampling_params)
 
-    for i, output in enumerate(outputs):
-        prompt = output.prompt
-        for sequence_idx, sequence in enumerate(output.outputs):
-            generated_text = sequence.text
-            # Skip printing the beam_idx if no beam search was used
-            sequence_id_text = f"[{sequence_idx}]" if args.max_beam_width > 1 or args.n > 1 else ""
+    args.spec_decode_max_draft_len
+
+    for i, prompt in enumerate(prompts):
+        num_tokens = 0
+        num_iterations = 0
+
+        if args.streaming:
+            for output in llm.generate_async(prompt,
+                                             sampling_params,
+                                             streaming=True):
+                new_tokens = output.outputs[0].token_ids
+                num_tokens = len(new_tokens)
+                num_iterations += 1
+        else:
+            print(f"=====start======")
+            output = llm.generate(prompt, sampling_params)
+
+        if args.streaming and num_iterations > 0:
+            accept_rate = num_tokens / num_iterations
+            print(f"[{i}] Accept rate: {accept_rate:.2f} "
+                  f"(tokens={num_tokens}, iterations={num_iterations})")
+
+        generated_text = output.outputs[0].text
+        print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+
+        if args.return_context_logits:
+            print(f"[{i}] Context logits: {output.context_logits}")
+        if args.return_generation_logits:
             print(
-                f"[{i}]{sequence_id_text} Prompt: {prompt!r}, Generated text: {generated_text!r}"
+                f"[{i}] Generation logits: {output.outputs[0].generation_logits}"
             )
-            if args.return_context_logits:
-                print(
-                    f"[{i}]{sequence_id_text} Context logits: {output.context_logits}"
-                )
-            if args.return_generation_logits:
-                print(
-                    f"[{i}]{sequence_id_text} Generation logits: {sequence.generation_logits}"
-                )
-            if args.prompt_logprobs:
-                print(
-                    f"[{i}]{sequence_id_text} Prompt logprobs: {sequence.prompt_logprobs}"
-                )
-            if args.logprobs:
-                print(f"[{i}]{sequence_id_text} Logprobs: {sequence.logprobs}")
+        if args.prompt_logprobs:
+            print(f"[{i}] Prompt logprobs: {output.outputs[0].prompt_logprobs}")
+        if args.logprobs:
+            print(f"[{i}] Logprobs: {output.outputs[0].logprobs}")
 
-            if args.additional_model_outputs:
-                for output_name in args.additional_model_outputs:
-                    if sequence.additional_context_outputs:
-                        print(
-                            f"[{i}]{sequence_id_text} Context {output_name}: {sequence.additional_context_outputs[output_name]}"
-                        )
+        if args.additional_model_outputs:
+            for output_name in args.additional_model_outputs:
+                if output.outputs[0].additional_context_outputs:
                     print(
-                        f"[{i}]{sequence_id_text} Generation {output_name}: {sequence.additional_generation_outputs[output_name]}"
+                        f"[{i}] Context {output_name}: {output.outputs[0].additional_context_outputs[output_name]}"
                     )
+                print(
+                    f"[{i}] Generation {output_name}: {output.outputs[0].additional_generation_outputs[output_name]}"
+                )
 
     if args.log_kv_cache_events:
         time.sleep(1)  # Wait for events to be dispatched

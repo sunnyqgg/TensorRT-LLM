@@ -621,14 +621,14 @@ class Attention(nn.Module):
                                         mrope_config=mrope_config,
                                         attention_sinks=attention_sinks)
 
-        # #region agent log - DEBUG: Print attention output after XQA
-        if hasattr(attn_metadata,
-                   'use_spec_decoding') and attn_metadata.use_spec_decoding:
-            print(f"[DEBUG-XQA-OUTPUT] layer_idx={self.layer_idx}")
-            print(
-                f"  attn_output.shape={attn_output.shape}, min={attn_output.min().item():.4f}, max={attn_output.max().item():.4f}, mean={attn_output.mean().item():.6f}"
-            )
-        # #endregion
+        # # #region agent log - DEBUG: Print attention output after XQA
+        # if hasattr(attn_metadata,
+        #            'use_spec_decoding') and attn_metadata.use_spec_decoding:
+        #     print(f"[DEBUG-XQA-OUTPUT] layer_idx={self.layer_idx}")
+        #     print(
+        #         f"  attn_output.shape={attn_output.shape}, min={attn_output.min().item():.4f}, max={attn_output.max().item():.4f}, mean={attn_output.mean().item():.6f}"
+        #     )
+        # # #endregion
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)

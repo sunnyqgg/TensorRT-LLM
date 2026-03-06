@@ -73,6 +73,13 @@ class SpecTreeManager:
     # shape: [1, max_total_draft_tokens + 1], device tensor.
     spec_dec_position_offsets_for_drafter_model: torch.Tensor = None
 
+    # CUDA kernel outputs for dynamic tree verification.
+    # These are produced by build_dynamic_tree CUDA kernel and used by verify_dynamic_tree_greedy.
+    # shape: [num_trees, max_total_draft_tokens + 1], int64, device tensor.
+    retrieve_index: torch.Tensor = None
+    retrieve_next_token: torch.Tensor = None
+    retrieve_next_sibling: torch.Tensor = None
+
     def __init__(self, max_num_requests: int, use_dynamic_tree: bool,
                  max_total_draft_tokens: int, max_draft_len: int,
                  eagle_choices: [List[List[int]]], dynamic_tree_max_topK: int):
@@ -121,6 +128,22 @@ class SpecTreeManager:
         # self.dump_tree_info()
 
     def init_tree_info_for_dynamic_tree(self):
+        # Allocate retrieve buffers for CUDA kernel outputs
+        num_draft_with_root = self.max_total_draft_tokens + 1
+        self.retrieve_index = torch.zeros((self.num_trees, num_draft_with_root),
+                                          dtype=torch.int32,
+                                          device='cuda')
+        self.retrieve_next_token = torch.full(
+            (self.num_trees, num_draft_with_root),
+            -1,
+            dtype=torch.int32,
+            device='cuda')
+        self.retrieve_next_sibling = torch.full(
+            (self.num_trees, num_draft_with_root),
+            -1,
+            dtype=torch.int32,
+            device='cuda')
+
         # For the dynamic tree
         # To the internal layer, the number of nodes is the same as the dynamic_tree_max_topK.
         self.spec_dec_position_offsets_for_drafter_model = torch.zeros(
