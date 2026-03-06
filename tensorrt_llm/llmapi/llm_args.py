@@ -923,7 +923,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
             )
 
         self.num_eagle_layers = self.max_draft_len
-        self.max_total_draft_tokens = self.max_draft_len  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
             # FIXME find a better way to setup it.
@@ -969,7 +968,25 @@ class EagleDecodingConfig(DecodingBaseConfig):
                     "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
                 )
 
-        return self
+        if self.use_dynamic_tree or self.dynamic_tree_max_topK is not None:
+            self.use_dynamic_tree = True
+            assert self.dynamic_tree_max_topK is not None and self.dynamic_tree_max_topK > 0, "dynamic_tree_max_topK is required for dynamic tree"
+            assert self.eagle_choices is None, "If use_dynamic_tree is True, eagle_choices should be None"
+            total_history_draft_tokens = self.dynamic_tree_max_topK + self.dynamic_tree_max_topK * self.dynamic_tree_max_topK * (
+                self.max_draft_len - 1)
+            default_max_total_draft_tokens = self.dynamic_tree_max_topK * self.max_draft_len
+
+            if self.max_total_draft_tokens is None:
+                self.max_total_draft_tokens = default_max_total_draft_tokens
+                logger.warning(
+                    f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)"
+                )
+            else:
+                assert self.max_total_draft_tokens <= total_history_draft_tokens and self.max_total_draft_tokens >= default_max_total_draft_tokens, f"max_total_draft_tokens should be between {default_max_total_draft_tokens} and {total_history_draft_tokens}"
+
+        # Linear tree
+        if self.max_total_draft_tokens is None:
+            self.max_total_draft_tokens = self.max_draft_len
 
     @model_validator(mode="after")
     def validate_speculative_model(self) -> 'EagleDecodingConfig':
@@ -1816,6 +1833,19 @@ SpeculativeConfig: TypeAlias = Annotated[
     ],
     Field(discriminator="decoding_type"),
 ]
+
+SpeculativeConfig: TypeAlias = Optional[Union[
+    DraftTargetDecodingConfig,
+    Eagle3DecodingConfig,  # Must be before EagleDecodingConfig since it's a subclass
+    EagleDecodingConfig,
+    LookaheadDecodingConfig,
+    MedusaDecodingConfig,
+    MTPDecodingConfig,
+    NGramDecodingConfig,
+    UserProvidedDecodingConfig,
+    SaveHiddenStatesDecodingConfig,
+    AutoDecodingConfig,
+]]
 
 SparseAttentionConfig: TypeAlias = Annotated[
     Union[
@@ -3258,7 +3288,14 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_speculative_config(self):
+        from tensorrt_llm.logger import logger
+        logger.info(
+            f"[DEBUG TorchLlmArgs.validate_speculative_config] self.speculative_config = {self.speculative_config}, type = {type(self.speculative_config) if self.speculative_config else None}"
+        )
         if self.speculative_config:
+            logger.info(
+                f"[DEBUG TorchLlmArgs.validate_speculative_config] speculative_config is truthy"
+            )
             if not self.speculative_config.supports_backend(self.backend):
                 raise ValueError(
                     f"Speculation type {self.speculative_config.decoding_type} does not "
@@ -3295,8 +3332,16 @@ class TorchLlmArgs(BaseLlmArgs):
                     self.speculative_config._draft_target_one_model = False
 
         else:
+            from tensorrt_llm.logger import logger
+            logger.info(
+                f"[DEBUG TorchLlmArgs.validate_speculative_config] speculative_config is falsy, setting decoding_config to None"
+            )
             self.decoding_config = None
 
+        from tensorrt_llm.logger import logger
+        logger.info(
+            f"[DEBUG TorchLlmArgs.validate_speculative_config] returning, self.speculative_config = {self.speculative_config}"
+        )
         return self
 
     @model_validator(mode="after")
