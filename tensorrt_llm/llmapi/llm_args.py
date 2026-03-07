@@ -988,6 +988,8 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.max_total_draft_tokens is None:
             self.max_total_draft_tokens = self.max_draft_len
 
+        return self
+
     @model_validator(mode="after")
     def validate_speculative_model(self) -> 'EagleDecodingConfig':
         if self.speculative_model is None:

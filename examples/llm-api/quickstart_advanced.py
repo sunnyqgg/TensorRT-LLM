@@ -10,9 +10,7 @@ from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
                                  TorchCompileConfig)
 
 example_prompts = [
-    "Hello, my name is",
-    "The capital of France is",
-    "The future of AI is",
+    "A conversation between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: Hello! ASSISTANT:",
 ]
 
 
@@ -148,7 +146,7 @@ def add_llm_args(parser):
                         action='store_true')
 
     # Sampling
-    parser.add_argument("--max_tokens", type=int, default=64)
+    parser.add_argument("--max_tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--top_p", type=float, default=None)

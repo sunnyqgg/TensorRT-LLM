@@ -635,7 +635,8 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata,
                     return_context_logits=True)
-                logits = logits.reshape(batch_size, num_infer_tokens,
+                logits = logits.reshape(batch_size,
+                                        num_infer_tokens // batch_size,
                                         vocab_size)
 
                 selected_logits = logits[:, -self.
@@ -789,7 +790,8 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
 
             num_tokens_layer0 = batch_size * self.dynamic_tree_max_topK
             self.draft_tokens_buffer[:
-                                     num_tokens_layer0] = new_draft_tokens  # 1D contiguous storage
+                                     num_tokens_layer0] = new_draft_tokens.reshape(
+                                         -1)  # 1D contiguous storage
 
             self.history_draft_tokens_buffer[:batch_size, :self.
                                              dynamic_tree_max_topK] = new_draft_tokens.reshape(
