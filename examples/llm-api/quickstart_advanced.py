@@ -10,7 +10,10 @@ from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
                                  TorchCompileConfig)
 
 example_prompts = [
-    "A conversation between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: Hello! ASSISTANT:",
+    "Hello, my name is",
+    "The capital of France is",
+    "The future of AI is",
+    # "A conversation between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: Hello! ASSISTANT:",
 ]
 
 

@@ -507,9 +507,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         attn_metadata.use_spec_decoding = True
 
-        # Increment debug iter counter
-        self._e3_fwd_iter += 1
-
         return {
             'logits': raw_logits,
             'new_tokens': accepted_tokens,

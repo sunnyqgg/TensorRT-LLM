@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -104,11 +104,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._max_total_draft_tokens = max_total_draft_tokens
         self.logsoftmax = nn.LogSoftmax(dim=-1)
 
-        # 1D buffers: store tokens contiguously
-        self.dt_draft_tokens_buffer = torch.zeros(
+        # 1D buffers: store tokens contiguously (matching two-model naming)
+        self.draft_tokens_buffer = torch.zeros(
             (max_batch_size * max_total_draft_tokens), dtype=torch.int64, device="cuda"
         )
-        self.dt_position_ids_buffer = torch.zeros(
+        self.position_ids_buffer = torch.zeros(
             (max_batch_size * (max_total_draft_tokens + 1)), dtype=torch.int64, device="cuda"
         )
         self.history_draft_tokens_buffer = torch.zeros(
@@ -150,10 +150,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         # Draft KV lens tracking: persistent across iterations.
         # Saves the draft model's kv_lens per batch position so that gen
         # requests can override the target's kv_lens at the start of step 0.
-        # Context requests save their context_len here; gen requests load it.
-        # This is the one-model equivalent of two-model's save_metadata_state
-        # which saves/restores draft model's own kv_lens around growing context.
         self._saved_draft_kv_lens = torch.zeros(max_batch_size, dtype=torch.int32, device="cuda")
+
+        # Hidden state management buffers (initialized in update_hidden_states step 0)
+        self._hs_write_buffer = None
+        self._hs_read_map = None
+        self._accumulated_hs = None
+        self._step0_hs = None
+        self._hs_dim = None
 
     # ---- Overridden dispatch methods ----
 
@@ -171,13 +175,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         original_all_rank_num_tokens,
         resource_manager,
     ):
-        """Dispatch to dynamic tree draft loop.
-
-        Unlike the buggy early-return approach, this always runs the full
-        dynamic tree draft loop — even for context-only batches (num_gens==0).
-        This produces real draft tokens (not zeros) so the first generation
-        iteration processes meaningful candidates, matching two-model behavior.
-        """
+        """Dispatch to dynamic tree draft loop."""
         return self._forward_dynamic_tree_draft_loop(
             inputs,
             attn_metadata,
@@ -321,10 +319,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     ):
         """Dynamic tree draft loop with growing context.
 
-        Matches the two-model DynamicTreeDraftingLoopWrapper approach:
-        - Step 0: initial forward, sample K tokens, set up KV/position/mask
-        - Steps 1+: growing context (reprocess all accumulated tokens),
-          tree attention mask, take last K logits for sampling
+        Matches the two-model DynamicTreeDraftingLoopWrapper structure:
+        - Step 0: initial forward, sample K tokens, update buffers
+        - prepare_for_generation(0): set up KV/position/mask
+        - Steps 1+: growing context forward, sample, update, prepare
         """
         K = self.dynamic_tree_max_topK
 
@@ -339,465 +337,235 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 self.spec_tree_manager = spec_rm.spec_tree_manager
 
         spec_tree_manager = self.spec_tree_manager
-        previous_draft_scores = None
+
+        # === Step 0: Initial forward ===
+        # Extract only accepted path tokens (one-model inputs contain ALL tree
+        # tokens in tree-topology order; must gather accepted path only so draft
+        # KV matches two-model behavior).
+        gen_tokens_per_req = spec_metadata.max_total_draft_tokens + 1
+
+        _used_accepted_path = False
+        _has_acc_idx = getattr(self, "_accepted_draft_indices_tensor", None)
+        if _has_acc_idx is not None and num_gens > 0:
+            _used_accepted_path = True
+            acc_gather_list = []
+
+            # Context tokens: keep all
+            if attn_metadata.num_ctx_tokens > 0:
+                acc_gather_list.append(
+                    torch.arange(attn_metadata.num_ctx_tokens, device="cuda", dtype=torch.long)
+                )
+
+            # Gen requests: root + accepted draft positions
+            for g_idx in range(num_gens):
+                req_idx = num_contexts + g_idx
+                n_acc = int(num_accepted_tokens[req_idx].item())
+                gen_start = attn_metadata.num_ctx_tokens + g_idx * gen_tokens_per_req
+
+                if n_acc <= 1:
+                    path_pos = torch.tensor([0], device="cuda", dtype=torch.long)
+                else:
+                    draft_pos = self._accepted_draft_indices_tensor[req_idx, : n_acc - 1].long() + 1
+                    path_pos = torch.cat(
+                        [torch.tensor([0], device="cuda", dtype=torch.long), draft_pos]
+                    )
+
+                acc_gather_list.append(gen_start + path_pos)
+
+            acc_indices = torch.cat(acc_gather_list)
+
+            # Reconstruct inputs with accepted-path-only tokens
+            inputs = {
+                "input_ids": inputs["input_ids"][acc_indices],
+                "position_ids": inputs["position_ids"][acc_indices],
+                "hidden_states": inputs["hidden_states"][acc_indices],
+                "attn_metadata": attn_metadata,
+                "spec_metadata": spec_metadata,
+            }
+
+            # Update seq_lens to num_accepted per gen request
+            for g_idx in range(num_gens):
+                req_idx = num_contexts + g_idx
+                n_acc = int(num_accepted_tokens[req_idx].item())
+                attn_metadata._seq_lens[req_idx] = n_acc
+                attn_metadata._seq_lens_cuda[req_idx] = n_acc
+            attn_metadata.on_update()
+
+            # Compute gather_ids from new layout
+            cumsum = torch.cumsum(attn_metadata.seq_lens_cuda[:batch_size], dim=0)
+            gather_ids = cumsum.long() - 1
+            _orig_gather_ids = acc_indices[gather_ids]
+        else:
+            # Fallback: original gather_ids (warmup/context-only)
+            start_ids_gen = (
+                spec_metadata.batch_indices_cuda[:num_gens] * gen_tokens_per_req
+            ).long()
+            last_pos = num_accepted_tokens[num_contexts:] - 1
+            gather_ids_gen = start_ids_gen + last_pos + attn_metadata.num_ctx_tokens
+            gather_ids = torch.concat(
+                [spec_metadata.gather_ids[:num_contexts], gather_ids_gen], dim=0
+            )
+            _orig_gather_ids = gather_ids
+
+        # Override kv_lens for gen requests with draft KV cache values
+        # (must happen AFTER accepted-path extraction updates seq_lens).
+        if num_gens > 0:
+            gen_seq_lens = attn_metadata.seq_lens_cuda[num_contexts:batch_size]
+            saved_dkv = self._saved_draft_kv_lens[num_contexts:batch_size]
+            has_saved = saved_dkv > 0
+            if has_saved.any():
+                attn_metadata.kv_lens_cuda[num_contexts:batch_size][has_saved] = (
+                    saved_dkv[has_saved] + gen_seq_lens[has_saved]
+                )
+
+        if original_all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+
+        # Set up spec_decoding for multi-token gen requests so the attention
+        # kernel processes ALL accepted tokens (not just 1 per gen request).
+        if _used_accepted_path and num_gens > 0:
+            gen_sl = attn_metadata.seq_lens_cuda[num_contexts:batch_size]
+
+            attn_metadata.spec_decoding_generation_lengths[num_contexts:batch_size] = gen_sl
+
+            # position_offsets: causal [0, 1, ..., n_acc-1]
+            tokens_per_req = spec_metadata.max_total_draft_tokens + 1
+            total_po_size = attn_metadata.spec_decoding_position_offsets.shape[0]
+            max_reqs = total_po_size // tokens_per_req
+            pos_2d = attn_metadata.spec_decoding_position_offsets.view(max_reqs, tokens_per_req)
+            max_gl = int(gen_sl.max().item())
+            causal_offs = torch.arange(max_gl, device="cuda", dtype=torch.int32)
+            for g_idx in range(num_gens):
+                req_idx = num_contexts + g_idx
+                n = int(gen_sl[g_idx].item())
+                pos_2d[req_idx, :n] = causal_offs[:n]
+
+            # packed_mask: causal lower-triangular (n_acc <= 32 so word 0 suffices)
+            attn_metadata.spec_decoding_packed_mask[num_contexts:batch_size].fill_(0)
+            for g_idx in range(num_gens):
+                req_idx = num_contexts + g_idx
+                n = int(gen_sl[g_idx].item())
+                for t in range(n):
+                    attn_metadata.spec_decoding_packed_mask[req_idx, t, 0] = (1 << (t + 1)) - 1
+
+            attn_metadata.use_spec_decoding = True
+        else:
+            attn_metadata.use_spec_decoding = False
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-            for i in range(self.max_draft_len):
-                if i == 0:
-                    # === Step 0: Initial forward ===
-                    # FIX (Bug 4): Extract only accepted path tokens.
-                    # In the two-model, draft step 0 only processes the
-                    # accepted path (num_accepted+1 tokens). The one-model
-                    # inputs contain ALL tree tokens in tree-topology order.
-                    # Processing all tree tokens creates KV entries in tree
-                    # order, but the accepted path may not be at the start.
-                    # KV rewind then keeps wrong entries. Fix: gather only
-                    # accepted path tokens so draft KV matches two-model.
-                    gen_tokens_per_req = spec_metadata.max_total_draft_tokens + 1
+            hidden_states, hidden_states_to_save = draft_model.model(**inputs)
 
-                    _used_accepted_path = False
-                    _has_acc_idx = getattr(self, "_accepted_draft_indices_tensor", None)
-                    if _has_acc_idx is not None and num_gens > 0:
-                        _used_accepted_path = True
-                        # Build indices to accepted path tokens in flat input
-                        acc_gather_list = []
+            # Use draft model's pre-norm output as step0_hs (matches two-model
+            # where Eagle3DecoderLayer writes MLP_out + residual to shared buffer).
+            hs_dim = spec_metadata.hidden_size
+            step0_hs = hidden_states_to_save[gather_ids].clone()
 
-                        # Context tokens: keep all
-                        if attn_metadata.num_ctx_tokens > 0:
-                            acc_gather_list.append(
-                                torch.arange(
-                                    attn_metadata.num_ctx_tokens, device="cuda", dtype=torch.long
-                                )
-                            )
+            logits = draft_model.logits_processor(
+                hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
+            )
 
-                        # Gen requests: root + accepted draft positions
-                        for g_idx in range(num_gens):
-                            req_idx = num_contexts + g_idx
-                            n_acc = int(num_accepted_tokens[req_idx].item())
-                            gen_start = attn_metadata.num_ctx_tokens + g_idx * gen_tokens_per_req
+            new_draft_tokens, new_draft_scores = self.sample(logits, K, draft_model=draft_model)
 
-                            if n_acc <= 1:
-                                path_pos = torch.tensor([0], device="cuda", dtype=torch.long)
-                            else:
-                                draft_pos = (
-                                    self._accepted_draft_indices_tensor[req_idx, : n_acc - 1].long()
-                                    + 1
-                                )
-                                path_pos = torch.cat(
-                                    [torch.tensor([0], device="cuda", dtype=torch.long), draft_pos]
-                                )
+            previous_draft_scores = self.update_draft_tokens_and_scores(
+                cur_draft_idx=0,
+                new_draft_tokens=new_draft_tokens,
+                new_draft_scores=new_draft_scores,
+                previous_draft_scores=None,
+                attn_metadata=attn_metadata,
+                spec_tree_manager=spec_tree_manager,
+            )
 
-                            acc_gather_list.append(gen_start + path_pos)
+            self.update_hidden_states(
+                cur_draft_idx=0,
+                batch_size=batch_size,
+                step0_hs=step0_hs,
+                hs_dim=hs_dim,
+                hidden_states_to_save=None,
+                selected_parents=None,
+            )
 
-                        acc_indices = torch.cat(acc_gather_list)
+            self.prepare_for_generation(
+                cur_draft_idx=0,
+                attn_metadata=attn_metadata,
+                inputs=inputs,
+                gather_ids=gather_ids,
+                batch_size=batch_size,
+                num_contexts=num_contexts,
+                num_gens=num_gens,
+                num_accepted_tokens=num_accepted_tokens,
+                original_all_rank_num_tokens=original_all_rank_num_tokens,
+            )
 
-                        # Reconstruct inputs with accepted-path-only tokens
-                        inputs = {
-                            "input_ids": inputs["input_ids"][acc_indices],
-                            "position_ids": inputs["position_ids"][acc_indices],
-                            "hidden_states": inputs["hidden_states"][acc_indices],
-                            "attn_metadata": attn_metadata,
-                            "spec_metadata": spec_metadata,
-                        }
+            for layer_idx in range(1, self.max_draft_len):
+                num_tokens_per_req = layer_idx * K
 
-                        # Update seq_lens: num_accepted per gen request
-                        for g_idx in range(num_gens):
-                            req_idx = num_contexts + g_idx
-                            n_acc = int(num_accepted_tokens[req_idx].item())
-                            attn_metadata._seq_lens[req_idx] = n_acc
-                            attn_metadata._seq_lens_cuda[req_idx] = n_acc
-                        attn_metadata.on_update()
+                if original_all_rank_num_tokens is not None:
+                    if spec_metadata.all_rank_num_seqs is not None:
+                        attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
 
-                        # Compute gather_ids from new layout
-                        cumsum = torch.cumsum(attn_metadata.seq_lens_cuda[:batch_size], dim=0)
-                        gather_ids = cumsum.long() - 1
-                        # Map back to original token positions (for
-                        # reading raw target prenorm from spec_metadata)
-                        _orig_gather_ids = acc_indices[gather_ids]
-                    else:
-                        # Fallback: original gather_ids (warmup/context-only)
-                        start_ids_gen = (
-                            spec_metadata.batch_indices_cuda[:num_gens] * gen_tokens_per_req
-                        ).long()
-                        last_pos = num_accepted_tokens[num_contexts:] - 1
-                        gather_ids_gen = start_ids_gen + last_pos + attn_metadata.num_ctx_tokens
-                        gather_ids = torch.concat(
-                            [spec_metadata.gather_ids[:num_contexts], gather_ids_gen], dim=0
-                        )
-                        # gather_ids already in original token positions
-                        _orig_gather_ids = gather_ids
+                # Growing context: process ALL accumulated tokens
+                num_infer_tokens = batch_size * num_tokens_per_req
 
-                    # FIX (Bug 5 + Bug 10): Override kv_lens for gen
-                    # requests with draft KV cache values.  Must happen
-                    # AFTER accepted-path extraction updates seq_lens.
-                    #
-                    # prepare() pre-incremented kv_lens = cached + seq_lens
-                    # for the TARGET.  The draft cache has a different
-                    # number of cached entries (_saved_draft_kv_lens).
-                    # Correct formula: kv_lens = saved + gen_seq_lens.
-                    if num_gens > 0:
-                        gen_seq_lens = attn_metadata.seq_lens_cuda[num_contexts:batch_size]
-                        saved_dkv = self._saved_draft_kv_lens[num_contexts:batch_size]
-                        has_saved = saved_dkv > 0
-                        if has_saved.any():
-                            attn_metadata.kv_lens_cuda[num_contexts:batch_size][has_saved] = (
-                                saved_dkv[has_saved] + gen_seq_lens[has_saved]
-                            )
+                inp_hs = self._accumulated_hs[:batch_size, :num_tokens_per_req, :].reshape(
+                    num_infer_tokens, -1
+                )
+                inp_ids = self.draft_tokens_buffer[:num_infer_tokens].to(torch.int32)
+                inp_pos = self.position_ids_buffer[:num_infer_tokens]
+                inputs = {
+                    "input_ids": inp_ids,
+                    "position_ids": inp_pos,
+                    "hidden_states": inp_hs,
+                    "attn_metadata": attn_metadata,
+                    "spec_metadata": spec_metadata,
+                }
 
-                    if original_all_rank_num_tokens is not None:
-                        attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+                hidden_states, hidden_states_to_save = draft_model.model(**inputs)
 
-                    # FIX (Bug 15): Step 0 spec_decoding for multi-token
-                    # gen requests.
-                    #
-                    # When n_acc > 1 accepted tokens per gen request, the
-                    # C++ attention kernel must process ALL n_acc tokens.
-                    # Without spec_decoding, the kernel processes only 1
-                    # token per gen request (standard generation), producing
-                    # ZERO attention output for tokens 1+ and wrong logits
-                    # at gather_ids (the last accepted token).
-                    #
-                    # In the accepted-path extraction case, we set proper
-                    # spec_decoding params (generation_lengths, position_
-                    # offsets, packed_mask) for causal attention among the
-                    # accepted tokens. In the fallback/warmup case, we
-                    # keep spec_decoding disabled for safety (stale tensors
-                    # from target verification would cause OOB access).
-                    if _used_accepted_path and num_gens > 0:
-                        gen_sl = attn_metadata.seq_lens_cuda[num_contexts:batch_size]
+                # Take last K logits per request
+                hs_reshaped = hidden_states.reshape(batch_size, num_tokens_per_req, -1)
+                selected_hs = hs_reshaped[:, -K:, :].reshape(batch_size * K, -1)
+                logits = draft_model.logits_processor(
+                    selected_hs, draft_model.lm_head, attn_metadata, True
+                )
 
-                        # generation_lengths = n_acc per gen request
-                        attn_metadata.spec_decoding_generation_lengths[num_contexts:batch_size] = (
-                            gen_sl
-                        )
+                new_draft_tokens, new_draft_scores = self.sample(logits, K, draft_model=draft_model)
 
-                        # position_offsets: causal [0, 1, ..., n_acc-1]
-                        tokens_per_req = spec_metadata.max_total_draft_tokens + 1
-                        total_po_size = attn_metadata.spec_decoding_position_offsets.shape[0]
-                        max_reqs = total_po_size // tokens_per_req
-                        pos_2d = attn_metadata.spec_decoding_position_offsets.view(
-                            max_reqs, tokens_per_req
-                        )
-                        max_gl = int(gen_sl.max().item())
-                        causal_offs = torch.arange(max_gl, device="cuda", dtype=torch.int32)
-                        for g_idx in range(num_gens):
-                            req_idx = num_contexts + g_idx
-                            n = int(gen_sl[g_idx].item())
-                            pos_2d[req_idx, :n] = causal_offs[:n]
+                # Reshape for update: [batch_size, K, K]
+                new_draft_tokens = new_draft_tokens.reshape(batch_size, K, K)
+                new_draft_scores = new_draft_scores.reshape(batch_size, K, K)
 
-                        # packed_mask: causal lower-triangular
-                        # Token t sees tokens [0..t] via bit mask in word 0
-                        # (n_acc <= max_draft_len+1 <= 32 so word 0 suffices)
-                        attn_metadata.spec_decoding_packed_mask[num_contexts:batch_size].fill_(0)
-                        for g_idx in range(num_gens):
-                            req_idx = num_contexts + g_idx
-                            n = int(gen_sl[g_idx].item())
-                            for t in range(n):
-                                attn_metadata.spec_decoding_packed_mask[req_idx, t, 0] = (
-                                    1 << (t + 1)
-                                ) - 1
+                previous_draft_scores = self.update_draft_tokens_and_scores(
+                    cur_draft_idx=layer_idx,
+                    new_draft_tokens=new_draft_tokens,
+                    new_draft_scores=new_draft_scores,
+                    previous_draft_scores=previous_draft_scores,
+                    attn_metadata=attn_metadata,
+                    spec_tree_manager=spec_tree_manager,
+                )
 
-                        attn_metadata.use_spec_decoding = True
-                    else:
-                        attn_metadata.use_spec_decoding = False
+                self.update_hidden_states(
+                    cur_draft_idx=layer_idx,
+                    batch_size=batch_size,
+                    step0_hs=None,
+                    hs_dim=hs_dim,
+                    hidden_states_to_save=hidden_states_to_save,
+                    selected_parents=self._last_selected_parents,
+                )
 
-                    hidden_states, hidden_states_to_save = draft_model.model(**inputs)
-
-                    # FIX (Bug 16): Use draft model's pre-norm output as
-                    # step0_hs.
-                    #
-                    # In the 2M, the DRAFT model's Eagle3DecoderLayer calls
-                    # maybe_capture_hidden_states(layer=0, MLP_out, residual)
-                    # which writes MLP_out + residual to the shared buffer at
-                    # columns [0:4096], OVERWRITING the TARGET model's layer 1
-                    # data. Step 1's get_hidden_states(is_first_draft=False)
-                    # reads these columns, getting the DRAFT model's output.
-                    #
-                    # Eagle3DraftModel.forward() returns (post_norm, pre_norm)
-                    # where pre_norm = MLP_out + residual — exactly what the
-                    # 2M's maybe_capture_hidden_states stores. So we use
-                    # hidden_states_to_save[gather_ids] (norm ~84) as step0_hs
-                    # to match the 2M behavior.
-                    #
-                    # Bug 14 incorrectly used TARGET L1 HS (norm ~1.4) here,
-                    # causing a ~60x magnitude mismatch vs the 2M.
-                    hs_dim = spec_metadata.hidden_size
-                    step0_hs = hidden_states_to_save[gather_ids].clone()  # [batch, hs_dim]
-
-                    logits = draft_model.logits_processor(
-                        hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
-                    )
-
-                    new_draft_tokens, new_draft_scores = self.sample_dynamic(
-                        logits, K, draft_model=draft_model
-                    )
-
-                    # Update history buffers and tree mask
-                    previous_draft_scores = self.dt_update_draft_tokens_and_scores(
-                        cur_draft_idx=0,
-                        new_draft_tokens=new_draft_tokens,
-                        new_draft_scores=new_draft_scores,
-                        previous_draft_scores=None,
-                        attn_metadata=attn_metadata,
-                        spec_tree_manager=spec_tree_manager,
-                    )
-
-                    # === Transition to growing context mode ===
-                    # Replicate two-model resource manager hidden state pattern:
-                    # - Depth-0 tokens read TARGET L1 HS (from resource mgr)
-                    # - Depth-d tokens read draft prenorm from depth d-1
-                    #   (via write_buffer storing draft model prenorm output,
-                    #    which is now at reasonable scale since the initial
-                    #    residual comes from target HS, not draft prenorm)
-
-                    # hs_write_buffer: stores prenorm from each GC forward.
-                    # Positions get overwritten by each step (matching 2M where
-                    # write_indices[0:K] = [start+1,...,start+K] are reused).
-                    hs_write_buffer = torch.zeros(
-                        batch_size,
-                        self.max_draft_len * K,
-                        hs_dim,
-                        device=step0_hs.device,
-                        dtype=step0_hs.dtype,
-                    )
-
-                    # hs_read_map: maps each token (beyond first K) to its
-                    # parent's position in hs_write_buffer. Set once per depth
-                    # via selected_parents, then never changed (matching 2M where
-                    # read_indices are set by update_hidden_states_indices and
-                    # the values at those positions change via overwrites).
-                    hs_read_map = torch.zeros(
-                        batch_size, self.max_draft_len * K, dtype=torch.long, device=step0_hs.device
-                    )
-
-                    # Initial accumulated_hs: all K depth-0 tokens share the
-                    # TARGET L1 HS at the last accepted token (matches
-                    # two-model where start_idx reads from resource manager).
-                    accumulated_hs = (
-                        step0_hs.unsqueeze(1).expand(-1, K, -1).clone()
-                    )  # [batch_size, K, hs_dim]
-
-                    # Initialize position buffer (like two-model prepare_for_generation(0))
-                    base_pos = inputs["position_ids"][gather_ids] + 1
-                    self.dt_position_ids_buffer[: batch_size * K] = (
-                        base_pos.unsqueeze(1).expand(-1, K).reshape(-1)
-                    )
-
-                    # KV cache: rewind to stable_kv (prompt_len), then pre-add K
-                    # Clone seq_lens BEFORE fill overwrites it
-                    seq_lens = attn_metadata.seq_lens_cuda[:batch_size].clone()
-                    attn_metadata._seq_lens[:batch_size].fill_(K)
-                    attn_metadata._seq_lens_cuda[:batch_size].fill_(K)
-                    attn_metadata.on_update()
-
-                    if inputs["attn_metadata"].kv_cache_manager is not None:
-                        attn_metadata.host_request_types[: attn_metadata.num_contexts].fill_(1)
-                        attn_metadata.num_contexts = 0
-
-                    if hasattr(attn_metadata, "kv_lens_cuda"):
-                        # FIX (Bug 7): Save draft kv_lens for ALL requests
-                        # AFTER step 0 forward and BEFORE rewind. This captures
-                        # the correct persistent draft kv_lens:
-                        #   context: kv_lens = context_len
-                        #   gen: kv_lens = prev_saved + n_acc (accumulated)
-                        #
-                        # In the two-model, save_metadata_state saves kv_lens
-                        # at this point (after step 0 fwd) and restores them
-                        # after growing context. The growing context entries
-                        # are ephemeral and get overwritten next iteration.
-                        #
-                        # Previously only context requests were saved, causing
-                        # gen requests to load stale kv_lens from the context
-                        # phase on every iteration. This meant the draft model
-                        # missed KV entries for previously accepted tokens,
-                        # producing incorrect attention outputs.
-                        self._saved_draft_kv_lens[:batch_size].copy_(
-                            attn_metadata.kv_lens_cuda[:batch_size]
-                        )
-
-                        # KV rewind matching two-model prepare_for_generation(0).
-                        # Two-model formula:
-                        #   kv_lens -= seq_lens - num_accepted_draft_tokens - 1
-                        # For context requests, 2M sets num_accepted_draft_tokens
-                        # = context_len - 1, giving rewind = 0 (keep ALL context
-                        # KV entries). For gen requests, rewind removes stale
-                        # draft KV entries beyond the accepted path.
-                        #
-                        # One-model equivalent:
-                        #   Context: NO rewind (kv_lens stays at context_len)
-                        #   Gen: kv_lens -= seq_lens - num_accepted_tokens
-                        #        where num_accepted_tokens = n_draft_accepted + 1
-                        #        equivalent to 2M: seq_lens - n_acc - 1
-                        #
-                        # FIX (Bug 11): Bug 10 applied rewind to ALL requests
-                        # including context. But for context, num_accepted_tokens
-                        # = 1 (target token only), giving rewind = context_len - 1
-                        # which removes almost all context KV entries! The 2M
-                        # effectively does 0 rewind for context. Only gen requests
-                        # need rewind to remove stale draft KV entries.
-                        if num_gens > 0:
-                            attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                                seq_lens[num_contexts:batch_size]
-                                - num_accepted_tokens[num_contexts:batch_size]
-                            )
-                        attn_metadata.kv_lens_cuda[:batch_size] += K
-
-                        # FIX (Bug 13): Sync HOST kv_lens tensors with GPU.
-                        # The C++ attention kernel's plan() reads BOTH:
-                        #   - sequence_length = kv_lens_cuda_runtime (GPU)
-                        #   - host_past_key_value_lengths = kv_lens_runtime (CPU)
-                        # Our code only modified kv_lens_cuda (GPU), leaving
-                        # kv_lens_runtime (CPU) stale from the initial prepare().
-                        # In the 2M, the draft model has its own attention
-                        # metadata where prepare() properly sets both. In the
-                        # 1M, we share the target's metadata and must manually
-                        # sync the HOST tensor.
-                        if hasattr(attn_metadata, "kv_lens_runtime"):
-                            attn_metadata.kv_lens_runtime[:batch_size].copy_(
-                                attn_metadata.kv_lens_cuda[:batch_size]
-                            )
-                        if hasattr(attn_metadata, "host_total_kv_lens"):
-                            attn_metadata.host_total_kv_lens[0] = 0
-                            attn_metadata.host_total_kv_lens[1] = (
-                                attn_metadata.kv_lens_cuda[:batch_size].sum().item()
-                            )
-
-                    # Growing context uses CAUSAL attention (via packed_mask set
-                    # by dt_prepare_tree_mask_and_position_offset).
-                    #
-                    # FIX (Bug 15): Must set use_spec_decoding=True so the C++
-                    # attention kernel reads spec_decoding_generation_lengths to
-                    # know how many tokens per generation request. Without this,
-                    # the kernel falls back to standard generation (1 token per
-                    # request), producing ZERO attention output for tokens 1+.
-                    #
-                    # In 2M, use_spec_decoding is already True from the draft
-                    # engine's initialization. The commented-out line in 2M's
-                    # prepare_for_generation (# attn_metadata.use_spec_decoding
-                    # = True) is commented out because it's ALREADY True.
-                    attn_metadata.use_spec_decoding = True
-
-                else:
-                    # === Steps 1+: Growing context ===
-                    num_tokens_per_req = i * K
-
-                    if original_all_rank_num_tokens is not None:
-                        if spec_metadata.all_rank_num_seqs is not None:
-                            attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
-
-                    # Growing context: process ALL accumulated tokens
-                    num_infer_tokens = batch_size * num_tokens_per_req
-
-                    # Use accumulated hidden states from previous forward
-                    # passes.  After each step, accumulated_hs is updated by
-                    # overwriting existing positions with new prenorm (matching
-                    # the two-model resource-manager write-back) and extending
-                    # with selected parents' prenorm for the new K tokens.
-                    inp_hs = accumulated_hs[:batch_size, :num_tokens_per_req, :].reshape(
-                        num_infer_tokens, -1
-                    )
-                    inp_ids = self.dt_draft_tokens_buffer[:num_infer_tokens].to(torch.int32)
-                    inp_pos = self.dt_position_ids_buffer[:num_infer_tokens]
-                    inputs = {
-                        "input_ids": inp_ids,
-                        "position_ids": inp_pos,
-                        "hidden_states": inp_hs,
-                        "attn_metadata": attn_metadata,
-                        "spec_metadata": spec_metadata,
-                    }
-
-                    hidden_states, hidden_states_to_save = draft_model.model(**inputs)
-
-                    # Take last K logits per request
-                    hs_reshaped = hidden_states.reshape(batch_size, num_tokens_per_req, -1)
-                    selected_hs = hs_reshaped[:, -K:, :].reshape(batch_size * K, -1)
-                    logits = draft_model.logits_processor(
-                        selected_hs, draft_model.lm_head, attn_metadata, True
-                    )
-
-                    new_draft_tokens, new_draft_scores = self.sample_dynamic(
-                        logits, K, draft_model=draft_model
-                    )
-
-                    # Reshape for update: [batch_size, K, K]
-                    new_draft_tokens = new_draft_tokens.reshape(batch_size, K, K)
-                    new_draft_scores = new_draft_scores.reshape(batch_size, K, K)
-
-                    previous_draft_scores = self.dt_update_draft_tokens_and_scores(
-                        cur_draft_idx=i,
-                        new_draft_tokens=new_draft_tokens,
-                        new_draft_scores=new_draft_scores,
-                        previous_draft_scores=previous_draft_scores,
-                        attn_metadata=attn_metadata,
-                        spec_tree_manager=spec_tree_manager,
-                    )
-
-                    # Update hidden states using write_buffer + read_map,
-                    # replicating the two-model resource manager pattern:
-                    #
-                    # 1) Write current forward's prenorm to write_buffer
-                    #    (overwrites previous values, matching 2M write indices)
-                    # 2) Set read_map for new K tokens via selected_parents
-                    #    (matching 2M update_hidden_states_indices)
-                    # 3) Construct accumulated_hs:
-                    #    - First K: step0_hs (STATIC, matching 2M pos `start`)
-                    #    - Rest: gather from write_buffer via read_map
-                    hs_to_save_reshaped = hidden_states_to_save.reshape(
-                        batch_size, num_tokens_per_req, -1
-                    )
-                    sp = self._last_selected_parents  # [batch_size, K]
-
-                    # 1) Update write_buffer with current prenorm
-                    hs_write_buffer[:batch_size, :num_tokens_per_req] = hs_to_save_reshaped
-
-                    # 2) Set read_map for new K tokens (depth i)
-                    # Depth i tokens parent to depth i-1 tokens, which are
-                    # at write_buffer positions [(i-1)*K : i*K].
-                    parent_offset = (i - 1) * K
-                    hs_read_map[:batch_size, i * K : (i + 1) * K] = parent_offset + sp
-
-                    # 3) Construct accumulated_hs for next step
-                    num_tokens_next = (i + 1) * K
-                    # First K: always step0_hs (target L1 HS at last accepted)
-                    new_acc = step0_hs.unsqueeze(1).expand(-1, K, -1).clone()
-                    # Remaining: gather from write_buffer using read_map
-                    if num_tokens_next > K:
-                        read_idx = hs_read_map[:batch_size, K:num_tokens_next]
-                        gathered = torch.gather(
-                            hs_write_buffer[:batch_size],
-                            1,
-                            read_idx.unsqueeze(-1).expand(-1, -1, hs_dim),
-                        )
-                        new_acc = torch.cat([new_acc, gathered], dim=1)
-                    accumulated_hs = new_acc
-
-                    # Update position buffer
-                    num_tokens_current = (i + 1) * K
-                    prev_pos = self.dt_position_ids_buffer[: batch_size * num_tokens_per_req].view(
-                        batch_size, num_tokens_per_req
-                    )
-                    new_pos = torch.cat([prev_pos, prev_pos[:, -K:] + 1], dim=1)
-                    self.dt_position_ids_buffer[: batch_size * num_tokens_current] = (
-                        new_pos.reshape(-1)
-                    )
-
-                    # Growing seq_lens and pre-increment kv_lens
-                    attn_metadata._seq_lens[:batch_size].fill_(num_tokens_current)
-                    attn_metadata._seq_lens_cuda[:batch_size].fill_(num_tokens_current)
-                    attn_metadata.on_update()
-                    attn_metadata.kv_lens_cuda[:batch_size] += K
-                    # Bug 13: Sync HOST kv_lens with GPU
-                    if hasattr(attn_metadata, "kv_lens_runtime"):
-                        attn_metadata.kv_lens_runtime[:batch_size].copy_(
-                            attn_metadata.kv_lens_cuda[:batch_size]
-                        )
-                    if hasattr(attn_metadata, "host_total_kv_lens"):
-                        attn_metadata.host_total_kv_lens[1] = (
-                            attn_metadata.kv_lens_cuda[:batch_size].sum().item()
-                        )
+                self.prepare_for_generation(
+                    cur_draft_idx=layer_idx,
+                    attn_metadata=attn_metadata,
+                    inputs=None,
+                    gather_ids=None,
+                    batch_size=batch_size,
+                    num_contexts=num_contexts,
+                    num_gens=num_gens,
+                    num_accepted_tokens=None,
+                    original_all_rank_num_tokens=None,
+                )
 
         # Resample final tokens and build tree
-        real_draft_tokens, topk_score_indices = self.dt_resampling_final_draft_tokens(batch_size)
+        real_draft_tokens, topk_score_indices = self.resampling_final_draft_tokens(batch_size)
 
         # Build the dynamic tree structure
         if spec_tree_manager is not None:
@@ -903,8 +671,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                         accept_index[req_slot, 1 : n_accepted + 1] - 1
                     ).to(torch.int32)
 
-            # Store tree-topology position of last accepted token for
-            # gather_ids in the next draft loop's step 0.
+            # Store tree-topology position of last accepted token
             self._last_accepted_tree_pos = torch.zeros(num_gens, dtype=torch.long, device="cuda")
             for g_idx in range(num_gens):
                 req_slot = g_idx
@@ -914,21 +681,16 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 else:
                     self._last_accepted_tree_pos[g_idx] = 0
 
-            # Save tree-topology target tokens for draft model input.
-            # accepted_tokens has positions 0..n_accepted overwritten with
-            # path-ordered tokens, which misaligns with hidden_states and
-            # the tree attention mask (both in tree-topology order).
+            # Save tree-topology target tokens for draft model input
             self._tree_topology_target_tokens = gen_target.to(torch.int32)
 
         num_accepted_tokens = self._apply_force_accepted_tokens(num_accepted_tokens, num_contexts)
 
         return accepted_tokens, num_accepted_tokens
 
-    # ---- Dynamic tree helper methods ----
+    # ---- Dynamic tree helper methods (matching two-model naming) ----
 
-    def sample_dynamic(
-        self, logits: torch.Tensor, max_top_k: int, draft_model=None
-    ) -> torch.Tensor:
+    def sample(self, logits: torch.Tensor, max_top_k: int, draft_model=None) -> torch.Tensor:
         """TopK sampling with log softmax for dynamic tree."""
         last_p = self.logsoftmax(logits)
         topk_values, topk_indices = torch.topk(last_p, k=max_top_k, dim=-1)
@@ -938,7 +700,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             topk_indices = topk_indices + d2t[topk_indices]
         return topk_indices, topk_values
 
-    def dt_update_draft_tokens_and_scores(
+    def update_draft_tokens_and_scores(
         self,
         cur_draft_idx: int,
         new_draft_tokens: torch.Tensor,
@@ -955,21 +717,21 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             new_draft_scores = new_draft_scores.reshape(batch_size, K)
 
             num_tokens_layer0 = batch_size * K
-            self.dt_draft_tokens_buffer[:num_tokens_layer0] = new_draft_tokens.reshape(-1)
+            self.draft_tokens_buffer[:num_tokens_layer0] = new_draft_tokens.reshape(-1)
 
             self.history_draft_tokens_buffer[:batch_size, :K] = new_draft_tokens.reshape(
                 batch_size, K
             )
             self.history_score_buffer[:batch_size, :K] = new_draft_scores[:, :]
 
-            # Process the parent buffer
+            # Initialize parent buffer: -1 for root, 0..K-1 for first layer
             self.history_draft_tokens_parent_buffer[:batch_size, : K + 1] = (
                 torch.arange(-1, K, device="cuda", dtype=torch.int32)
                 .unsqueeze(0)
                 .expand(batch_size, -1)
             )
 
-            self.dt_prepare_tree_mask_and_position_offset(
+            self.prepare_tree_mask_and_position_offset(
                 cur_draft_idx, attn_metadata, spec_tree_manager, None
             )
 
@@ -977,23 +739,23 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         else:
             new_draft_tokens = new_draft_tokens.reshape(batch_size, K * K)
 
-            # Update scores with previous layer's scores
+            # Accumulate scores from previous layer
             new_draft_scores = new_draft_scores + previous_draft_scores.unsqueeze(2)
             new_draft_scores = new_draft_scores.reshape(batch_size, K * K)
 
-            # Extract the real draft tokens: topK again
+            # Select best K from K*K candidates
             topk_values, topk_indices = torch.topk(new_draft_scores, k=K, dim=-1)
             real_draft_tokens = torch.gather(new_draft_tokens, dim=1, index=topk_indices)
             num_tokens_previous_layer = cur_draft_idx * K
             num_tokens_current_layer = (cur_draft_idx + 1) * K
-            old_tokens = self.dt_draft_tokens_buffer[
-                : batch_size * num_tokens_previous_layer
-            ].reshape(batch_size, num_tokens_previous_layer)
-            self.dt_draft_tokens_buffer[: batch_size * num_tokens_current_layer] = torch.cat(
+            old_tokens = self.draft_tokens_buffer[: batch_size * num_tokens_previous_layer].reshape(
+                batch_size, num_tokens_previous_layer
+            )
+            self.draft_tokens_buffer[: batch_size * num_tokens_current_layer] = torch.cat(
                 [old_tokens, real_draft_tokens], dim=1
             ).reshape(-1)
 
-            # Save to history buffers
+            # Save all K*K candidates to history buffers
             write_history_start_offset = K + (cur_draft_idx - 1) * K * K
             write_history_end_offset = write_history_start_offset + K * K
             self.history_draft_tokens_buffer[
@@ -1003,11 +765,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 :batch_size, write_history_start_offset:write_history_end_offset
             ] = new_draft_scores
 
-            # Update tree mask
+            # Determine which parents were selected
             selected_parents = topk_indices // K
-            # Store for hidden states gathering in the draft loop
             self._last_selected_parents = selected_parents
-            self.dt_prepare_tree_mask_and_position_offset(
+            self.prepare_tree_mask_and_position_offset(
                 cur_draft_idx, attn_metadata, spec_tree_manager, selected_parents
             )
 
@@ -1023,7 +784,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             return_draft_scores = topk_values
         return return_draft_scores
 
-    def dt_resampling_final_draft_tokens(self, batch_size: int):
+    def resampling_final_draft_tokens(self, batch_size: int):
         """Reconstruct the tree based on history buffers."""
         topk_score_indices = torch.topk(
             self.history_score_buffer[:batch_size, :], k=self._max_total_draft_tokens, dim=-1
@@ -1036,7 +797,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         return real_draft_tokens, topk_score_indices
 
-    def dt_prepare_tree_mask_and_position_offset(
+    def prepare_tree_mask_and_position_offset(
         self,
         cur_draft_idx: int,
         attn_metadata: AttentionMetadata,
@@ -1099,3 +860,142 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             attn_metadata.spec_decoding_position_offsets[
                 : batch_size * num_tokens_current_layer
             ] = new_position_offsets.reshape(-1)
+
+    def prepare_for_generation(
+        self,
+        cur_draft_idx: int,
+        attn_metadata: AttentionMetadata,
+        inputs,
+        gather_ids,
+        batch_size: int,
+        num_contexts: int,
+        num_gens: int,
+        num_accepted_tokens,
+        original_all_rank_num_tokens,
+    ):
+        """Set up attn_metadata for the subsequent drafter layer.
+
+        Matches two-model prepare_for_generation() structure:
+        - Step 0: position IDs, seq_lens, KV rewind, host_request_types, save draft kv_lens
+        - Steps 1+: extend position IDs, update seq_lens, increment kv_lens
+        """
+        K = self.dynamic_tree_max_topK
+        num_tokens_current_layer = K * (cur_draft_idx + 1)
+
+        if cur_draft_idx == 0:
+            # Position IDs: base_pos + 1, replicated K times per batch
+            base_pos = inputs["position_ids"][gather_ids] + 1
+            self.position_ids_buffer[: batch_size * K] = (
+                base_pos.unsqueeze(1).expand(-1, K).reshape(-1)
+            )
+
+            # KV cache: rewind to stable state then pre-add K
+            seq_lens = attn_metadata.seq_lens_cuda[:batch_size].clone()
+            attn_metadata._seq_lens[:batch_size].fill_(K)
+            attn_metadata._seq_lens_cuda[:batch_size].fill_(K)
+            attn_metadata.on_update()
+
+            if inputs["attn_metadata"].kv_cache_manager is not None:
+                attn_metadata.host_request_types[: attn_metadata.num_contexts].fill_(1)
+                attn_metadata.num_contexts = 0
+
+            if hasattr(attn_metadata, "kv_lens_cuda"):
+                # Save draft kv_lens for ALL requests AFTER step 0 forward and
+                # BEFORE rewind (captures correct persistent draft kv_lens).
+                self._saved_draft_kv_lens[:batch_size].copy_(
+                    attn_metadata.kv_lens_cuda[:batch_size]
+                )
+
+                # KV rewind: gen requests only (context needs no rewind).
+                if num_gens > 0:
+                    attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
+                        seq_lens[num_contexts:batch_size]
+                        - num_accepted_tokens[num_contexts:batch_size]
+                    )
+                attn_metadata.kv_lens_cuda[:batch_size] += K
+
+            attn_metadata.use_spec_decoding = True
+
+        else:
+            # Position IDs: append prev[-K:] + 1
+            num_tokens_previous_layer = cur_draft_idx * K
+            prev_pos = self.position_ids_buffer[: batch_size * num_tokens_previous_layer].view(
+                batch_size, num_tokens_previous_layer
+            )
+            new_pos = torch.cat([prev_pos, prev_pos[:, -K:] + 1], dim=1)
+            self.position_ids_buffer[: batch_size * num_tokens_current_layer] = new_pos.reshape(-1)
+
+            # Growing seq_lens and pre-increment kv_lens
+            attn_metadata._seq_lens[:batch_size].fill_(num_tokens_current_layer)
+            attn_metadata._seq_lens_cuda[:batch_size].fill_(num_tokens_current_layer)
+            attn_metadata.on_update()
+            attn_metadata.kv_lens_cuda[:batch_size] += K
+
+    def update_hidden_states(
+        self,
+        cur_draft_idx: int,
+        batch_size: int,
+        step0_hs,
+        hs_dim: int,
+        hidden_states_to_save=None,
+        selected_parents=None,
+    ):
+        """Manage hidden states for the growing context pattern.
+
+        One-model uses accumulated_hs, hs_write_buffer, hs_read_map to replicate
+        the two-model's resource-manager-based hidden state tracking:
+        - Step 0: initialize buffers from step0_hs (draft model pre-norm at last accepted token)
+        - Steps 1+: write prenorm to buffer, set read_map via selected_parents, reconstruct
+        """
+        K = self.dynamic_tree_max_topK
+
+        if cur_draft_idx == 0:
+            self._hs_dim = hs_dim
+
+            # hs_write_buffer: stores prenorm from each growing-context forward
+            self._hs_write_buffer = torch.zeros(
+                batch_size,
+                self.max_draft_len * K,
+                hs_dim,
+                device=step0_hs.device,
+                dtype=step0_hs.dtype,
+            )
+
+            # hs_read_map: maps each token (beyond first K) to its parent
+            # position in hs_write_buffer
+            self._hs_read_map = torch.zeros(
+                batch_size, self.max_draft_len * K, dtype=torch.long, device=step0_hs.device
+            )
+
+            # All K depth-0 tokens share the draft model pre-norm at last
+            # accepted token (matches two-model where start_idx reads from
+            # resource manager)
+            self._accumulated_hs = step0_hs.unsqueeze(1).expand(-1, K, -1).clone()
+            self._step0_hs = step0_hs
+
+        else:
+            num_tokens_per_req = cur_draft_idx * K
+
+            hs_to_save_reshaped = hidden_states_to_save.reshape(batch_size, num_tokens_per_req, -1)
+
+            # 1) Write current forward's prenorm to write_buffer
+            self._hs_write_buffer[:batch_size, :num_tokens_per_req] = hs_to_save_reshaped
+
+            # 2) Set read_map for new K tokens (depth cur_draft_idx)
+            parent_offset = (cur_draft_idx - 1) * K
+            self._hs_read_map[:batch_size, cur_draft_idx * K : (cur_draft_idx + 1) * K] = (
+                parent_offset + selected_parents
+            )
+
+            # 3) Construct accumulated_hs: first K = step0_hs, rest from write_buffer
+            num_tokens_next = (cur_draft_idx + 1) * K
+            new_acc = self._step0_hs.unsqueeze(1).expand(-1, K, -1).clone()
+            if num_tokens_next > K:
+                read_idx = self._hs_read_map[:batch_size, K:num_tokens_next]
+                gathered = torch.gather(
+                    self._hs_write_buffer[:batch_size],
+                    1,
+                    read_idx.unsqueeze(-1).expand(-1, -1, self._hs_dim),
+                )
+                new_acc = torch.cat([new_acc, gathered], dim=1)
+            self._accumulated_hs = new_acc
