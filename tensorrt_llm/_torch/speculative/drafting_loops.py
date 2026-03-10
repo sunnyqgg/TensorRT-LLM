@@ -590,7 +590,6 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor,
                 attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,
                 **kwargs) -> dict[str, torch.Tensor]:
-
         assert isinstance(spec_metadata, Eagle3SpecMetadata)
         spec_tree_manager = spec_metadata.eagle3_resource_manager.spec_tree_manager
 
@@ -641,10 +640,10 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
 
                 selected_logits = logits[:, -self.
                                          dynamic_tree_max_topK:, :]  # [batch_size*K, vocab_size]
+
                 new_draft_tokens, new_draft_scores = self.sample(
                     logits=selected_logits,
                     max_top_k=spec_tree_manager.dynamic_tree_max_topK)
-                # Keep updating
 
                 cur_scores = self.update_draft_tokens_and_scores(
                     cur_draft_idx=layer_idx,
@@ -654,6 +653,7 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata,
                     spec_tree_manager=spec_tree_manager)
+
                 self.prepare_for_generation(
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata,

@@ -3290,14 +3290,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_speculative_config(self):
-        from tensorrt_llm.logger import logger
-        logger.info(
-            f"[DEBUG TorchLlmArgs.validate_speculative_config] self.speculative_config = {self.speculative_config}, type = {type(self.speculative_config) if self.speculative_config else None}"
-        )
         if self.speculative_config:
-            logger.info(
-                f"[DEBUG TorchLlmArgs.validate_speculative_config] speculative_config is truthy"
-            )
             if not self.speculative_config.supports_backend(self.backend):
                 raise ValueError(
                     f"Speculation type {self.speculative_config.decoding_type} does not "
@@ -3334,16 +3327,8 @@ class TorchLlmArgs(BaseLlmArgs):
                     self.speculative_config._draft_target_one_model = False
 
         else:
-            from tensorrt_llm.logger import logger
-            logger.info(
-                f"[DEBUG TorchLlmArgs.validate_speculative_config] speculative_config is falsy, setting decoding_config to None"
-            )
             self.decoding_config = None
 
-        from tensorrt_llm.logger import logger
-        logger.info(
-            f"[DEBUG TorchLlmArgs.validate_speculative_config] returning, self.speculative_config = {self.speculative_config}"
-        )
         return self
 
     @model_validator(mode="after")
