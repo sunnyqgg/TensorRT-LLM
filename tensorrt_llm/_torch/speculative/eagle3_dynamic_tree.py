@@ -100,16 +100,18 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
         max_batch_size = 256
 
-        self.dynamic_tree_max_topK = K
-        self._max_total_draft_tokens = max_total_draft_tokens
+        self.K = K
+        self.max_total_draft_tokens = max_total_draft_tokens
+        self.tokens_per_gen_step = max_total_draft_tokens + 1
         self.logsoftmax = nn.LogSoftmax(dim=-1)
 
         # 1D buffers: store tokens contiguously (matching two-model naming)
         self.draft_tokens_buffer = torch.zeros(
             (max_batch_size * max_total_draft_tokens), dtype=torch.int64, device="cuda"
         )
+        tokens_per_gen_step = self.tokens_per_gen_step
         self.position_ids_buffer = torch.zeros(
-            (max_batch_size * (max_total_draft_tokens + 1)), dtype=torch.int64, device="cuda"
+            (max_batch_size * tokens_per_gen_step), dtype=torch.int64, device="cuda"
         )
         self.history_draft_tokens_buffer = torch.zeros(
             (max_batch_size, (K + K * K * (max_draft_len - 1))), dtype=torch.int64, device="cuda"
@@ -121,7 +123,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             (max_batch_size, K * (max_draft_len - 1) + 1), dtype=torch.int64, device="cuda"
         )
         self.tree_mask_buffer = torch.zeros(
-            (max_batch_size * (max_total_draft_tokens + 1) * (max_total_draft_tokens + 1)),
+            (max_batch_size * tokens_per_gen_step * tokens_per_gen_step),
             dtype=torch.int32,
             device="cuda",
         )
@@ -129,7 +131,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             torch.eye(K, dtype=torch.int32, device="cuda").unsqueeze(0).repeat(max_batch_size, 1, 1)
         )
         self.tree_mask_padding_zeros = torch.zeros(
-            (max_batch_size, max_total_draft_tokens, max_total_draft_tokens + 1),
+            (max_batch_size, max_total_draft_tokens, tokens_per_gen_step),
             dtype=torch.int32,
             device="cuda",
         )
@@ -158,6 +160,17 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._accumulated_hs = None
         self._step0_hs = None
         self._hs_dim = None
+
+    def _ensure_spec_tree_manager(self, resource_manager):
+        """Lazily initialize spec_tree_manager from resource_manager."""
+        if self.spec_tree_manager is None and resource_manager is not None:
+            from ..pyexecutor.resource_manager import ResourceManagerType
+
+            spec_rm = resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER
+            )
+            if spec_rm is not None and hasattr(spec_rm, "spec_tree_manager"):
+                self.spec_tree_manager = spec_rm.spec_tree_manager
 
     # ---- Overridden dispatch methods ----
 
@@ -202,16 +215,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         resource_manager=None,
     ):
         """Override to add accepted_draft_tokens_indices to output."""
-        # Eagerly initialize spec_tree_manager so it is available for
-        # sample_and_accept_draft_tokens (called inside super().forward()).
-        if self.spec_tree_manager is None and resource_manager is not None:
-            from ..pyexecutor.resource_manager import ResourceManagerType
-
-            spec_rm = resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER
-            )
-            if spec_rm is not None and hasattr(spec_rm, "spec_tree_manager"):
-                self.spec_tree_manager = spec_rm.spec_tree_manager
+        self._ensure_spec_tree_manager(resource_manager)
 
         output = super().forward(
             input_ids,
@@ -239,10 +243,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             )
 
         # Context-only: sample target token, no draft verification.
-        max_total = spec_metadata.max_total_draft_tokens
-        accepted_tokens = torch.zeros(
-            (batch_size, max_total + 1), dtype=torch.int, device=logits.device
-        )
+        N = self.tokens_per_gen_step
+        accepted_tokens = torch.zeros((batch_size, N), dtype=torch.int, device=logits.device)
         num_accepted_tokens = torch.ones(batch_size, dtype=torch.int, device=logits.device)
         target_tokens = torch.argmax(logits, dim=-1)
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
@@ -324,25 +326,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         - prepare_for_generation(0): set up KV/position/mask
         - Steps 1+: growing context forward, sample, update, prepare
         """
-        K = self.dynamic_tree_max_topK
 
-        # Lazily get spec_tree_manager
-        if self.spec_tree_manager is None and resource_manager is not None:
-            from ..pyexecutor.resource_manager import ResourceManagerType
-
-            spec_rm = resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER
-            )
-            if spec_rm is not None and hasattr(spec_rm, "spec_tree_manager"):
-                self.spec_tree_manager = spec_rm.spec_tree_manager
-
+        self._ensure_spec_tree_manager(resource_manager)
         spec_tree_manager = self.spec_tree_manager
 
         # === Step 0: Initial forward ===
         # Extract only accepted path tokens (one-model inputs contain ALL tree
         # tokens in tree-topology order; must gather accepted path only so draft
         # KV matches two-model behavior).
-        gen_tokens_per_req = spec_metadata.max_total_draft_tokens + 1
+        gen_tokens_per_req = self.tokens_per_gen_step
 
         _used_accepted_path = False
         _has_acc_idx = getattr(self, "_accepted_draft_indices_tensor", None)
@@ -429,7 +421,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             attn_metadata.spec_decoding_generation_lengths[num_contexts:batch_size] = gen_sl
 
             # position_offsets: causal [0, 1, ..., n_acc-1]
-            tokens_per_req = spec_metadata.max_total_draft_tokens + 1
+            tokens_per_req = self.tokens_per_gen_step
             total_po_size = attn_metadata.spec_decoding_position_offsets.shape[0]
             max_reqs = total_po_size // tokens_per_req
             pos_2d = attn_metadata.spec_decoding_position_offsets.view(max_reqs, tokens_per_req)
@@ -464,7 +456,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
             )
 
-            new_draft_tokens, new_draft_scores = self.sample(logits, K, draft_model=draft_model)
+            new_draft_tokens, new_draft_scores = self.sample(
+                logits, self.K, draft_model=draft_model
+            )
 
             previous_draft_scores = self.update_draft_tokens_and_scores(
                 cur_draft_idx=0,
@@ -497,7 +491,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             )
 
             for layer_idx in range(1, self.max_draft_len):
-                num_tokens_per_req = layer_idx * K
+                num_tokens_per_req = layer_idx * self.K
 
                 if original_all_rank_num_tokens is not None:
                     if spec_metadata.all_rank_num_seqs is not None:
@@ -523,16 +517,18 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
                 # Take last K logits per request
                 hs_reshaped = hidden_states.reshape(batch_size, num_tokens_per_req, -1)
-                selected_hs = hs_reshaped[:, -K:, :].reshape(batch_size * K, -1)
+                selected_hs = hs_reshaped[:, -self.K :, :].reshape(batch_size * self.K, -1)
                 logits = draft_model.logits_processor(
                     selected_hs, draft_model.lm_head, attn_metadata, True
                 )
 
-                new_draft_tokens, new_draft_scores = self.sample(logits, K, draft_model=draft_model)
+                new_draft_tokens, new_draft_scores = self.sample(
+                    logits, self.K, draft_model=draft_model
+                )
 
                 # Reshape for update: [batch_size, K, K]
-                new_draft_tokens = new_draft_tokens.reshape(batch_size, K, K)
-                new_draft_scores = new_draft_scores.reshape(batch_size, K, K)
+                new_draft_tokens = new_draft_tokens.reshape(batch_size, self.K, self.K)
+                new_draft_scores = new_draft_scores.reshape(batch_size, self.K, self.K)
 
                 previous_draft_scores = self.update_draft_tokens_and_scores(
                     cur_draft_idx=layer_idx,
@@ -590,13 +586,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self, logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
     ):
         """Dynamic tree verification using CUDA kernel."""
-        max_total = spec_metadata.max_total_draft_tokens
-        N = max_total + 1  # includes root
+        max_total = self.max_total_draft_tokens
+        N = self.tokens_per_gen_step  # includes root
 
         # Allocate return buffers
-        accepted_tokens = torch.empty(
-            (batch_size, max_total + 1), dtype=torch.int, device=logits.device
-        )
+        accepted_tokens = torch.empty((batch_size, N), dtype=torch.int, device=logits.device)
         num_accepted_tokens = torch.ones(batch_size, dtype=torch.int, device=logits.device)
         # Accepted draft indices tensor for KV cache rewind [batch_size, max_total]
         self._accepted_draft_indices_tensor = torch.full(
@@ -712,21 +706,20 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         """Update draft tokens and scores, write contiguously to buffer."""
         return_draft_scores = None
         batch_size = attn_metadata.num_seqs
-        K = self.dynamic_tree_max_topK
         if cur_draft_idx == 0:
-            new_draft_scores = new_draft_scores.reshape(batch_size, K)
+            new_draft_scores = new_draft_scores.reshape(batch_size, self.K)
 
-            num_tokens_layer0 = batch_size * K
+            num_tokens_layer0 = batch_size * self.K
             self.draft_tokens_buffer[:num_tokens_layer0] = new_draft_tokens.reshape(-1)
 
-            self.history_draft_tokens_buffer[:batch_size, :K] = new_draft_tokens.reshape(
-                batch_size, K
+            self.history_draft_tokens_buffer[:batch_size, : self.K] = new_draft_tokens.reshape(
+                batch_size, self.K
             )
-            self.history_score_buffer[:batch_size, :K] = new_draft_scores[:, :]
+            self.history_score_buffer[:batch_size, : self.K] = new_draft_scores[:, :]
 
             # Initialize parent buffer: -1 for root, 0..K-1 for first layer
-            self.history_draft_tokens_parent_buffer[:batch_size, : K + 1] = (
-                torch.arange(-1, K, device="cuda", dtype=torch.int32)
+            self.history_draft_tokens_parent_buffer[:batch_size, : self.K + 1] = (
+                torch.arange(-1, self.K, device="cuda", dtype=torch.int32)
                 .unsqueeze(0)
                 .expand(batch_size, -1)
             )
@@ -737,17 +730,17 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             return_draft_scores = new_draft_scores
         else:
-            new_draft_tokens = new_draft_tokens.reshape(batch_size, K * K)
+            new_draft_tokens = new_draft_tokens.reshape(batch_size, self.K * self.K)
 
             # Accumulate scores from previous layer
             new_draft_scores = new_draft_scores + previous_draft_scores.unsqueeze(2)
-            new_draft_scores = new_draft_scores.reshape(batch_size, K * K)
+            new_draft_scores = new_draft_scores.reshape(batch_size, self.K * self.K)
 
             # Select best K from K*K candidates
-            topk_values, topk_indices = torch.topk(new_draft_scores, k=K, dim=-1)
+            topk_values, topk_indices = torch.topk(new_draft_scores, k=self.K, dim=-1)
             real_draft_tokens = torch.gather(new_draft_tokens, dim=1, index=topk_indices)
-            num_tokens_previous_layer = cur_draft_idx * K
-            num_tokens_current_layer = (cur_draft_idx + 1) * K
+            num_tokens_previous_layer = cur_draft_idx * self.K
+            num_tokens_current_layer = (cur_draft_idx + 1) * self.K
             old_tokens = self.draft_tokens_buffer[: batch_size * num_tokens_previous_layer].reshape(
                 batch_size, num_tokens_previous_layer
             )
@@ -756,8 +749,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             ).reshape(-1)
 
             # Save all K*K candidates to history buffers
-            write_history_start_offset = K + (cur_draft_idx - 1) * K * K
-            write_history_end_offset = write_history_start_offset + K * K
+            write_history_start_offset = self.K + (cur_draft_idx - 1) * self.K * self.K
+            write_history_end_offset = write_history_start_offset + self.K * self.K
             self.history_draft_tokens_buffer[
                 :batch_size, write_history_start_offset:write_history_end_offset
             ] = new_draft_tokens
@@ -766,7 +759,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             ] = new_draft_scores
 
             # Determine which parents were selected
-            selected_parents = topk_indices // K
+            selected_parents = topk_indices // self.K
             self._last_selected_parents = selected_parents
             self.prepare_tree_mask_and_position_offset(
                 cur_draft_idx, attn_metadata, spec_tree_manager, selected_parents
@@ -774,9 +767,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             # Update parent buffer for next layer
             if cur_draft_idx < self.max_draft_len - 1:
-                next_layer_start = cur_draft_idx * K + 1
-                next_layer_end = next_layer_start + K
-                parents_relative_indices = topk_indices + K**2 * (cur_draft_idx - 1) + K
+                next_layer_start = cur_draft_idx * self.K + 1
+                next_layer_end = next_layer_start + self.K
+                parents_relative_indices = topk_indices + self.K**2 * (cur_draft_idx - 1) + self.K
                 self.history_draft_tokens_parent_buffer[
                     :batch_size, next_layer_start:next_layer_end
                 ] = parents_relative_indices
@@ -787,7 +780,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     def resampling_final_draft_tokens(self, batch_size: int):
         """Reconstruct the tree based on history buffers."""
         topk_score_indices = torch.topk(
-            self.history_score_buffer[:batch_size, :], k=self._max_total_draft_tokens, dim=-1
+            self.history_score_buffer[:batch_size, :], k=self.max_total_draft_tokens, dim=-1
         ).indices
         topk_score_indices = torch.sort(topk_score_indices).values
 
@@ -806,9 +799,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     ):
         """Prepare the mask and position offsets for the next layer."""
         batch_size = attn_metadata.num_seqs
-        K = self.dynamic_tree_max_topK
-        num_tokens_current_layer = K * (cur_draft_idx + 1)
-        num_tokens_previous_layer = K * cur_draft_idx
+        num_tokens_current_layer = self.K * (cur_draft_idx + 1)
+        num_tokens_previous_layer = self.K * cur_draft_idx
         if cur_draft_idx == 0:
             attn_metadata.spec_decoding_packed_mask.fill_(0)
             spec_tree_manager.compute_spec_dec_packed_mask(
@@ -821,16 +813,16 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             attn_metadata.spec_decoding_position_offsets.fill_(0)
             attn_metadata.spec_decoding_generation_lengths[:batch_size] = num_tokens_current_layer
         else:
-            num_parent_mask = batch_size * cur_draft_idx * K * cur_draft_idx * K
+            num_parent_mask = batch_size * cur_draft_idx * self.K * cur_draft_idx * self.K
             parent_mask = self.tree_mask_buffer[:num_parent_mask].reshape(
-                batch_size, cur_draft_idx * K, cur_draft_idx * K
+                batch_size, cur_draft_idx * self.K, cur_draft_idx * self.K
             )
 
             selected_parents_expanded = selected_parents.unsqueeze(-1).expand(
-                batch_size, K, parent_mask.size(-1)
+                batch_size, self.K, parent_mask.size(-1)
             )
             parent_mask_selected = torch.gather(
-                parent_mask[:, -K:, :], dim=1, index=selected_parents_expanded
+                parent_mask[:, -self.K :, :], dim=1, index=selected_parents_expanded
             )
             current_mask = torch.cat(
                 [parent_mask_selected, self.tree_mask_init_buffer[:batch_size]], dim=2
@@ -855,7 +847,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 batch_size, num_tokens_previous_layer
             )
             new_position_offsets = torch.cat(
-                [previous_position_offsets, previous_position_offsets[:, -K:] + 1], dim=1
+                [previous_position_offsets, previous_position_offsets[:, -self.K :] + 1], dim=1
             )
             attn_metadata.spec_decoding_position_offsets[
                 : batch_size * num_tokens_current_layer
@@ -879,20 +871,19 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         - Step 0: position IDs, seq_lens, KV rewind, host_request_types, save draft kv_lens
         - Steps 1+: extend position IDs, update seq_lens, increment kv_lens
         """
-        K = self.dynamic_tree_max_topK
-        num_tokens_current_layer = K * (cur_draft_idx + 1)
+        num_tokens_current_layer = self.K * (cur_draft_idx + 1)
 
         if cur_draft_idx == 0:
             # Position IDs: base_pos + 1, replicated K times per batch
             base_pos = inputs["position_ids"][gather_ids] + 1
-            self.position_ids_buffer[: batch_size * K] = (
-                base_pos.unsqueeze(1).expand(-1, K).reshape(-1)
+            self.position_ids_buffer[: batch_size * self.K] = (
+                base_pos.unsqueeze(1).expand(-1, self.K).reshape(-1)
             )
 
             # KV cache: rewind to stable state then pre-add K
             seq_lens = attn_metadata.seq_lens_cuda[:batch_size].clone()
-            attn_metadata._seq_lens[:batch_size].fill_(K)
-            attn_metadata._seq_lens_cuda[:batch_size].fill_(K)
+            attn_metadata._seq_lens[:batch_size].fill_(self.K)
+            attn_metadata._seq_lens_cuda[:batch_size].fill_(self.K)
             attn_metadata.on_update()
 
             if inputs["attn_metadata"].kv_cache_manager is not None:
@@ -912,24 +903,24 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                         seq_lens[num_contexts:batch_size]
                         - num_accepted_tokens[num_contexts:batch_size]
                     )
-                attn_metadata.kv_lens_cuda[:batch_size] += K
+                attn_metadata.kv_lens_cuda[:batch_size] += self.K
 
             attn_metadata.use_spec_decoding = True
 
         else:
             # Position IDs: append prev[-K:] + 1
-            num_tokens_previous_layer = cur_draft_idx * K
+            num_tokens_previous_layer = cur_draft_idx * self.K
             prev_pos = self.position_ids_buffer[: batch_size * num_tokens_previous_layer].view(
                 batch_size, num_tokens_previous_layer
             )
-            new_pos = torch.cat([prev_pos, prev_pos[:, -K:] + 1], dim=1)
+            new_pos = torch.cat([prev_pos, prev_pos[:, -self.K :] + 1], dim=1)
             self.position_ids_buffer[: batch_size * num_tokens_current_layer] = new_pos.reshape(-1)
 
             # Growing seq_lens and pre-increment kv_lens
             attn_metadata._seq_lens[:batch_size].fill_(num_tokens_current_layer)
             attn_metadata._seq_lens_cuda[:batch_size].fill_(num_tokens_current_layer)
             attn_metadata.on_update()
-            attn_metadata.kv_lens_cuda[:batch_size] += K
+            attn_metadata.kv_lens_cuda[:batch_size] += self.K
 
     def update_hidden_states(
         self,
@@ -947,15 +938,13 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         - Step 0: initialize buffers from step0_hs (draft model pre-norm at last accepted token)
         - Steps 1+: write prenorm to buffer, set read_map via selected_parents, reconstruct
         """
-        K = self.dynamic_tree_max_topK
-
         if cur_draft_idx == 0:
             self._hs_dim = hs_dim
 
             # hs_write_buffer: stores prenorm from each growing-context forward
             self._hs_write_buffer = torch.zeros(
                 batch_size,
-                self.max_draft_len * K,
+                self.max_draft_len * self.K,
                 hs_dim,
                 device=step0_hs.device,
                 dtype=step0_hs.dtype,
@@ -964,17 +953,20 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             # hs_read_map: maps each token (beyond first K) to its parent
             # position in hs_write_buffer
             self._hs_read_map = torch.zeros(
-                batch_size, self.max_draft_len * K, dtype=torch.long, device=step0_hs.device
+                batch_size,
+                self.max_draft_len * self.K,
+                dtype=torch.long,
+                device=step0_hs.device,
             )
 
             # All K depth-0 tokens share the draft model pre-norm at last
             # accepted token (matches two-model where start_idx reads from
             # resource manager)
-            self._accumulated_hs = step0_hs.unsqueeze(1).expand(-1, K, -1).clone()
+            self._accumulated_hs = step0_hs.unsqueeze(1).expand(-1, self.K, -1).clone()
             self._step0_hs = step0_hs
 
         else:
-            num_tokens_per_req = cur_draft_idx * K
+            num_tokens_per_req = cur_draft_idx * self.K
 
             hs_to_save_reshaped = hidden_states_to_save.reshape(batch_size, num_tokens_per_req, -1)
 
@@ -982,16 +974,16 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             self._hs_write_buffer[:batch_size, :num_tokens_per_req] = hs_to_save_reshaped
 
             # 2) Set read_map for new K tokens (depth cur_draft_idx)
-            parent_offset = (cur_draft_idx - 1) * K
-            self._hs_read_map[:batch_size, cur_draft_idx * K : (cur_draft_idx + 1) * K] = (
-                parent_offset + selected_parents
-            )
+            parent_offset = (cur_draft_idx - 1) * self.K
+            self._hs_read_map[
+                :batch_size, cur_draft_idx * self.K : (cur_draft_idx + 1) * self.K
+            ] = parent_offset + selected_parents
 
             # 3) Construct accumulated_hs: first K = step0_hs, rest from write_buffer
-            num_tokens_next = (cur_draft_idx + 1) * K
-            new_acc = self._step0_hs.unsqueeze(1).expand(-1, K, -1).clone()
-            if num_tokens_next > K:
-                read_idx = self._hs_read_map[:batch_size, K:num_tokens_next]
+            num_tokens_next = (cur_draft_idx + 1) * self.K
+            new_acc = self._step0_hs.unsqueeze(1).expand(-1, self.K, -1).clone()
+            if num_tokens_next > self.K:
+                read_idx = self._hs_read_map[:batch_size, self.K : num_tokens_next]
                 gathered = torch.gather(
                     self._hs_write_buffer[:batch_size],
                     1,
