@@ -2609,7 +2609,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         candidates[:, 0] = target_predict[:, 0]  # root always matches
 
         # Call kernel: pass spec_tree_manager buffers directly
-        _, accept_index, accept_token_num = torch.ops.trtllm.verify_dynamic_tree_greedy_op(
+        _, accept_index, accept_token_num, _ = torch.ops.trtllm.verify_dynamic_tree_greedy_op(
             candidates,
             spec_tree_manager.retrieve_index,
             spec_tree_manager.retrieve_next_token,

@@ -208,7 +208,7 @@ class DynamicTreeOpsConverter:
 
         # Call CUDA kernel
         try:
-            predicts, accept_index, accept_token_num = (
+            predicts, accept_index, accept_token_num, _ = (
                 torch.ops.trtllm.verify_dynamic_tree_greedy_op(
                     draft_tokens,
                     tree_buffers.retrieve_index,

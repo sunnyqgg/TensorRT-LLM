@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -68,8 +68,8 @@ void build_dynamic_tree_op(th::Tensor& parentList, th::Tensor& selectedIndex, th
 
 //! \brief Verify dynamic tree using greedy strategy
 //! All index/token tensors use int64.
-//! Returns tuple of (predicts, acceptIndex, acceptTokenNum)
-std::tuple<th::Tensor, th::Tensor, th::Tensor> verify_dynamic_tree_greedy_op(th::Tensor& candidates,
+//! Returns tuple of (predicts, acceptIndex, acceptTokenNum, acceptToken)
+std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> verify_dynamic_tree_greedy_op(th::Tensor& candidates,
     th::Tensor& retrieveIndex, th::Tensor& retrieveNextToken, th::Tensor& retrieveNextSibling,
     th::Tensor& targetPredict, int64_t numSpecStep)
 {
@@ -104,17 +104,20 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor> verify_dynamic_tree_greedy_op(th:
     auto acceptIndex
         = torch::zeros({batchSize, numSpecStep}, torch::TensorOptions().dtype(torch::kInt64).device(device));
     auto acceptTokenNum = torch::zeros({batchSize}, torch::TensorOptions().dtype(torch::kInt64).device(device));
+    auto acceptToken
+        = torch::zeros({batchSize, numSpecStep}, torch::TensorOptions().dtype(torch::kInt64).device(device));
 
     // Convert candidates and targetPredict to int64 if needed
     auto candidatesInt64 = candidates.to(torch::kInt64);
     auto targetPredictInt64 = targetPredict.to(torch::kInt64);
 
     tk::invokeVerifyDynamicTreeGreedy(predicts.data_ptr<int64_t>(), acceptIndex.data_ptr<int64_t>(),
-        acceptTokenNum.data_ptr<int64_t>(), candidatesInt64.data_ptr<int64_t>(), retrieveIndex.data_ptr<int32_t>(),
-        retrieveNextToken.data_ptr<int32_t>(), retrieveNextSibling.data_ptr<int32_t>(),
-        targetPredictInt64.data_ptr<int64_t>(), batchSize, numDraftTokens, numSpecStep, stream);
+        acceptTokenNum.data_ptr<int64_t>(), acceptToken.data_ptr<int64_t>(), candidatesInt64.data_ptr<int64_t>(),
+        retrieveIndex.data_ptr<int32_t>(), retrieveNextToken.data_ptr<int32_t>(),
+        retrieveNextSibling.data_ptr<int32_t>(), targetPredictInt64.data_ptr<int64_t>(), batchSize, numDraftTokens,
+        numSpecStep, stream);
 
-    return std::make_tuple(predicts, acceptIndex, acceptTokenNum);
+    return std::make_tuple(predicts, acceptIndex, acceptTokenNum, acceptToken);
 }
 
 } // namespace torch_ext
@@ -143,7 +146,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "verify_dynamic_tree_greedy_op(Tensor candidates, Tensor retrieveIndex, Tensor retrieveNextToken, "
-        "Tensor retrieveNextSibling, Tensor targetPredict, int numSpecStep) -> (Tensor, Tensor, Tensor)");
+        "Tensor retrieveNextSibling, Tensor targetPredict, int numSpecStep) -> (Tensor, Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

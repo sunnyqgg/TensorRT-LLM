@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  * Portions Copyright (c) 2025 by SGLang team (original implementation).
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -274,7 +274,7 @@ void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIn
 //! \param numSpeculativeTokens second dim of acceptIndex (>= max possible accepts + 1)
 //! \param numDraftTokens       total tree nodes per batch (including root)
 __global__ void verifyDynamicTreeGreedyKernel(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
-    int64_t const* candidates, int32_t const* retrieveIndex, int32_t const* retrieveNextToken,
+    int64_t* acceptToken, int64_t const* candidates, int32_t const* retrieveIndex, int32_t const* retrieveNextToken,
     int32_t const* retrieveNextSibling, int64_t const* targetPredict, uint32_t batchSize, uint32_t numSpeculativeTokens,
     uint32_t numDraftTokens)
 {
@@ -285,6 +285,9 @@ __global__ void verifyDynamicTreeGreedyKernel(int64_t* predicts, int64_t* accept
     acceptIndex[bx * numSpeculativeTokens] = lastAcceptedLocalIdx;
     uint32_t numAcceptedTokens = 0;
     int32_t curIndex = 0;
+
+    // Root token: target prediction at root position
+    acceptToken[bx * numSpeculativeTokens] = targetPredict[batchOffset + lastAcceptedLocalIdx];
 
     for (uint32_t j = 1; j < numSpeculativeTokens; ++j)
     {
@@ -301,6 +304,8 @@ __global__ void verifyDynamicTreeGreedyKernel(int64_t* predicts, int64_t* accept
                 predicts[batchOffset + lastAcceptedLocalIdx] = targetTokenId;
                 ++numAcceptedTokens;
                 acceptIndex[bx * numSpeculativeTokens + numAcceptedTokens] = draftLocalIdx;
+                // Accepted token: target prediction at accepted draft position
+                acceptToken[bx * numSpeculativeTokens + numAcceptedTokens] = targetPredict[batchOffset + draftLocalIdx];
                 lastAcceptedLocalIdx = draftLocalIdx;
                 break;
             }
@@ -320,15 +325,16 @@ __global__ void verifyDynamicTreeGreedyKernel(int64_t* predicts, int64_t* accept
 }
 
 void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
-    int64_t const* candidates, int32_t const* retrieveIndex, int32_t const* retrieveNextToken,
+    int64_t* acceptToken, int64_t const* candidates, int32_t const* retrieveIndex, int32_t const* retrieveNextToken,
     int32_t const* retrieveNextSibling, int64_t const* targetPredict, SizeType32 batchSize, SizeType32 numDraftTokens,
     SizeType32 numSpecStep, cudaStream_t stream)
 {
     dim3 grid(batchSize);
     dim3 block(1);
 
-    verifyDynamicTreeGreedyKernel<<<grid, block, 0, stream>>>(predicts, acceptIndex, acceptTokenNum, candidates,
-        retrieveIndex, retrieveNextToken, retrieveNextSibling, targetPredict, batchSize, numSpecStep, numDraftTokens);
+    verifyDynamicTreeGreedyKernel<<<grid, block, 0, stream>>>(predicts, acceptIndex, acceptTokenNum, acceptToken,
+        candidates, retrieveIndex, retrieveNextToken, retrieveNextSibling, targetPredict, batchSize, numSpecStep,
+        numDraftTokens);
 
     sync_check_cuda_error(stream);
 }

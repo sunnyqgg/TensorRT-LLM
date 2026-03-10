@@ -148,6 +148,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         # when linear fallback verification is used.
         self._last_accepted_tree_pos = None
         self._tree_topology_target_tokens = None
+        self._accept_token = None
 
         # Draft KV lens tracking: persistent across iterations.
         # Saves the draft model's kv_lens per batch position so that gen
@@ -331,29 +332,44 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         spec_tree_manager = self.spec_tree_manager
 
         # === Step 0: Initial forward ===
-        # Extract only accepted path tokens (one-model inputs contain ALL tree
-        # tokens in tree-topology order; must gather accepted path only so draft
-        # KV matches two-model behavior).
+        # Process max_draft_len + 1 tokens per gen request (uniform, like
+        # linear tree): accepted tokens contiguous at front, padding after.
+        # Gather output at num_accepted - 1, KV rewind removes padding.
         gen_tokens_per_req = self.tokens_per_gen_step
+        num_step0_tokens = self.max_draft_len + 1
 
-        _used_accepted_path = False
-        _has_acc_idx = getattr(self, "_accepted_draft_indices_tensor", None)
-        if _has_acc_idx is not None and num_gens > 0:
-            _used_accepted_path = True
-            acc_gather_list = []
+        _used_uniform_path = False
+        if num_gens > 0 and self._accept_token is not None:
+            _used_uniform_path = True
+            num_ctx_tokens = attn_metadata.num_ctx_tokens
 
-            # Context tokens: keep all
-            if attn_metadata.num_ctx_tokens > 0:
-                acc_gather_list.append(
-                    torch.arange(attn_metadata.num_ctx_tokens, device="cuda", dtype=torch.long)
-                )
+            # Build padded gen buffers [num_gens * num_step0_tokens]
+            total_gen_tokens = num_gens * num_step0_tokens
+            input_ids_gen_buf = torch.zeros(
+                total_gen_tokens, dtype=inputs["input_ids"].dtype, device="cuda"
+            )
+            hs_gen_buf = torch.zeros(
+                total_gen_tokens,
+                inputs["hidden_states"].shape[-1],
+                dtype=inputs["hidden_states"].dtype,
+                device="cuda",
+            )
+            pos_gen_buf = torch.zeros(
+                total_gen_tokens, dtype=inputs["position_ids"].dtype, device="cuda"
+            )
 
-            # Gen requests: root + accepted draft positions
             for g_idx in range(num_gens):
                 req_idx = num_contexts + g_idx
                 n_acc = int(num_accepted_tokens[req_idx].item())
-                gen_start = attn_metadata.num_ctx_tokens + g_idx * gen_tokens_per_req
+                gen_start = num_ctx_tokens + g_idx * gen_tokens_per_req
+                buf_start = g_idx * num_step0_tokens
 
+                # input_ids from kernel's contiguous accept_token
+                input_ids_gen_buf[buf_start : buf_start + n_acc] = self._accept_token[
+                    g_idx, :n_acc
+                ].to(inputs["input_ids"].dtype)
+
+                # hidden_states gathered at accepted tree positions
                 if n_acc <= 1:
                     path_pos = torch.tensor([0], device="cuda", dtype=torch.long)
                 else:
@@ -361,34 +377,40 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     path_pos = torch.cat(
                         [torch.tensor([0], device="cuda", dtype=torch.long), draft_pos]
                     )
+                hs_gen_buf[buf_start : buf_start + n_acc] = inputs["hidden_states"][
+                    gen_start + path_pos
+                ]
 
-                acc_gather_list.append(gen_start + path_pos)
+                # position_ids: sequential from base position
+                base_pos = inputs["position_ids"][gen_start]
+                pos_gen_buf[buf_start : buf_start + n_acc] = base_pos + torch.arange(
+                    n_acc, device="cuda", dtype=pos_gen_buf.dtype
+                )
 
-            acc_indices = torch.cat(acc_gather_list)
-
-            # Reconstruct inputs with accepted-path-only tokens
+            # Rebuild inputs with uniform-padded gen tokens
             inputs = {
-                "input_ids": inputs["input_ids"][acc_indices],
-                "position_ids": inputs["position_ids"][acc_indices],
-                "hidden_states": inputs["hidden_states"][acc_indices],
+                "input_ids": torch.cat([inputs["input_ids"][:num_ctx_tokens], input_ids_gen_buf]),
+                "position_ids": torch.cat([inputs["position_ids"][:num_ctx_tokens], pos_gen_buf]),
+                "hidden_states": torch.cat([inputs["hidden_states"][:num_ctx_tokens], hs_gen_buf]),
                 "attn_metadata": attn_metadata,
                 "spec_metadata": spec_metadata,
             }
 
-            # Update seq_lens to num_accepted per gen request
-            for g_idx in range(num_gens):
-                req_idx = num_contexts + g_idx
-                n_acc = int(num_accepted_tokens[req_idx].item())
-                attn_metadata._seq_lens[req_idx] = n_acc
-                attn_metadata._seq_lens_cuda[req_idx] = n_acc
+            # Uniform seq_lens for all gen requests
+            attn_metadata._seq_lens[num_contexts:batch_size].fill_(num_step0_tokens)
+            attn_metadata._seq_lens_cuda[num_contexts:batch_size].fill_(num_step0_tokens)
             attn_metadata.on_update()
 
-            # Compute gather_ids from new layout
-            cumsum = torch.cumsum(attn_metadata.seq_lens_cuda[:batch_size], dim=0)
-            gather_ids = cumsum.long() - 1
-            _orig_gather_ids = acc_indices[gather_ids]
+            # Gather at last accepted token per request
+            gather_ids_gen = (
+                num_ctx_tokens
+                + torch.arange(num_gens, device="cuda") * num_step0_tokens
+                + num_accepted_tokens[num_contexts:batch_size]
+                - 1
+            )
+            gather_ids = torch.cat([spec_metadata.gather_ids[:num_contexts], gather_ids_gen.long()])
         else:
-            # Fallback: original gather_ids (warmup/context-only)
+            # Fallback: context-only / warmup
             start_ids_gen = (
                 spec_metadata.batch_indices_cuda[:num_gens] * gen_tokens_per_req
             ).long()
@@ -397,10 +419,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             gather_ids = torch.concat(
                 [spec_metadata.gather_ids[:num_contexts], gather_ids_gen], dim=0
             )
-            _orig_gather_ids = gather_ids
 
         # Override kv_lens for gen requests with draft KV cache values
-        # (must happen AFTER accepted-path extraction updates seq_lens).
         if num_gens > 0:
             gen_seq_lens = attn_metadata.seq_lens_cuda[num_contexts:batch_size]
             saved_dkv = self._saved_draft_kv_lens[num_contexts:batch_size]
@@ -413,32 +433,24 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         if original_all_rank_num_tokens is not None:
             attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
-        # Set up spec_decoding for multi-token gen requests so the attention
-        # kernel processes ALL accepted tokens (not just 1 per gen request).
-        if _used_accepted_path and num_gens > 0:
-            gen_sl = attn_metadata.seq_lens_cuda[num_contexts:batch_size]
+        # Set up spec_decoding: uniform causal for num_step0_tokens
+        if _used_uniform_path:
+            attn_metadata.spec_decoding_generation_lengths[num_contexts:batch_size].fill_(
+                num_step0_tokens
+            )
 
-            attn_metadata.spec_decoding_generation_lengths[num_contexts:batch_size] = gen_sl
-
-            # position_offsets: causal [0, 1, ..., n_acc-1]
             tokens_per_req = self.tokens_per_gen_step
             total_po_size = attn_metadata.spec_decoding_position_offsets.shape[0]
             max_reqs = total_po_size // tokens_per_req
             pos_2d = attn_metadata.spec_decoding_position_offsets.view(max_reqs, tokens_per_req)
-            max_gl = int(gen_sl.max().item())
-            causal_offs = torch.arange(max_gl, device="cuda", dtype=torch.int32)
-            for g_idx in range(num_gens):
-                req_idx = num_contexts + g_idx
-                n = int(gen_sl[g_idx].item())
-                pos_2d[req_idx, :n] = causal_offs[:n]
+            causal_offs = torch.arange(num_step0_tokens, device="cuda", dtype=torch.int32)
+            pos_2d[num_contexts:batch_size, :num_step0_tokens] = causal_offs
 
-            # packed_mask: causal lower-triangular (n_acc <= 32 so word 0 suffices)
             attn_metadata.spec_decoding_packed_mask[num_contexts:batch_size].fill_(0)
-            for g_idx in range(num_gens):
-                req_idx = num_contexts + g_idx
-                n = int(gen_sl[g_idx].item())
-                for t in range(n):
-                    attn_metadata.spec_decoding_packed_mask[req_idx, t, 0] = (1 << (t + 1)) - 1
+            for t in range(num_step0_tokens):
+                attn_metadata.spec_decoding_packed_mask[num_contexts:batch_size, t, 0] = (
+                    1 << (t + 1)
+                ) - 1
 
             attn_metadata.use_spec_decoding = True
         else:
@@ -638,26 +650,32 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 accepted_tokens[req_idx, :N] = gen_target[g_idx, :N].to(torch.int32)
 
             # Call verification kernel
-            _, accept_index, accept_token_num = torch.ops.trtllm.verify_dynamic_tree_greedy_op(
-                candidates,
-                spec_tree_manager.retrieve_index,
-                spec_tree_manager.retrieve_next_token,
-                spec_tree_manager.retrieve_next_sibling,
-                target_predict,
-                self.max_draft_len + 1,
+            _, accept_index, accept_token_num, accept_token = (
+                torch.ops.trtllm.verify_dynamic_tree_greedy_op(
+                    candidates,
+                    spec_tree_manager.retrieve_index,
+                    spec_tree_manager.retrieve_next_token,
+                    spec_tree_manager.retrieve_next_sibling,
+                    target_predict,
+                    self.max_draft_len + 1,
+                )
             )
+
+            # Store kernel's contiguous accepted tokens for step 0 input_ids
+            self._accept_token = accept_token
 
             # Process results for each gen request
             for g_idx in range(num_gens):
                 req_idx = num_contexts + g_idx
                 req_slot = g_idx
                 n_accepted = int(accept_token_num[req_slot].item())
-                num_accepted_tokens[req_idx] = n_accepted + 1  # +1 for root
+                n_acc_total = n_accepted + 1  # +1 for root
+                num_accepted_tokens[req_idx] = n_acc_total
 
-                # Fill accepted_tokens in order
-                for j in range(n_accepted + 1):
-                    step = int(accept_index[req_slot, j].item())
-                    accepted_tokens[req_idx, j] = gen_target[g_idx, step]
+                # Fill accepted_tokens from kernel's contiguous output
+                accepted_tokens[req_idx, :n_acc_total] = accept_token[req_slot, :n_acc_total].to(
+                    torch.int32
+                )
 
                 # Store accepted draft indices for KV cache rewind
                 if n_accepted > 0:
@@ -891,18 +909,18 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 attn_metadata.num_contexts = 0
 
             if hasattr(attn_metadata, "kv_lens_cuda"):
-                # Save draft kv_lens for ALL requests AFTER step 0 forward and
-                # BEFORE rewind (captures correct persistent draft kv_lens).
-                self._saved_draft_kv_lens[:batch_size].copy_(
-                    attn_metadata.kv_lens_cuda[:batch_size]
-                )
-
                 # KV rewind: gen requests only (context needs no rewind).
+                # With uniform padding, this removes padding entries.
                 if num_gens > 0:
                     attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                         seq_lens[num_contexts:batch_size]
                         - num_accepted_tokens[num_contexts:batch_size]
                     )
+                # Save draft kv_lens AFTER rewind so saved value is clean
+                # (only accepted entries, no padding).
+                self._saved_draft_kv_lens[:batch_size].copy_(
+                    attn_metadata.kv_lens_cuda[:batch_size]
+                )
                 attn_metadata.kv_lens_cuda[:batch_size] += self.K
 
             attn_metadata.use_spec_decoding = True
