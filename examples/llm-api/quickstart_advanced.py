@@ -10,9 +10,7 @@ from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
                                  TorchCompileConfig)
 
 example_prompts = [
-    "Hello, my name is",
-    "The capital of France is",
-    "The future of AI is",
+    "A conversation between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: Hello! ASSISTANT:",
 ]
 
 
@@ -148,7 +146,7 @@ def add_llm_args(parser):
                         action='store_true')
 
     # Sampling
-    parser.add_argument("--max_tokens", type=int, default=64)
+    parser.add_argument("--max_tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--top_p", type=float, default=None)
@@ -176,6 +174,7 @@ def add_llm_args(parser):
                         default="llama3",
                         choices=["llama3", "mistral_large3"],
                         help="The model architecture of the eagle3 model.")
+    parser.add_argument('--max_total_draft_tokens', type=int, default=None)
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
@@ -210,6 +209,11 @@ def parse_arguments():
         description="LLM models with the PyTorch workflow.")
     parser = add_llm_args(parser)
     parser.add_argument("--kv_cache_fraction", type=float, default=0.9)
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        default=False,
+        help="Use streaming generate_async instead of generate.")
     args = parser.parse_args()
     return args
 
@@ -247,7 +251,8 @@ def setup_llm(args, **kwargs):
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
             allow_advanced_sampling=args.allow_advanced_sampling,
-            eagle3_model_arch=args.eagle3_model_arch)
+            eagle3_model_arch=args.eagle3_model_arch,
+            max_total_draft_tokens=args.max_total_draft_tokens)
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
@@ -353,6 +358,25 @@ def main():
                                                   tokenize=False,
                                                   add_generation_prompt=True))
         prompts = new_prompts
+    if args.streaming:
+        for i, prompt in enumerate(prompts):
+            num_tokens = 0
+            num_iterations = 0
+            for output in llm.generate_async(prompt,
+                                             sampling_params,
+                                             streaming=True):
+                new_tokens = output.outputs[0].token_ids
+                num_tokens = len(new_tokens)
+                num_iterations += 1
+            if num_iterations > 0:
+                accept_rate = num_tokens / num_iterations
+                print(f"[{i}] Accept rate: {accept_rate:.2f} "
+                      f"(tokens={num_tokens}, iterations={num_iterations})")
+            generated_text = output.outputs[0].text
+            print(
+                f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+        return
+
     outputs = llm.generate(prompts, sampling_params)
 
     for i, output in enumerate(outputs):
