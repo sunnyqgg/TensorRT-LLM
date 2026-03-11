@@ -162,6 +162,21 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._step0_hs = None
         self._hs_dim = None
 
+        # Step 0 reusable buffers (avoid per-call allocation)
+        max_step0_tokens = max_draft_len + 1
+        self._step0_input_ids_buf = torch.zeros(
+            max_batch_size * max_step0_tokens, dtype=torch.int64, device="cuda"
+        )
+        self._step0_pos_buf = torch.zeros(
+            max_batch_size * max_step0_tokens, dtype=torch.int64, device="cuda"
+        )
+        self._step0_hs_buf = None  # lazily init (hidden_dim unknown at init)
+        self._step0_causal_mask = torch.tensor(
+            [(1 << (t + 1)) - 1 for t in range(max_step0_tokens)],
+            dtype=torch.int64,
+            device="cuda",
+        )
+
     def _ensure_spec_tree_manager(self, resource_manager):
         """Lazily initialize spec_tree_manager from resource_manager."""
         if self.spec_tree_manager is None and resource_manager is not None:
@@ -345,47 +360,54 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             # Build padded gen buffers [num_gens * num_step0_tokens]
             total_gen_tokens = num_gens * num_step0_tokens
-            input_ids_gen_buf = torch.zeros(
-                total_gen_tokens, dtype=inputs["input_ids"].dtype, device="cuda"
-            )
-            hs_gen_buf = torch.zeros(
-                total_gen_tokens,
-                inputs["hidden_states"].shape[-1],
-                dtype=inputs["hidden_states"].dtype,
-                device="cuda",
-            )
-            pos_gen_buf = torch.zeros(
-                total_gen_tokens, dtype=inputs["position_ids"].dtype, device="cuda"
-            )
+            hidden_dim = inputs["hidden_states"].shape[-1]
 
-            for g_idx in range(num_gens):
-                req_idx = num_contexts + g_idx
-                n_acc = int(num_accepted_tokens[req_idx].item())
-                gen_start = num_ctx_tokens + g_idx * gen_tokens_per_req
-                buf_start = g_idx * num_step0_tokens
-
-                # input_ids from kernel's contiguous accept_token
-                input_ids_gen_buf[buf_start : buf_start + n_acc] = self._accept_token[
-                    g_idx, :n_acc
-                ].to(inputs["input_ids"].dtype)
-
-                # hidden_states gathered at accepted tree positions
-                if n_acc <= 1:
-                    path_pos = torch.tensor([0], device="cuda", dtype=torch.long)
-                else:
-                    draft_pos = self._accepted_draft_indices_tensor[req_idx, : n_acc - 1].long() + 1
-                    path_pos = torch.cat(
-                        [torch.tensor([0], device="cuda", dtype=torch.long), draft_pos]
-                    )
-                hs_gen_buf[buf_start : buf_start + n_acc] = inputs["hidden_states"][
-                    gen_start + path_pos
-                ]
-
-                # position_ids: sequential from base position
-                base_pos = inputs["position_ids"][gen_start]
-                pos_gen_buf[buf_start : buf_start + n_acc] = base_pos + torch.arange(
-                    n_acc, device="cuda", dtype=pos_gen_buf.dtype
+            # Reuse pre-allocated buffers instead of torch.zeros each call
+            input_ids_gen_buf = self._step0_input_ids_buf[:total_gen_tokens]
+            input_ids_gen_buf.fill_(0)
+            pos_gen_buf = self._step0_pos_buf[:total_gen_tokens]
+            pos_gen_buf.fill_(0)
+            if self._step0_hs_buf is None or self._step0_hs_buf.shape[1] != hidden_dim:
+                max_buf = self._step0_input_ids_buf.shape[0]
+                self._step0_hs_buf = torch.zeros(
+                    max_buf,
+                    hidden_dim,
+                    dtype=inputs["hidden_states"].dtype,
+                    device="cuda",
                 )
+            hs_gen_buf = self._step0_hs_buf[:total_gen_tokens]
+            hs_gen_buf.fill_(0)
+
+            # Vectorized scatter: build mask for variable-length accepted tokens
+            n_acc_all = num_accepted_tokens[num_contexts:batch_size]
+            max_acc = n_acc_all.max().item()
+            t_idx = torch.arange(max_acc, device="cuda")
+            mask = t_idx.unsqueeze(0) < n_acc_all.unsqueeze(1)  # [num_gens, max_acc]
+            buf_starts = torch.arange(num_gens, device="cuda") * num_step0_tokens
+            dest_flat = (buf_starts.unsqueeze(1) + t_idx.unsqueeze(0))[mask]
+
+            # input_ids: scatter accepted tokens
+            input_ids_gen_buf[dest_flat] = self._accept_token[:num_gens, :max_acc][mask].to(
+                input_ids_gen_buf.dtype
+            )
+
+            # position_ids: sequential from each request's base position
+            gen_starts = num_ctx_tokens + torch.arange(num_gens, device="cuda") * gen_tokens_per_req
+            base_positions = inputs["position_ids"][gen_starts]
+            pos_gen_buf[dest_flat] = (base_positions.unsqueeze(1) + t_idx.unsqueeze(0))[mask]
+
+            # hidden_states: gather at accepted tree positions
+            path_pos_2d = torch.zeros(num_gens, max_acc, device="cuda", dtype=torch.long)
+            if max_acc > 1:
+                path_pos_2d[:, 1:max_acc] = (
+                    self._accepted_draft_indices_tensor[
+                        num_contexts:batch_size, : max_acc - 1
+                    ].long()
+                    + 1
+                )
+            hs_gen_buf[dest_flat] = inputs["hidden_states"][
+                (gen_starts.unsqueeze(1) + path_pos_2d)[mask]
+            ]
 
             # Rebuild inputs with uniform-padded gen tokens
             inputs = {
@@ -447,10 +469,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             pos_2d[num_contexts:batch_size, :num_step0_tokens] = causal_offs
 
             attn_metadata.spec_decoding_packed_mask[num_contexts:batch_size].fill_(0)
-            for t in range(num_step0_tokens):
-                attn_metadata.spec_decoding_packed_mask[num_contexts:batch_size, t, 0] = (
-                    1 << (t + 1)
-                ) - 1
+            attn_metadata.spec_decoding_packed_mask[
+                num_contexts:batch_size, :num_step0_tokens, 0
+            ] = self._step0_causal_mask[:num_step0_tokens]
 
             attn_metadata.use_spec_decoding = True
         else:
