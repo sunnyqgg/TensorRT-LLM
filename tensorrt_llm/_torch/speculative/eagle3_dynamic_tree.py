@@ -27,7 +27,7 @@ Goal: One-model dynamic tree accept rate must match two-model dynamic tree
 accept rate exactly. See eagle3-dynamic-tree.md section 22 for details.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import torch
 from torch import nn
@@ -53,9 +53,16 @@ class Eagle3OneModelDynamicTreeSampler(MTPSampler):
     def __init__(self, args: TorchSampler.Args, spec_config=None):
         super().__init__(args, nextn=args.max_total_draft_tokens)
         seq_slots = args.max_num_sequences
+        max_draft_len = spec_config.max_draft_len
+
         self._accepted_indices_store = torch.full(
-            (seq_slots, args.max_total_draft_tokens), -1, dtype=torch.int32, device="cuda"
+            (seq_slots, max_draft_len), -1, dtype=torch.int32, device="cuda"
         )
+
+    @override
+    def _get_max_new_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
+        """Dynamic tree accepted path depth = max_draft_len + 1."""
+        return args.max_draft_len + 1
 
     def sample_async(self, scheduled_requests, outputs, num_context_logits_prefix_sum):
         if "accepted_draft_tokens_indices" in outputs:
@@ -142,6 +149,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             max_total_draft_tokens=max_total_draft_tokens,
             max_batch_size=max_batch_size,
             device=torch.device("cuda"),
+        )
+
+        # Pre-allocated buffer for accepted draft indices (reused each call)
+        self._accepted_draft_indices_tensor = torch.full(
+            (max_batch_size, max_draft_len), -1, dtype=torch.int32, device="cuda"
         )
 
         # Initialized by _sample_and_accept_dynamic_tree; None during warmup
@@ -244,7 +256,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             resource_manager,
         )
         if hasattr(self, "_accepted_draft_indices_tensor"):
-            output["accepted_draft_tokens_indices"] = self._accepted_draft_indices_tensor
+            batch_size = attn_metadata.num_seqs
+            output["accepted_draft_tokens_indices"] = self._accepted_draft_indices_tensor[
+                :batch_size
+            ]
         return output
 
     def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
@@ -253,18 +268,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        if num_gens > 0:
-            return self._sample_and_accept_dynamic_tree(
-                logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
-            )
-
-        # Context-only: sample target token, no draft verification.
-        N = self.tokens_per_gen_step
-        accepted_tokens = torch.zeros((batch_size, N), dtype=torch.int, device=logits.device)
-        num_accepted_tokens = torch.ones(batch_size, dtype=torch.int, device=logits.device)
-        target_tokens = torch.argmax(logits, dim=-1)
-        accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
-        return accepted_tokens, num_accepted_tokens
+        return self._sample_and_accept_dynamic_tree(
+            logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
+        )
 
     def prepare_1st_drafter_inputs(
         self,
@@ -303,7 +309,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
 
         # generation: use tree-topology tokens when available
-        if num_gens > 0 and self._tree_topology_target_tokens is not None:
+        if num_gens > 0:
             input_ids_gen = self._tree_topology_target_tokens[:num_gens].flatten()
         else:
             # Warmup / linear fallback
@@ -618,65 +624,50 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     def _sample_and_accept_dynamic_tree(
         self, logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
     ):
-        """Dynamic tree verification using CUDA kernel."""
+        """Dynamic tree verification using CUDA kernel.
+
+        All kernel pre/post-processing is vectorized (no Python for-loops)
+        to avoid GPU-CPU sync overhead from per-request .item() calls.
+        """
         max_total = self.max_total_draft_tokens
         N = self.tokens_per_gen_step  # includes root
+        max_path_len = self.max_draft_len + 1  # max accepted path (tree depth + root)
 
-        # Allocate return buffers
-        accepted_tokens = torch.empty((batch_size, N), dtype=torch.int, device=logits.device)
-        num_accepted_tokens = torch.ones(batch_size, dtype=torch.int, device=logits.device)
-        # Accepted draft indices tensor for KV cache rewind [batch_size, max_total]
-        self._accepted_draft_indices_tensor = torch.full(
-            (batch_size, max_total), -1, dtype=torch.int32, device=logits.device
+        # Allocate return buffers (max_path_len columns = accepted path depth)
+        accepted_tokens = torch.empty(
+            (batch_size, max_path_len), dtype=torch.int, device=logits.device
         )
+        num_accepted_tokens = torch.ones(batch_size, dtype=torch.int, device=logits.device)
+        # Reset pre-allocated accepted draft indices buffer
+        self._accepted_draft_indices_tensor[:batch_size].fill_(-1)
 
-        # Context requests: sample token
-        if num_contexts > 0:
-            ctx_tokens = self._sample_tokens_for_batch(
-                logits[:num_contexts], spec_metadata, 0, num_contexts
-            )
-            accepted_tokens[:num_contexts, 0] = ctx_tokens
+        # Sample all target tokens (greedy: dynamic tree kernel requires greedy verification)
+        target_tokens = torch.argmax(logits, dim=-1)
+
+        # Context requests: accept sampled token
+        accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
 
         # Generation requests: tree verification
         if num_gens > 0:
             spec_tree_manager = self.spec_tree_manager
 
-            # Sample target tokens from logits (greedy)
-            target_tokens = torch.argmax(logits, dim=-1)  # [num_tokens]
+            # Build target_predict: [num_gens, N]
+            target_predict = target_tokens[num_contexts:].reshape(num_gens, N).to(dtype=torch.int64)
 
-            # Build target_predict: [num_trees, N]
-            gen_target = target_tokens[num_contexts:]
-            gen_target = gen_target.reshape(num_gens, N).to(dtype=torch.int64)
-
-            # Build candidates: [num_trees, N] with draft tokens
-            num_trees = spec_tree_manager.retrieve_index.shape[0]
-            candidates = torch.zeros(num_trees, N, dtype=torch.int64, device="cuda")
-
-            # Get draft tokens for each gen request
-            for g_idx in range(num_gens):
-                req_slot = g_idx
-                draft_toks = spec_metadata.draft_tokens[g_idx * max_total : (g_idx + 1) * max_total]
-                candidates[req_slot, 1:] = draft_toks.to(torch.int64)
-
-            # Set root tokens
-            target_predict = torch.zeros(num_trees, N, dtype=torch.int64, device="cuda")
-            for g_idx in range(num_gens):
-                req_slot = g_idx
-                target_predict[req_slot, :N] = gen_target[g_idx, :N]
+            # Build candidates: [num_gens, N] with draft tokens
+            candidates = torch.zeros(num_gens, N, dtype=torch.int64, device="cuda")
+            candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, max_total).to(
+                torch.int64
+            )
             candidates[:, 0] = target_predict[:, 0]
-
-            # Fill ALL accepted_tokens positions with target predictions
-            for g_idx in range(num_gens):
-                req_idx = num_contexts + g_idx
-                accepted_tokens[req_idx, :N] = gen_target[g_idx, :N].to(torch.int32)
 
             # Call verification kernel
             _, accept_index, accept_token_num, accept_token = (
                 torch.ops.trtllm.verify_dynamic_tree_greedy_op(
                     candidates,
-                    spec_tree_manager.retrieve_index,
-                    spec_tree_manager.retrieve_next_token,
-                    spec_tree_manager.retrieve_next_sibling,
+                    spec_tree_manager.retrieve_index[:num_gens],
+                    spec_tree_manager.retrieve_next_token[:num_gens],
+                    spec_tree_manager.retrieve_next_sibling[:num_gens],
                     target_predict,
                     self.max_draft_len + 1,
                 )
@@ -685,37 +676,33 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             # Store kernel's contiguous accepted tokens for step 0 input_ids
             self._accept_token = accept_token
 
-            # Process results for each gen request
-            for g_idx in range(num_gens):
-                req_idx = num_contexts + g_idx
-                req_slot = g_idx
-                n_accepted = int(accept_token_num[req_slot].item())
-                n_acc_total = n_accepted + 1  # +1 for root
-                num_accepted_tokens[req_idx] = n_acc_total
+            # Process kernel results (vectorized, no Python for-loops)
+            n_acc_draft = accept_token_num[:num_gens]  # draft-only count per request
+            num_accepted_tokens[num_contexts:batch_size] = (n_acc_draft + 1).to(torch.int32)
 
-                # Fill accepted_tokens from kernel's contiguous output
-                accepted_tokens[req_idx, :n_acc_total] = accept_token[req_slot, :n_acc_total].to(
-                    torch.int32
-                )
+            # accept_token/accept_index shape = [num_trees, max_path_len] (from kernel)
+            # Kernel allocates with torch::zeros; only writes positions 0..n_acc, rest stays 0.
 
-                # Store accepted draft indices for KV cache rewind
-                if n_accepted > 0:
-                    self._accepted_draft_indices_tensor[req_idx, :n_accepted] = (
-                        accept_index[req_slot, 1 : n_accepted + 1] - 1
-                    ).to(torch.int32)
+            # Accepted tokens: direct copy (buffer width = max_path_len)
+            accepted_tokens[num_contexts:batch_size] = accept_token[:num_gens].to(torch.int32)
 
-            # Store tree-topology position of last accepted token
-            self._last_accepted_tree_pos = torch.zeros(num_gens, dtype=torch.long, device="cuda")
-            for g_idx in range(num_gens):
-                req_slot = g_idx
-                n_acc = int(accept_token_num[req_slot].item())
-                if n_acc > 0:
-                    self._last_accepted_tree_pos[g_idx] = accept_index[req_slot, n_acc].long()
-                else:
-                    self._last_accepted_tree_pos[g_idx] = 0
+            # Accepted draft indices: 0 - 1 = -1 = sentinel, so direct copy works
+            self._accepted_draft_indices_tensor[num_contexts:batch_size] = (
+                accept_index[:num_gens, 1:max_path_len] - 1
+            ).to(torch.int32)
+
+            # Last accepted tree position: gather replaces per-request loop
+            n_acc_clamped = n_acc_draft.clamp(min=0)
+            self._last_accepted_tree_pos = (
+                accept_index[:num_gens]
+                .gather(1, n_acc_clamped.unsqueeze(1).long())
+                .squeeze(1)
+                .long()
+            )
+            self._last_accepted_tree_pos[n_acc_draft == 0] = 0
 
             # Save tree-topology target tokens for draft model input
-            self._tree_topology_target_tokens = gen_target.to(torch.int32)
+            self._tree_topology_target_tokens = target_predict.to(torch.int32)
 
         num_accepted_tokens = self._apply_force_accepted_tokens(num_accepted_tokens, num_contexts)
 
