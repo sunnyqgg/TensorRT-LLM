@@ -676,9 +676,7 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
 
         # Build dynamic tree structure using CUDA kernel (in-place, writes to pre-allocated buffers)
         tree_structure = None
-        if hasattr(
-                self,
-                'tree_ops_converter') and self.tree_ops_converter is not None:
+        if self.tree_ops_converter is not None:
             try:
                 # Write directly to spec_tree_manager buffers (target model reads from there).
                 # use_packed_mask=True: kernel outputs bit-packed mask directly,
@@ -701,7 +699,8 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                 )
 
             except Exception as e:
-                assert False, f"Dynamic tree CUDA kernel failed: {e}"
+                raise RuntimeError(
+                    f"Dynamic tree CUDA kernel failed: {e}") from e
 
         # return_new_draft_tokens: [max_total_draft_tokens, batch_size]
         return_new_draft_tokens = torch.transpose(real_draft_tokens, 0, 1)
@@ -735,7 +734,8 @@ class DynamicTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
             }
         }
 
-    def sample(self, logits: torch.Tensor, max_top_k: int) -> torch.Tensor:
+    def sample(self, logits: torch.Tensor,
+               max_top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
         # TODO: inject the sampler here so we can support non-greedy
 
         # for draft_layer_idx == 0, logits is of shape [batch_size, vocab_size]

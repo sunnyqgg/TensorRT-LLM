@@ -317,41 +317,10 @@ class SpecTreeManager:
             indices = path[path > -1]
             self.spec_dec_mask_matrix[actual_idx][i, indices] = 1
 
-    # # Compute the packed mask according to the mask matrix
-    # def compute_spec_dec_packed_mask(self, mask_matrix, packed_mask):
-    #     # mask_matrix: shape: [bs, num_tokens, num_tokens]
-    #     # packed_mask: output buffer, shape: [bs, max_total_draft_tokens + 1, num_blocks]
-    #     # This function pads last dim to padded_len and packs each row into 32-bit integers
-    #     # Only the first num_tokens rows of packed_mask are filled
-
-    #     num_tokens = mask_matrix.shape[1]
-    #     padded_len = self.max_total_draft_tokens + 1
-    #     num_blocks = math.ceil(padded_len / 32)
-
-    #     # Pad last dim: [bs, num_tokens, num_tokens] -> [bs, num_tokens, padded_len]
-
-    #     pad_cols = padded_len - num_tokens
-    #     padded_matrix = torch.nn.functional.pad(mask_matrix, (0, pad_cols), value=0)
-
-    #     # Flatten to [bs * num_tokens, padded_len] for packing
-    #     int_tensor = padded_matrix.reshape(-1, padded_len)
-    #     packed_mask = packed_mask[:,:num_tokens,:].reshape(-1, num_blocks)
-
-    #     # Pack each 32-bit block
-    #     for block_idx in range(num_blocks):
-    #         start_idx = block_idx * 32
-    #         end_idx = min(start_idx + 32, padded_len)
-    #         block_bits = int_tensor[:, start_idx:end_idx]
-    #         weight = torch.pow(
-    #             2,
-    #             torch.arange(end_idx - start_idx,
-    #                          dtype=torch.int32,
-    #                          device=int_tensor.device))
-    #         block_value = torch.sum(block_bits * weight, dim=-1)
-    #         packed_mask[:, block_idx] = block_value
-
     def compute_spec_dec_packed_mask(self, mask_matrix, packed_mask):
         bs, num_tokens, num_tokens_attend = mask_matrix.shape
+        assert mask_matrix.ndim == 3, f"Expected 3D mask_matrix, got {mask_matrix.ndim}D"
+        assert packed_mask.ndim == 3, f"Expected 3D packed_mask, got {packed_mask.ndim}D"
         num_blocks = packed_mask.shape[-1]
 
         # 1. Prepare bit weights (1, 1, 32)

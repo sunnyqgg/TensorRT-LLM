@@ -81,21 +81,6 @@ class DynamicTreeOpsConverter:
         self.max_batch_size = max_batch_size
         self.device = device
 
-        # Pre-allocate buffers for tree building
-        self._preallocate_buffers()
-
-    def _preallocate_buffers(self):
-        """Pre-allocate reusable buffers to minimize runtime allocation."""
-        # Preallocate parent_list buffer (max size)
-        # Size: [max_batch_size, K * (depth - 1) + 1]
-        # Note: Only first max_total_draft_tokens are used
-        self.parent_list_buffer = torch.full(
-            (self.max_batch_size, self.K * (self.depth - 1) + 1),
-            -1,
-            dtype=torch.int32,
-            device=self.device,
-        )
-
     def build_dynamic_tree(
         self,
         history_draft_tokens_parent_buffer: torch.Tensor,

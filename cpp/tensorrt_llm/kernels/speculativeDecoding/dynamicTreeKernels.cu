@@ -112,7 +112,7 @@ __global__ void buildDynamicTreeKernel(int64_t const* parentList, int64_t const*
     {
         // Walk up to root, setting treeMask ancestor bits and counting depth
         int32_t curPosition = tid - 1;
-        while (true)
+        while (position < depth + 1)
         {
             position += 1;
             treeMask[tokenTreeIdx + curPosition] = 1;
@@ -130,6 +130,10 @@ __global__ void buildDynamicTreeKernel(int64_t const* parentList, int64_t const*
                 {
                     break;
                 }
+            }
+            if (curPosition == draftTokenNum)
+            {
+                break;
             }
         }
         positions[bid * draftTokenNum + tid] = position + seqLen;
@@ -204,7 +208,7 @@ __global__ void buildDynamicTreeKernelPacked(int64_t const* parentList, int64_t 
     else
     {
         int32_t curPosition = tid - 1;
-        while (true)
+        while (position < depth + 1)
         {
             position += 1;
 
@@ -230,6 +234,10 @@ __global__ void buildDynamicTreeKernelPacked(int64_t const* parentList, int64_t 
                 {
                     break;
                 }
+            }
+            if (curPosition == draftTokenNum)
+            {
+                break;
             }
         }
         positions[bid * draftTokenNum + tid] = position + seqLen;

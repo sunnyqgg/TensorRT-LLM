@@ -825,7 +825,7 @@ def test_dynamic_tree_update_draft_tokens_and_scores():
         ref_hidden_states_read_indices,
     )
 
-    ##### CASE 2 dynamic tree, batch size = 1, cur_draft_idx = 1 #############
+    ##### CASE 3 dynamic tree, batch size = 1, cur_draft_idx = 2 #############
     max_batch_size = 1
     max_draft_len = 3
     max_total_draft_tokens = 15

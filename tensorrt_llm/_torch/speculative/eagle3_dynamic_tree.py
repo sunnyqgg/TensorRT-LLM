@@ -105,7 +105,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         K = spec_config.dynamic_tree_max_topK
         max_draft_len = spec_config.max_draft_len
         max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
-        max_batch_size = 256
+        # Read runtime max_batch_size set by py_executor_creator; fall back to 256
+        max_batch_size = getattr(spec_config, "_runtime_max_batch_size", 256)
+        self._max_batch_size = max_batch_size
 
         self.K = K
         self.max_total_draft_tokens = max_total_draft_tokens
@@ -207,6 +209,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
     # ---- Overridden dispatch methods ----
 
+    @override
     def _forward_draft_loop(
         self,
         inputs,
@@ -236,6 +239,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             resource_manager,
         )
 
+    @override
     def forward(
         self,
         input_ids,
@@ -267,6 +271,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             ]
         return output
 
+    @override
     def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
         """Override to handle dynamic tree verification."""
         batch_size = attn_metadata.num_seqs
@@ -277,6 +282,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
         )
 
+    @override
     def prepare_1st_drafter_inputs(
         self,
         input_ids,
@@ -433,6 +439,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         self._ensure_spec_tree_manager(resource_manager)
         spec_tree_manager = self.spec_tree_manager
+
+        assert batch_size <= self._max_batch_size, (
+            f"batch_size {batch_size} exceeds pre-allocated max_batch_size {self._max_batch_size}"
+        )
 
         # === Step 0: Initial forward ===
         # Inputs already in uniform-padded layout from prepare_1st_drafter_inputs:
@@ -703,7 +713,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
     # ---- Dynamic tree helper methods (matching two-model naming) ----
 
-    def sample(self, logits: torch.Tensor, max_top_k: int, draft_model=None) -> torch.Tensor:
+    def sample(
+        self, logits: torch.Tensor, max_top_k: int, draft_model=None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """TopK sampling with log softmax for dynamic tree."""
         last_p = self.logsoftmax(logits)
         topk_values, topk_indices = torch.topk(last_p, k=max_top_k, dim=-1)

@@ -3307,7 +3307,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             state.sampler_event.synchronize()
 
         assert state.host is not None
-        new_tokens = state.host.new_tokens  # torch.Size([5, 2048, 1])
+        new_tokens = state.host.new_tokens
         finish_reasons = state.host.finish_reasons_list()
 
         new_tokens_list = new_tokens.tolist()

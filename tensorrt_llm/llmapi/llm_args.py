@@ -1821,8 +1821,8 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
 SpeculativeConfig: TypeAlias = Annotated[
     Union[
         DraftTargetDecodingConfig,
+        Eagle3DecodingConfig,  # Must be before EagleDecodingConfig since it's a subclass
         EagleDecodingConfig,
-        Eagle3DecodingConfig,
         LookaheadDecodingConfig,
         MedusaDecodingConfig,
         MTPDecodingConfig,
@@ -1835,19 +1835,6 @@ SpeculativeConfig: TypeAlias = Annotated[
     ],
     Field(discriminator="decoding_type"),
 ]
-
-SpeculativeConfig: TypeAlias = Optional[Union[
-    DraftTargetDecodingConfig,
-    Eagle3DecodingConfig,  # Must be before EagleDecodingConfig since it's a subclass
-    EagleDecodingConfig,
-    LookaheadDecodingConfig,
-    MedusaDecodingConfig,
-    MTPDecodingConfig,
-    NGramDecodingConfig,
-    UserProvidedDecodingConfig,
-    SaveHiddenStatesDecodingConfig,
-    AutoDecodingConfig,
-]]
 
 SparseAttentionConfig: TypeAlias = Annotated[
     Union[
