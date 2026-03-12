@@ -164,11 +164,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._accept_token = None
         self._last_num_accepted = None
 
-        # Draft KV lens tracking: persistent across iterations.
-        # Saves the draft model's kv_lens per batch position so that gen
-        # requests can override the target's kv_lens at the start of step 0.
-        self._saved_draft_kv_lens = torch.zeros(max_batch_size, dtype=torch.int32, device="cuda")
-
         # Hidden state management buffers (initialized in update_hidden_states step 0)
         self._hs_write_buffer = None
         self._hs_read_map = torch.zeros(
@@ -452,16 +447,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         # gather_ids: empty concat when num_gens == 0
         gather_ids = torch.cat([spec_metadata.gather_ids[:num_contexts], self._step0_gather_ids])
 
-        # Override kv_lens for gen requests with saved draft KV values
-        if num_gens > 0:
-            gen_seq_lens = attn_metadata.seq_lens_cuda[num_contexts:batch_size]
-            saved_dkv = self._saved_draft_kv_lens[num_contexts:batch_size]
-            has_saved = saved_dkv > 0
-            if has_saved.any():
-                attn_metadata.kv_lens_cuda[num_contexts:batch_size][has_saved] = (
-                    saved_dkv[has_saved] + gen_seq_lens[has_saved]
-                )
-
         if original_all_rank_num_tokens is not None:
             attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
@@ -483,6 +468,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
 
         attn_metadata.use_spec_decoding = num_gens > 0
+
+        # Pre-step-0 KV correction: convert from target tree-width to draft
+        # accepted-path width.  The target model processed tokens_per_gen_step
+        # tokens per gen request, but the draft loop step 0 should only attend
+        # to max_path_len (= max_draft_len + 1) accepted-path tokens.
+        if num_gens > 0 and hasattr(attn_metadata, "kv_lens_cuda"):
+            attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
+                self.tokens_per_gen_step - (self.max_draft_len + 1)
+            )
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
@@ -895,7 +889,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         """Set up attn_metadata for the subsequent drafter layer.
 
         Matches two-model prepare_for_generation() structure:
-        - Step 0: position IDs, seq_lens, KV rewind, host_request_types, save draft kv_lens
+        - Step 0: position IDs, seq_lens, KV rewind, host_request_types
         - Steps 1+: extend position IDs, update seq_lens, increment kv_lens
         """
         num_tokens_current_layer = self.K * (cur_draft_idx + 1)
@@ -908,7 +902,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             )
 
             # KV cache: rewind to stable state then pre-add K
-            seq_lens = attn_metadata.seq_lens_cuda[:batch_size].clone()
             attn_metadata._seq_lens[:batch_size].fill_(self.K)
             attn_metadata._seq_lens_cuda[:batch_size].fill_(self.K)
             attn_metadata.on_update()
@@ -918,18 +911,16 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 attn_metadata.num_contexts = 0
 
             if hasattr(attn_metadata, "kv_lens_cuda"):
-                # KV rewind: gen requests only (context needs no rewind).
-                # With uniform padding, this removes padding entries.
+                # KV rewind: remove unaccepted draft-path tokens for gen
+                # requests.  At this point kv_lens already reflects the
+                # accepted-path width (max_draft_len + 1) thanks to the
+                # pre-step-0 correction in _forward_dynamic_tree_draft_loop.
+                # This mirrors the linear tree pattern (eagle3.py:594-597).
                 if num_gens > 0:
                     attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                        seq_lens[num_contexts:batch_size]
+                        (self.max_draft_len + 1)
                         - num_accepted_tokens[num_contexts:batch_size]
                     )
-                # Save draft kv_lens AFTER rewind so saved value is clean
-                # (only accepted entries, no padding).
-                self._saved_draft_kv_lens[:batch_size].copy_(
-                    attn_metadata.kv_lens_cuda[:batch_size]
-                )
                 attn_metadata.kv_lens_cuda[:batch_size] += self.K
 
             attn_metadata.use_spec_decoding = True
