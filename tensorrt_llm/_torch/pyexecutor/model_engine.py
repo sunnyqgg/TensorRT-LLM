@@ -3612,8 +3612,81 @@ class PyTorchModelEngine(ModelEngine):
                         # maybe we need a cleaner way to do this.
                         outputs = self.cuda_graph_runner.replay(key, inputs)
                     else:
+                        # Debug: check spec_decoding_* before/after replay
+                        _do_debug = False
+                        if os.environ.get(
+                                'TRTLLM_DEBUG_SPEC_DEC', ''
+                        ) and hasattr(
+                                attn_metadata, 'spec_decoding_packed_mask'
+                        ) and attn_metadata.spec_decoding_packed_mask is not None:
+                            if not hasattr(self, '_debug_iter_count'):
+                                self._debug_iter_count = 0
+                            self._debug_iter_count += 1
+                            if self._debug_iter_count <= 8:
+                                import sys
+                                _do_debug = True
+                                torch.cuda.synchronize()
+                                _iter = self._debug_iter_count
+                                _gl = attn_metadata.spec_decoding_generation_lengths[:4].cpu(
+                                ).tolist()
+                                _mk = attn_metadata.spec_decoding_packed_mask[
+                                    0, :5, 0].cpu().tolist()
+                                _po = attn_metadata.spec_decoding_position_offsets[:10].cpu(
+                                ).tolist()
+                                _kv = attn_metadata.kv_lens_cuda[:4].cpu(
+                                ).tolist()
+                                print(
+                                    f"[DBG iter={_iter}] BEFORE replay bs={scheduled_requests.batch_size} gl={_gl} mk={_mk} po={_po} kv={_kv} mask_ptr={attn_metadata.spec_decoding_packed_mask.data_ptr()}",
+                                    file=sys.stderr,
+                                    flush=True)
+                                _pre_mask = attn_metadata.spec_decoding_packed_mask[
+                                    0, :5, 0].clone()
+                                _pre_gl = attn_metadata.spec_decoding_generation_lengths[:4].clone(
+                                )
+                                _pre_po = attn_metadata.spec_decoding_position_offsets[:10].clone(
+                                )
+
                         with MoeLoadBalancerIterContext(moe_load_balancer):
                             outputs = self.cuda_graph_runner.replay(key, inputs)
+
+                        if _do_debug:
+                            import sys
+                            torch.cuda.synchronize()
+                            _gl2 = attn_metadata.spec_decoding_generation_lengths[:4].cpu(
+                            ).tolist()
+                            _mk2 = attn_metadata.spec_decoding_packed_mask[
+                                0, :5, 0].cpu().tolist()
+                            _po2 = attn_metadata.spec_decoding_position_offsets[:10].cpu(
+                            ).tolist()
+                            _mask_ok = torch.equal(
+                                _pre_mask,
+                                attn_metadata.spec_decoding_packed_mask[0, :5,
+                                                                        0])
+                            _gl_ok = torch.equal(
+                                _pre_gl, attn_metadata.
+                                spec_decoding_generation_lengths[:4])
+                            _po_ok = torch.equal(
+                                _pre_po, attn_metadata.
+                                spec_decoding_position_offsets[:10])
+                            print(
+                                f"[DBG iter={_iter}] AFTER  replay gl={_gl2} mk={_mk2} po={_po2} restore_ok=mask:{_mask_ok},gl:{_gl_ok},po:{_po_ok}",
+                                file=sys.stderr,
+                                flush=True)
+                            if not _mask_ok:
+                                print(
+                                    f"  MASK DIFF pre={_pre_mask.cpu().tolist()} post={_mk2}",
+                                    file=sys.stderr,
+                                    flush=True)
+                            if not _gl_ok:
+                                print(
+                                    f"  GL DIFF pre={_pre_gl.cpu().tolist()} post={_gl2}",
+                                    file=sys.stderr,
+                                    flush=True)
+                            if not _po_ok:
+                                print(
+                                    f"  PO DIFF pre={_pre_po.cpu().tolist()} post={_po2}",
+                                    file=sys.stderr,
+                                    flush=True)
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()

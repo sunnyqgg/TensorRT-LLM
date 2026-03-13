@@ -216,6 +216,13 @@ def parse_arguments():
         action="store_true",
         default=False,
         help="Use streaming generate_async instead of generate.")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help=
+        "Path to a JSONL dataset file. Each line: {\"question_id\": N, \"question\": [\"prompt\"]}."
+    )
     args = parser.parse_args()
     return args
 
@@ -346,9 +353,33 @@ def setup_llm(args, **kwargs):
     return llm, sampling_params
 
 
+def load_dataset(dataset_path):
+    """Load prompts from a JSONL dataset file.
+
+    Each line: {"question_id": N, "question": ["prompt_text"]}
+    For multi-turn, the last element in "question" is used as the prompt.
+    """
+    prompts = []
+    with open(dataset_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            # Use the last element of the question list as the prompt
+            prompts.append(data["question"][-1])
+    return prompts
+
+
 def main():
     args = parse_arguments()
-    prompts = args.prompt if args.prompt else example_prompts
+    if args.dataset:
+        prompts = load_dataset(args.dataset)
+        print(f"Loaded {len(prompts)} prompts from {args.dataset}")
+    elif args.prompt:
+        prompts = args.prompt
+    else:
+        prompts = example_prompts
 
     llm, sampling_params = setup_llm(args)
     new_prompts = []
@@ -360,6 +391,11 @@ def main():
                                                   tokenize=False,
                                                   add_generation_prompt=True))
         prompts = new_prompts
+
+    accept_rates = []
+    total_tokens = 0
+    total_iterations = 0
+
     if args.streaming:
         for i, prompt in enumerate(prompts):
             num_tokens = 0
@@ -372,23 +408,53 @@ def main():
                 num_iterations += 1
             if num_iterations > 0:
                 accept_rate = num_tokens / num_iterations
+                accept_rates.append(accept_rate)
+                total_tokens += num_tokens
+                total_iterations += num_iterations
                 print(f"[{i}] Accept rate: {accept_rate:.2f} "
                       f"(tokens={num_tokens}, iterations={num_iterations})")
             generated_text = output.outputs[0].text
             print(
-                f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+                f"[{i}] Prompt: {prompt[:80]!r}..., Generated text: {generated_text[:200]!r}..."
+            )
+
+        if accept_rates:
+            avg_accept_rate = sum(accept_rates) / len(accept_rates)
+            global_accept_rate = total_tokens / total_iterations
+            print("\n=== Accept Rate Summary ===")
+            print(f"Total prompts: {len(accept_rates)}")
+            print(f"Mean accept rate (per-prompt avg): {avg_accept_rate:.2f}")
+            print(
+                f"Global accept rate (total_tokens/total_iters): {global_accept_rate:.2f}"
+            )
+            print(
+                f"Total tokens: {total_tokens}, Total iterations: {total_iterations}"
+            )
         return
 
-    outputs = llm.generate(prompts, sampling_params)
-
-    for i, output in enumerate(outputs):
-        prompt = output.prompt
+    # Use streaming generate_async to count decode iterations for accept rate
+    for i, prompt in enumerate(prompts):
+        num_tokens = 0
+        num_iterations = 0
+        for output in llm.generate_async(prompt,
+                                         sampling_params,
+                                         streaming=True):
+            new_tokens = output.outputs[0].token_ids
+            num_tokens = len(new_tokens)
+            num_iterations += 1
+        if num_iterations > 0:
+            accept_rate = num_tokens / num_iterations
+            accept_rates.append(accept_rate)
+            total_tokens += num_tokens
+            total_iterations += num_iterations
+            print(f"[{i}] Accept rate: {accept_rate:.2f} "
+                  f"(tokens={num_tokens}, iterations={num_iterations})")
         for sequence_idx, sequence in enumerate(output.outputs):
             generated_text = sequence.text
             # Skip printing the beam_idx if no beam search was used
             sequence_id_text = f"[{sequence_idx}]" if args.max_beam_width > 1 or args.n > 1 else ""
             print(
-                f"[{i}]{sequence_id_text} Prompt: {prompt!r}, Generated text: {generated_text!r}"
+                f"[{i}]{sequence_id_text} Prompt: {prompt[:80]!r}..., Generated text: {generated_text[:200]!r}..."
             )
             if args.return_context_logits:
                 print(
@@ -414,6 +480,19 @@ def main():
                     print(
                         f"[{i}]{sequence_id_text} Generation {output_name}: {sequence.additional_generation_outputs[output_name]}"
                     )
+
+    if accept_rates:
+        avg_accept_rate = sum(accept_rates) / len(accept_rates)
+        global_accept_rate = total_tokens / total_iterations
+        print("\n=== Accept Rate Summary ===")
+        print(f"Total prompts: {len(accept_rates)}")
+        print(f"Mean accept rate (per-prompt avg): {avg_accept_rate:.2f}")
+        print(
+            f"Global accept rate (total_tokens/total_iters): {global_accept_rate:.2f}"
+        )
+        print(
+            f"Total tokens: {total_tokens}, Total iterations: {total_iterations}"
+        )
 
     if args.log_kv_cache_events:
         time.sleep(1)  # Wait for events to be dispatched

@@ -122,6 +122,23 @@ class SpecTreeManager:
             device='cuda',
         )
 
+        # Cached constants for compute_spec_dec_packed_mask (avoids per-call allocation)
+        self._pack_weights = (
+            1 << torch.arange(32, device='cuda', dtype=torch.int32))
+        # Pre-allocated intermediate buffers for packed mask computation
+        num_blocks = math.ceil((self.max_total_draft_tokens + 1) / 32)
+        total_bits = num_blocks * 32
+        self._padded_mask_buf = torch.zeros(self.num_trees,
+                                            self.max_total_draft_tokens + 1,
+                                            total_bits,
+                                            dtype=torch.int32,
+                                            device='cuda')
+        self._pack_result_buf = torch.zeros(self.num_trees,
+                                            self.max_total_draft_tokens + 1,
+                                            num_blocks,
+                                            dtype=torch.int32,
+                                            device='cuda')
+
         if self.use_dynamic_tree:
             self.init_tree_info_for_dynamic_tree()
         else:
@@ -323,28 +340,23 @@ class SpecTreeManager:
         assert packed_mask.ndim == 3, f"Expected 3D packed_mask, got {packed_mask.ndim}D"
         num_blocks = packed_mask.shape[-1]
 
-        # 1. Prepare bit weights (1, 1, 32)
-        weights = (
-            1 << torch.arange(32, device=mask_matrix.device, dtype=torch.int32))
+        # Use cached bit weights
+        weights = self._pack_weights
 
-        # 2. Pad the last dimension to 32 * num_blocks to simplify indexing
+        # Pad into pre-allocated buffer
         total_bits = num_blocks * 32
-        pad_cols = total_bits - num_tokens_attend
+        padded_m = self._padded_mask_buf[:bs, :num_tokens, :total_bits]
+        padded_m.zero_()
+        padded_m[:, :, :num_tokens_attend].copy_(mask_matrix.to(torch.int32))
 
-        # Pad with zeros on the right (LSB-first packing)
-        padded_m = torch.nn.functional.pad(mask_matrix.to(torch.int32),
-                                           (0, pad_cols),
-                                           value=0)
-
-        # 3. Reshape last dim into [num_blocks, 32] for blocked packing
-        # [bs, num_tokens, num_blocks * 32] -> [bs, num_tokens, num_blocks, 32]
+        # Reshape last dim into [num_blocks, 32] for blocked packing
         blocked_matrix = padded_m.view(bs, num_tokens, num_blocks, 32)
 
-        # 4. Vectorized dot product over the last dim to pack 32 bits per block
-        # [bs, num_tokens, num_blocks, 32] * [32] -> [bs, num_tokens, num_blocks]
-        result = torch.sum(blocked_matrix * weights, dim=-1)
+        # Vectorized dot product into pre-allocated result buffer
+        result = self._pack_result_buf[:bs, :num_tokens, :num_blocks]
+        torch.sum(blocked_matrix * weights, dim=-1, out=result)
 
-        # 5. Write results back to the output buffer
+        # Write results back to the output buffer
         packed_mask[:, :num_tokens, :] = result
         return packed_mask
 

@@ -81,6 +81,25 @@ class DynamicTreeOpsConverter:
         self.max_batch_size = max_batch_size
         self.device = device
 
+        # Pre-allocated buffer for build_dynamic_tree_op's verifiedSeqLen param
+        self._verified_seq_len_buf = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
+
+        # Pre-allocated output buffers for verify_dynamic_tree_greedy_out_op
+        N = max_total_draft_tokens + 1  # tokens_per_gen_step (includes root)
+        max_path_len = max_draft_len + 1
+        self._verify_predicts_buf = torch.zeros(
+            max_batch_size * N, dtype=torch.int64, device=device
+        )
+        self._verify_accept_index_buf = torch.zeros(
+            max_batch_size, max_path_len, dtype=torch.int64, device=device
+        )
+        self._verify_accept_token_num_buf = torch.zeros(
+            max_batch_size, dtype=torch.int64, device=device
+        )
+        self._verify_accept_token_buf = torch.zeros(
+            max_batch_size, max_path_len, dtype=torch.int64, device=device
+        )
+
     def build_dynamic_tree(
         self,
         history_draft_tokens_parent_buffer: torch.Tensor,
@@ -139,6 +158,7 @@ class DynamicTreeOpsConverter:
                 retrieve_index,
                 retrieve_next_token,
                 retrieve_next_sibling,
+                self._verified_seq_len_buf[:bs],
                 self.K,
                 self.depth,
                 num_draft_tokens,
@@ -167,7 +187,9 @@ class DynamicTreeOpsConverter:
         num_spec_step: int,
     ) -> VerifyTreeResults:
         """
-        Verify dynamic tree using greedy strategy.
+        Verify dynamic tree using greedy strategy (allocating variant).
+
+        Used by sampler.py two-model path. Allocates output tensors each call.
 
         Args:
             draft_tokens: [bs, num_draft_tokens]
@@ -176,8 +198,8 @@ class DynamicTreeOpsConverter:
                 Target model logits for verification.
             tree_buffers: DynamicTreeBuffers
                 Tree structure from build_dynamic_tree.
-            num_spec_step: int, optional
-                Number of speculative steps. Defaults to num_draft_tokens.
+            num_spec_step: int
+                Number of speculative steps.
 
         Returns:
             VerifyTreeResults containing verification outputs.
@@ -213,6 +235,60 @@ class DynamicTreeOpsConverter:
         return VerifyTreeResults(
             predicts=predicts, accept_index=accept_index, accept_token_num=accept_token_num
         )
+
+    def verify_dynamic_tree_greedy_out(
+        self,
+        candidates: torch.Tensor,
+        retrieve_index: torch.Tensor,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        target_predict: torch.Tensor,
+        num_gens: int,
+        num_spec_step: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        In-place verify using pre-allocated output buffers (CUDA graph friendly).
+
+        Args:
+            candidates: [num_gens, N] int64 candidate tokens.
+            retrieve_index: [num_gens, N] int32 retrieval indices.
+            retrieve_next_token: [num_gens, N] int32 next token indices.
+            retrieve_next_sibling: [num_gens, N] int32 next sibling indices.
+            target_predict: [num_gens, N] int64 target predictions.
+            num_gens: Number of generation requests.
+            num_spec_step: Number of speculative steps.
+
+        Returns:
+            Tuple of (predicts, accept_index, accept_token_num, accept_token)
+            as slices of pre-allocated buffers.
+        """
+        N = candidates.size(1)
+        predicts = self._verify_predicts_buf[: num_gens * N]
+        accept_index = self._verify_accept_index_buf[:num_gens]
+        accept_token_num = self._verify_accept_token_num_buf[:num_gens]
+        accept_token = self._verify_accept_token_buf[:num_gens]
+
+        try:
+            torch.ops.trtllm.verify_dynamic_tree_greedy_out_op(
+                candidates,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                target_predict,
+                predicts,
+                accept_index,
+                accept_token_num,
+                accept_token,
+                num_spec_step,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"verify_dynamic_tree_greedy_out_op failed: {e}\n"
+                f"Inputs: num_gens={num_gens}, N={N}, "
+                f"num_spec_step={num_spec_step}"
+            ) from e
+
+        return predicts, accept_index, accept_token_num, accept_token
 
 
 def create_dynamic_tree_ops_converter(
