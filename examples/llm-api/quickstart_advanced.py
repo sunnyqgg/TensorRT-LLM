@@ -223,6 +223,13 @@ def parse_arguments():
         help=
         "Path to a JSONL dataset file. Each line: {\"question_id\": N, \"question\": [\"prompt\"]}."
     )
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=None,
+        required=False,
+        help="Limit number of samples from dataset (for fast debugging)."
+    )
     args = parser.parse_args()
     return args
 
@@ -380,6 +387,10 @@ def main():
         prompts = args.prompt
     else:
         prompts = example_prompts
+
+    if args.num_samples is not None:
+        prompts = prompts[:args.num_samples]
+        print(f"Truncated to {len(prompts)} samples for debugging")
 
     llm, sampling_params = setup_llm(args)
     new_prompts = []

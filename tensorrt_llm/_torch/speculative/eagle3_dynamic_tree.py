@@ -276,44 +276,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             if spec_rm is not None and hasattr(spec_rm, "spec_tree_manager"):
                 self.spec_tree_manager = spec_rm.spec_tree_manager
 
-    # ---- Save/restore spec_decoding_* for CUDA graph compatibility ----
-
-    @override
-    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
-        """Save spec_decoding_* tensors before the draft loop overwrites them.
-
-        The dynamic tree draft loop modifies spec_decoding_packed_mask,
-        spec_decoding_position_offsets, and spec_decoding_generation_lengths
-        at each step.  Without saving/restoring, these overwrites persist
-        across CUDA graph warmup iterations, causing the target model to
-        read draft-loop residue instead of the correct target tree params.
-        """
-        super()._prepare_attn_metadata_for_spec_dec(attn_metadata)
-        bs = attn_metadata.num_seqs
-        self._saved_spec_dec_packed_mask[:bs].copy_(attn_metadata.spec_decoding_packed_mask[:bs])
-        po_len = bs * self.tokens_per_gen_step
-        self._saved_spec_dec_position_offsets[:po_len].copy_(
-            attn_metadata.spec_decoding_position_offsets[:po_len]
-        )
-        self._saved_spec_dec_generation_lengths[:bs].copy_(
-            attn_metadata.spec_decoding_generation_lengths[:bs]
-        )
-        self._saved_spec_dec_bs = bs
-
-    @override
-    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
-        """Restore spec_decoding_* tensors after the draft loop."""
-        super()._restore_attn_metadata_from_spec_dec(attn_metadata)
-        bs = self._saved_spec_dec_bs
-        attn_metadata.spec_decoding_packed_mask[:bs].copy_(self._saved_spec_dec_packed_mask[:bs])
-        po_len = bs * self.tokens_per_gen_step
-        attn_metadata.spec_decoding_position_offsets[:po_len].copy_(
-            self._saved_spec_dec_position_offsets[:po_len]
-        )
-        attn_metadata.spec_decoding_generation_lengths[:bs].copy_(
-            self._saved_spec_dec_generation_lengths[:bs]
-        )
-
     # ---- Overridden dispatch methods ----
 
     @override
@@ -612,20 +574,22 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         # Spec decoding: uniform causal mask for gen requests
         # All [num_contexts:batch_size] writes are empty-slice no-ops when num_gens == 0
-        attn_metadata.spec_decoding_generation_lengths[num_contexts:batch_size].fill_(
-            num_step0_tokens
-        )
+        # Guard: spec_decoding tensors are None during prefill-only warmup
+        if attn_metadata.spec_decoding_generation_lengths is not None:
+            attn_metadata.spec_decoding_generation_lengths[num_contexts:batch_size].fill_(
+                num_step0_tokens
+            )
 
-        tokens_per_req = self.tokens_per_gen_step
-        total_po_size = attn_metadata.spec_decoding_position_offsets.shape[0]
-        max_reqs = total_po_size // tokens_per_req
-        pos_2d = attn_metadata.spec_decoding_position_offsets.view(max_reqs, tokens_per_req)
-        pos_2d[num_contexts:batch_size, :num_step0_tokens] = self._causal_offs[:num_step0_tokens]
+            tokens_per_req = self.tokens_per_gen_step
+            total_po_size = attn_metadata.spec_decoding_position_offsets.shape[0]
+            max_reqs = total_po_size // tokens_per_req
+            pos_2d = attn_metadata.spec_decoding_position_offsets.view(max_reqs, tokens_per_req)
+            pos_2d[num_contexts:batch_size, :num_step0_tokens] = self._causal_offs[:num_step0_tokens]
 
-        attn_metadata.spec_decoding_packed_mask[num_contexts:batch_size].fill_(0)
-        attn_metadata.spec_decoding_packed_mask[num_contexts:batch_size, :num_step0_tokens, 0] = (
-            self._step0_causal_mask[:num_step0_tokens]
-        )
+            attn_metadata.spec_decoding_packed_mask[num_contexts:batch_size].fill_(0)
+            attn_metadata.spec_decoding_packed_mask[num_contexts:batch_size, :num_step0_tokens, 0] = (
+                self._step0_causal_mask[:num_step0_tokens]
+            )
 
         attn_metadata.use_spec_decoding = num_gens > 0
 
@@ -1027,6 +991,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         selected_parents: torch.Tensor = None,
     ):
         """Prepare the mask and position offsets for the next layer."""
+        if attn_metadata.spec_decoding_packed_mask is None:
+            return
         batch_size = attn_metadata.num_seqs
         num_tokens_current_layer = self.K * (cur_draft_idx + 1)
         num_tokens_previous_layer = self.K * cur_draft_idx
