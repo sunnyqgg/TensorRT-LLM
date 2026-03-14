@@ -3688,6 +3688,31 @@ class PyTorchModelEngine(ModelEngine):
                                     file=sys.stderr,
                                     flush=True)
 
+            # Sync CUDA graph attn_metadata back to persistent attn_metadata
+            # for dynamic tree spec decoding.  The CUDA graph uses its own
+            # attn_metadata with independently allocated kv_lens_cuda and
+            # kv_cache_block_offsets.  After graph replay, the KV cache
+            # relocation kernel (_update_kv_cache_draft_token_location) reads
+            # from the persistent self.attn_metadata.  Without this sync the
+            # kernel would use stale values, causing either illegal memory
+            # access (wrong kv_lens) or KV cache data corruption (wrong
+            # block offsets).
+            if (can_run_graph and attn_metadata is not self.attn_metadata
+                    and self.spec_config is not None
+                    and getattr(self.spec_config, 'use_dynamic_tree', False)):
+                batch_size = scheduled_requests.batch_size
+                if hasattr(attn_metadata, 'kv_lens_cuda') and hasattr(
+                        self.attn_metadata, 'kv_lens_cuda'):
+                    self.attn_metadata.kv_lens_cuda[:batch_size].copy_(
+                        attn_metadata.kv_lens_cuda[:batch_size])
+                if hasattr(
+                        attn_metadata, 'kv_cache_block_offsets'
+                ) and attn_metadata.kv_cache_block_offsets is not None and hasattr(
+                        self.attn_metadata, 'kv_cache_block_offsets'
+                ) and self.attn_metadata.kv_cache_block_offsets is not None:
+                    self.attn_metadata.kv_cache_block_offsets[:, :batch_size].copy_(
+                        attn_metadata.kv_cache_block_offsets[:, :batch_size])
+
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
