@@ -27,8 +27,6 @@ Goal: One-model dynamic tree accept rate must match two-model dynamic tree
 accept rate exactly. See eagle3-dynamic-tree.md section 22 for details.
 """
 
-import math
-import os
 from typing import TYPE_CHECKING, override
 
 import torch
@@ -43,13 +41,6 @@ from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
-
-# Debug flag: disable tree attention in draft steps (use regular attention like linear tree)
-_DEBUG_NO_DRAFT_TREE_ATTN = bool(os.environ.get("TRTLLM_DEBUG_NO_DRAFT_TREE_ATTN", ""))
-
-# Debug flag: capture per-step logits checksums and key tensor values.
-# Prints a summary after each forward to compare eager vs CUDA graph.
-_DEBUG_DRAFT_CHECKSUMS = bool(os.environ.get("TRTLLM_DEBUG_DRAFT_CHECKSUMS", ""))
 
 
 class Eagle3OneModelDynamicTreeSampler(MTPSampler):
@@ -148,12 +139,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self.tree_mask_init_buffer = (
             torch.eye(K, dtype=torch.int32, device="cuda").unsqueeze(0).repeat(max_batch_size, 1, 1)
         )
-        self.tree_mask_padding_zeros = torch.zeros(
-            (max_batch_size, max_total_draft_tokens, tokens_per_gen_step),
-            dtype=torch.int32,
-            device="cuda",
-        )
-
         self.tree_ops_converter = create_dynamic_tree_ops_converter(
             dynamic_tree_max_topK=K,
             max_draft_len=max_draft_len,
@@ -235,36 +220,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             max_batch_size, max_total_draft_tokens, dtype=torch.int32, device="cuda"
         )
 
-        # Pre-allocated save buffers for spec_decoding_* tensors (CUDA graph
-        # compatible).  The draft loop overwrites these tensors; we save them
-        # before the loop and restore after so that warmup iterations during
-        # CUDA graph capture see the correct target-model tree parameters.
-        N = tokens_per_gen_step
-        mask_cols = math.ceil(N / 32)
-        self._saved_spec_dec_packed_mask = torch.zeros(
-            max_batch_size, N, mask_cols, dtype=torch.int32, device="cuda"
-        )
-        self._saved_spec_dec_position_offsets = torch.zeros(
-            max_batch_size * N, dtype=torch.int32, device="cuda"
-        )
-        self._saved_spec_dec_generation_lengths = torch.zeros(
-            max_batch_size, dtype=torch.int32, device="cuda"
-        )
-        self._saved_spec_dec_bs = 0
-
-        # Debug: per-step checksums (CUDA-graph safe, GPU buffers only)
-        if _DEBUG_DRAFT_CHECKSUMS:
-            # Store logits sum, kv_lens sum, generation_lengths sum, hidden_states sum per step
-            # [max_draft_len, 4]: col 0=logits_sum, 1=kv_lens_sum, 2=gen_lengths_sum, 3=hs_sum
-            self._debug_step_checksums = torch.zeros(
-                max_draft_len, 4, dtype=torch.float32, device="cuda"
-            )
-            # Store spec_decoding_packed_mask checksum and position_offsets checksum per step
-            self._debug_step_spec_checksums = torch.zeros(
-                max_draft_len, 2, dtype=torch.float32, device="cuda"
-            )
-            self._debug_forward_count = 0
-
     def _ensure_spec_tree_manager(self, resource_manager):
         """Lazily initialize spec_tree_manager from resource_manager."""
         if self.spec_tree_manager is None and resource_manager is not None:
@@ -338,24 +293,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             output["accepted_draft_tokens_indices"] = self._accepted_draft_indices_tensor[
                 :batch_size
             ]
-
-        # Debug: print per-step checksums AFTER graph completes (CPU read is safe here)
-        if _DEBUG_DRAFT_CHECKSUMS:
-            self._debug_forward_count += 1
-            # Print every 10th forward to reduce log volume
-            if self._debug_forward_count % 10 == 1:
-                is_cg = getattr(attn_metadata, "is_cuda_graph", False)
-                mode = "CG" if is_cg else "EG"
-                sums = self._debug_step_checksums.cpu()
-                spec_sums = self._debug_step_spec_checksums.cpu()
-                parts = [f"[{mode} fwd#{self._debug_forward_count}]"]
-                for s in range(self.max_draft_len):
-                    parts.append(
-                        f"  step{s}: logits={sums[s, 0]:.1f} kv={sums[s, 1]:.0f} "
-                        f"gl={sums[s, 2]:.0f} hs={sums[s, 3]:.1f} "
-                        f"mask={spec_sums[s, 0]:.0f} po={spec_sums[s, 1]:.0f}"
-                    )
-                print("\n".join(parts), flush=True)
 
         return output
 
@@ -584,12 +521,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             total_po_size = attn_metadata.spec_decoding_position_offsets.shape[0]
             max_reqs = total_po_size // tokens_per_req
             pos_2d = attn_metadata.spec_decoding_position_offsets.view(max_reqs, tokens_per_req)
-            pos_2d[num_contexts:batch_size, :num_step0_tokens] = self._causal_offs[:num_step0_tokens]
+            pos_2d[num_contexts:batch_size, :num_step0_tokens] = self._causal_offs[
+                :num_step0_tokens
+            ]
 
             attn_metadata.spec_decoding_packed_mask[num_contexts:batch_size].fill_(0)
-            attn_metadata.spec_decoding_packed_mask[num_contexts:batch_size, :num_step0_tokens, 0] = (
-                self._step0_causal_mask[:num_step0_tokens]
-            )
+            attn_metadata.spec_decoding_packed_mask[
+                num_contexts:batch_size, :num_step0_tokens, 0
+            ] = self._step0_causal_mask[:num_step0_tokens]
 
         attn_metadata.use_spec_decoding = num_gens > 0
 
@@ -613,27 +552,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             logits = draft_model.logits_processor(
                 hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
             )
-
-            # Debug: capture step 0 checksums (all GPU ops, CUDA-graph safe)
-            if _DEBUG_DRAFT_CHECKSUMS:
-                self._debug_step_checksums[0, 0] = logits.float().sum()
-                self._debug_step_checksums[0, 1] = (
-                    attn_metadata.kv_lens_cuda[:batch_size].float().sum()
-                )
-                self._debug_step_checksums[0, 2] = (
-                    attn_metadata.spec_decoding_generation_lengths[:batch_size].float().sum()
-                )
-                self._debug_step_checksums[0, 3] = hidden_states.float().sum()
-                self._debug_step_spec_checksums[0, 0] = (
-                    attn_metadata.spec_decoding_packed_mask[:batch_size].float().sum()
-                )
-                self._debug_step_spec_checksums[0, 1] = (
-                    attn_metadata.spec_decoding_position_offsets[
-                        : batch_size * self.tokens_per_gen_step
-                    ]
-                    .float()
-                    .sum()
-                )
 
             new_draft_tokens, new_draft_scores = self.sample(
                 logits, self.K, draft_model=draft_model
@@ -704,27 +622,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 logits = draft_model.logits_processor(
                     selected_hs, draft_model.lm_head, attn_metadata, True
                 )
-
-                # Debug: capture step N checksums (all GPU ops, CUDA-graph safe)
-                if _DEBUG_DRAFT_CHECKSUMS:
-                    self._debug_step_checksums[layer_idx, 0] = logits.float().sum()
-                    self._debug_step_checksums[layer_idx, 1] = (
-                        attn_metadata.kv_lens_cuda[:batch_size].float().sum()
-                    )
-                    self._debug_step_checksums[layer_idx, 2] = (
-                        attn_metadata.spec_decoding_generation_lengths[:batch_size].float().sum()
-                    )
-                    self._debug_step_checksums[layer_idx, 3] = hidden_states.float().sum()
-                    self._debug_step_spec_checksums[layer_idx, 0] = (
-                        attn_metadata.spec_decoding_packed_mask[:batch_size].float().sum()
-                    )
-                    self._debug_step_spec_checksums[layer_idx, 1] = (
-                        attn_metadata.spec_decoding_position_offsets[
-                            : batch_size * self.tokens_per_gen_step
-                        ]
-                        .float()
-                        .sum()
-                    )
 
                 new_draft_tokens, new_draft_scores = self.sample(
                     logits, self.K, draft_model=draft_model
