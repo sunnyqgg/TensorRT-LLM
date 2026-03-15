@@ -440,6 +440,7 @@ class PyExecutor:
         # Ensure the default stream waits for execution_stream to complete
         # before subsequent operations.
         torch.cuda.current_stream().wait_stream(self.execution_stream)
+
         self.is_warmup = False
 
         self.is_shutdown = False
