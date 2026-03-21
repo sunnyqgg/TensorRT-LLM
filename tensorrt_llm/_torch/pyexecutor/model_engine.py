@@ -3725,14 +3725,6 @@ class PyTorchModelEngine(ModelEngine):
                         with MoeLoadBalancerIterContext(moe_load_balancer):
                             outputs = self.cuda_graph_runner.replay(key, inputs)
 
-            # Relocate accepted draft tokens' KV from tree to linear positions.
-            if (self.spec_config is not None
-                    and getattr(self.spec_config, 'use_dynamic_tree', False)):
-                spec_worker = self._get_spec_worker()
-                if spec_worker is not None:
-                    spec_worker._relocate_kv_eagerly(
-                        attn_metadata, scheduled_requests.batch_size)
-
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
