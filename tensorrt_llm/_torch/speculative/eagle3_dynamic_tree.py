@@ -88,6 +88,8 @@ def _gather_repack_step0_kernel(
     max_path_len,
     max_draft_len,
     hidden_dim,
+    dst_offset,
+    gather_id_offset,
     BLOCK_H: tl.constexpr,
 ):
     """Fused gather+repack for generation requests in step 0.
@@ -110,8 +112,8 @@ def _gather_repack_step0_kernel(
     tree_pos = tl.where(path_idx == 0, 0, raw_val.to(tl.int64) + 1)
     src_row = gen_start + tree_pos
 
-    # Destination position in output buffers
-    dst_row = num_ctx_tokens + gen_idx * max_path_len + path_idx
+    # Destination position in output buffers (gen-only, offset 0)
+    dst_row = dst_offset + gen_idx * max_path_len + path_idx
 
     # 1) Gather hidden_states: src[src_row, :] → out[dst_row, :]
     for h in range(0, hidden_dim, BLOCK_H):
@@ -129,9 +131,10 @@ def _gather_repack_step0_kernel(
     tl.store(out_pos_ptr + dst_row, base_pos + path_idx)
 
     # 4) Compute gather_id (only for last accepted token of each gen request)
+    #    gather_id references the FINAL combined [ctx | gen] tensor
     n_acc = tl.load(num_accepted_ptr + num_contexts + gen_idx).to(tl.int64)
     if path_idx == 0:
-        gather_id = num_ctx_tokens + gen_idx * max_path_len + n_acc - 1
+        gather_id = gather_id_offset + gen_idx * max_path_len + n_acc - 1
         tl.store(out_gather_ids_ptr + num_contexts + gen_idx, gather_id)
 
 
@@ -408,7 +411,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         if num_gens > 0:
             max_path_len = self._max_path_len
             num_gen_tokens = num_gens * max_path_len
-            total_len = num_ctx_tokens + num_gen_tokens
 
             hidden_dim = hidden_states.shape[-1]
             if (
@@ -422,12 +424,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     device="cuda",
                 )
 
-            # Context tokens: copy directly
-            self._step0_input_ids_buf[:num_ctx_tokens].copy_(input_ids_ctx)
-            self._step0_position_ids_buf[:num_ctx_tokens].copy_(position_ids[:num_ctx_tokens])
-            self._step0_hidden_states_buf[:num_ctx_tokens].copy_(hidden_states[:num_ctx_tokens])
-
-            # Gen tokens: fused Triton kernel
+            # Gen tokens: fused Triton kernel writes into gen-only buffers
+            # (buffers sized for max_batch_size * tokens_per_gen_step)
             BLOCK_H = triton.next_power_of_2(hidden_dim)
             _gather_repack_step0_kernel[(num_gens * max_path_len,)](
                 hidden_states,
@@ -445,12 +443,23 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 max_path_len,
                 self.max_draft_len,
                 hidden_dim,
+                0,  # dst_offset: gen tokens start at 0 in buffer
+                num_ctx_tokens,  # gather_id_offset: references combined tensor
                 BLOCK_H=BLOCK_H,
             )
 
-            input_ids = self._step0_input_ids_buf[:total_len]
-            position_ids = self._step0_position_ids_buf[:total_len]
-            hidden_states = self._step0_hidden_states_buf[:total_len]
+            # Concat context + gen
+            input_ids = torch.cat(
+                [input_ids_ctx, self._step0_input_ids_buf[:num_gen_tokens]], dim=0
+            )
+            position_ids = torch.cat(
+                [position_ids[:num_ctx_tokens], self._step0_position_ids_buf[:num_gen_tokens]],
+                dim=0,
+            )
+            hidden_states = torch.cat(
+                [hidden_states[:num_ctx_tokens], self._step0_hidden_states_buf[:num_gen_tokens]],
+                dim=0,
+            )
 
             attn_metadata._seq_lens[num_contexts:batch_size].fill_(max_path_len)
             attn_metadata._seq_lens_cuda[num_contexts:batch_size].fill_(max_path_len)
