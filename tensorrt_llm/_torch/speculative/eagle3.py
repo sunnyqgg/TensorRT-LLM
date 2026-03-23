@@ -680,7 +680,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 if i == 0:
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
-                    attn_metadata.on_update()
+                    # Avoid .item() which is UB during CUDA graph capture.
+                    attn_metadata._num_tokens = batch_size
+                    attn_metadata._num_ctx_tokens = 0
+                    attn_metadata._num_generations = batch_size
                     # cannot run generation if there is no kv cache
                     if inputs["attn_metadata"].kv_cache_manager is not None:
                         attn_metadata.host_request_types[:attn_metadata.
