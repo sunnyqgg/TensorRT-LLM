@@ -467,14 +467,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             attn_metadata._seq_lens[num_contexts:batch_size].fill_(max_path_len)
             attn_metadata._seq_lens_cuda[num_contexts:batch_size].fill_(max_path_len)
-            if attn_metadata.is_cuda_graph:
-                # During CUDA graph, num_contexts=0 always, so all requests are gen.
-                attn_metadata._num_tokens = batch_size * max_path_len
-                attn_metadata._num_ctx_tokens = 0
-                attn_metadata._num_generations = batch_size
-            else:
-                # Normal path: context requests have varying seq_lens, need .item()
-                attn_metadata.on_update()
+            attn_metadata.on_update()
         else:
             # Context-only (warmup). No gen tokens.
             input_ids = input_ids_ctx
@@ -924,11 +917,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             attn_metadata._seq_lens[:batch_size].fill_(self.K)
             attn_metadata._seq_lens_cuda[:batch_size].fill_(self.K)
-            # Avoid .item() which is UB during CUDA graph capture.
-            # All requests are generation (num_contexts=0 after setup).
-            attn_metadata._num_tokens = batch_size * self.K
-            attn_metadata._num_ctx_tokens = 0
-            attn_metadata._num_generations = batch_size
+            attn_metadata.on_update()
 
             if inputs["attn_metadata"].kv_cache_manager is not None:
                 attn_metadata.host_request_types[: attn_metadata.num_contexts].fill_(1)
@@ -953,10 +942,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             attn_metadata._seq_lens[:batch_size].fill_(num_tokens_current_layer)
             attn_metadata._seq_lens_cuda[:batch_size].fill_(num_tokens_current_layer)
-            # Avoid .item() which is UB during CUDA graph capture.
-            attn_metadata._num_tokens = batch_size * num_tokens_current_layer
-            attn_metadata._num_ctx_tokens = 0
-            attn_metadata._num_generations = batch_size
+            attn_metadata.on_update()
             attn_metadata.kv_lens_cuda[:batch_size] += self.K
 
     def update_hidden_states(
