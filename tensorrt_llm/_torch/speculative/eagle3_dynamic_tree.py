@@ -265,7 +265,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
     @nvtx_range("eagle3_dyn._ensure_spec_tree_manager")
     def _ensure_spec_tree_manager(self, resource_manager):
-        """Lazily initialize spec_tree_manager."""
+        """Lazily initialize spec_tree_manager and KV head metadata."""
         if self.spec_tree_manager is not None:
             return
         from ..pyexecutor.resource_manager import ResourceManagerType
@@ -275,6 +275,23 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             "Dynamic tree mode requires spec_tree_manager in resource_manager"
         )
         self.spec_tree_manager = spec_rm.spec_tree_manager
+
+        if self._kv_head_dim_bytes is None:
+            cache_mgr = resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+            if cache_mgr is not None:
+                from tensorrt_llm.bindings import DataType
+
+                _dtype_bytes = {
+                    DataType.HALF: 2,
+                    DataType.BF16: 2,
+                    DataType.FLOAT: 4,
+                    DataType.FP8: 1,
+                    DataType.INT8: 1,
+                    DataType.NVFP4: 0.5,
+                }
+                self._kv_head_dim_bytes = int(
+                    cache_mgr.head_dim * _dtype_bytes.get(cache_mgr.dtype, 0.5)
+                )
 
     # ---- Overridden dispatch methods ----
 
@@ -327,28 +344,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         if cache_mgr is None:
             return
 
-        if self._kv_head_dim_bytes is None:
-            from tensorrt_llm.bindings import DataType
-
-            _dtype_bytes = {
-                DataType.HALF: 2,
-                DataType.BF16: 2,
-                DataType.FLOAT: 4,
-                DataType.FP8: 1,
-                DataType.INT8: 1,
-                DataType.NVFP4: 0.5,
-            }
-            self._kv_head_dim_bytes = int(
-                cache_mgr.head_dim * _dtype_bytes.get(cache_mgr.dtype, 0.5)
-            )
-
         torch.ops.tensorrt_llm.update_kv_cache_draft_token_location_2d(
             self._accepted_draft_indices_tensor[:batch_size],
             self._num_accepted_tokens_buf[:batch_size],
             attn_metadata.kv_lens_cuda[:batch_size],
             True,
             cache_mgr.num_layers,
-            cache_mgr.num_kv_heads,
+            # Use TP-sharded num_kv_heads (per-rank) instead of the unsharded
+            # total so the C++ kernel computes correct strides and grid dims.
+            cache_mgr.num_kv_heads_per_layer[0],
             self._kv_head_dim_bytes,
             cache_mgr.max_total_draft_tokens,
             cache_mgr.max_attention_window_vec[0],
