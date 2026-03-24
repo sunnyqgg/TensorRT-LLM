@@ -1067,6 +1067,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
                 )
             else:
                 assert self.max_total_draft_tokens >= self.max_draft_len, f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be >= max_draft_len ({self.max_draft_len})"
+                assert self.max_total_draft_tokens <= self.dynamic_tree_max_topK * self.max_draft_len, (
+                    f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be <= "
+                    f"dynamic_tree_max_topK * max_draft_len ({self.dynamic_tree_max_topK * self.max_draft_len})"
+                )
 
         # Linear tree
         if self.max_total_draft_tokens is None:

@@ -231,6 +231,11 @@ def parse_arguments():
         default=False,
         help="Use streaming generate_async instead of generate.")
     parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Number of concurrent requests to submit simultaneously.")
+    parser.add_argument(
         "--dataset",
         type=str,
         default=None,
@@ -458,54 +463,90 @@ def main():
             )
         return
 
-    # Use streaming generate_async to count decode iterations for accept rate
-    for i, prompt in enumerate(prompts):
-        num_tokens = 0
-        num_iterations = 0
-        for output in llm.generate_async(prompt,
-                                         sampling_params,
-                                         streaming=True):
-            new_tokens = output.outputs[0].token_ids
-            num_tokens = len(new_tokens)
-            num_iterations += 1
-        if num_iterations > 0:
-            accept_rate = num_tokens / num_iterations
-            accept_rates.append(accept_rate)
-            total_tokens += num_tokens
-            total_iterations += num_iterations
-            print(f"[{i}] Accept rate: {accept_rate:.2f} "
-                  f"(tokens={num_tokens}, iterations={num_iterations})")
-        for sequence_idx, sequence in enumerate(output.outputs):
-            generated_text = sequence.text
-            # Skip printing the beam_idx if no beam search was used
-            sequence_id_text = f"[{sequence_idx}]" if args.max_beam_width > 1 or args.n > 1 else ""
-            print(
-                f"[{i}]{sequence_id_text} Prompt: {prompt[:80]!r}..., Generated text: {generated_text[:200]!r}..."
-            )
-            if args.return_context_logits:
-                print(
-                    f"[{i}]{sequence_id_text} Context logits: {output.context_logits}"
-                )
-            if args.return_generation_logits:
-                print(
-                    f"[{i}]{sequence_id_text} Generation logits: {sequence.generation_logits}"
-                )
-            if args.prompt_logprobs is not None:
-                print(
-                    f"[{i}]{sequence_id_text} Prompt logprobs: {sequence.prompt_logprobs}"
-                )
-            if args.logprobs is not None:
-                print(f"[{i}]{sequence_id_text} Logprobs: {sequence.logprobs}")
+    concurrency = args.concurrency
 
-            if args.additional_model_outputs:
-                for output_name in args.additional_model_outputs:
-                    if sequence.additional_context_outputs:
-                        print(
-                            f"[{i}]{sequence_id_text} Context {output_name}: {sequence.additional_context_outputs[output_name]}"
-                        )
+    if concurrency > 1:
+        # Submit all prompts concurrently in batches of `concurrency`
+        for batch_start in range(0, len(prompts), concurrency):
+            batch_end = min(batch_start + concurrency, len(prompts))
+            batch_prompts = prompts[batch_start:batch_end]
+
+            futures = []
+            for prompt in batch_prompts:
+                future = llm.generate_async(prompt,
+                                            sampling_params,
+                                            streaming=True)
+                futures.append(future)
+
+            for j, future in enumerate(futures):
+                i = batch_start + j
+                num_tokens = 0
+                num_iterations = 0
+                for output in future:
+                    new_tokens = output.outputs[0].token_ids
+                    num_tokens = len(new_tokens)
+                    num_iterations += 1
+                if num_iterations > 0:
+                    accept_rate = num_tokens / num_iterations
+                    accept_rates.append(accept_rate)
+                    total_tokens += num_tokens
+                    total_iterations += num_iterations
+                    print(f"[{i}] Accept rate: {accept_rate:.2f} "
+                          f"(tokens={num_tokens}, iterations={num_iterations})")
+                generated_text = output.outputs[0].text
+                print(
+                    f"[{i}] Prompt: {prompt[:80]!r}..., Generated text: {generated_text[:200]!r}..."
+                )
+    else:
+        # Use streaming generate_async to count decode iterations for accept rate
+        for i, prompt in enumerate(prompts):
+            num_tokens = 0
+            num_iterations = 0
+            for output in llm.generate_async(prompt,
+                                             sampling_params,
+                                             streaming=True):
+                new_tokens = output.outputs[0].token_ids
+                num_tokens = len(new_tokens)
+                num_iterations += 1
+            if num_iterations > 0:
+                accept_rate = num_tokens / num_iterations
+                accept_rates.append(accept_rate)
+                total_tokens += num_tokens
+                total_iterations += num_iterations
+                print(f"[{i}] Accept rate: {accept_rate:.2f} "
+                      f"(tokens={num_tokens}, iterations={num_iterations})")
+            for sequence_idx, sequence in enumerate(output.outputs):
+                generated_text = sequence.text
+                sequence_id_text = f"[{sequence_idx}]" if args.max_beam_width > 1 or args.n > 1 else ""
+                print(
+                    f"[{i}]{sequence_id_text} Prompt: {prompt[:80]!r}..., Generated text: {generated_text[:200]!r}..."
+                )
+                if args.return_context_logits:
                     print(
-                        f"[{i}]{sequence_id_text} Generation {output_name}: {sequence.additional_generation_outputs[output_name]}"
+                        f"[{i}]{sequence_id_text} Context logits: {output.context_logits}"
                     )
+                if args.return_generation_logits:
+                    print(
+                        f"[{i}]{sequence_id_text} Generation logits: {sequence.generation_logits}"
+                    )
+                if args.prompt_logprobs is not None:
+                    print(
+                        f"[{i}]{sequence_id_text} Prompt logprobs: {sequence.prompt_logprobs}"
+                    )
+                if args.logprobs is not None:
+                    print(
+                        f"[{i}]{sequence_id_text} Logprobs: {sequence.logprobs}"
+                    )
+
+                if args.additional_model_outputs:
+                    for output_name in args.additional_model_outputs:
+                        if sequence.additional_context_outputs:
+                            print(
+                                f"[{i}]{sequence_id_text} Context {output_name}: {sequence.additional_context_outputs[output_name]}"
+                            )
+                        print(
+                            f"[{i}]{sequence_id_text} Generation {output_name}: {sequence.additional_generation_outputs[output_name]}"
+                        )
 
     if accept_rates:
         avg_accept_rate = sum(accept_rates) / len(accept_rates)
