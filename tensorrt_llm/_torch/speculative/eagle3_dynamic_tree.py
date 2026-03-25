@@ -517,24 +517,25 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         # Set up uniform causal mask for step 0 (None during prefill-only warmup)
         if attn_metadata.spec_decoding_generation_lengths is not None:
-            attn_metadata.spec_decoding_generation_lengths[num_contexts:batch_size].fill_(
-                num_step0_tokens
-            )
+            # C++ thop/attentionOp.cpp passes spec_decoding tensors to the gen
+            # sub-batch kernel via raw data_ptr() (NOT offset by num_contexts).
+            # The kernel indexes with gen-relative batch_idx starting from 0.
+            # Therefore we must write gen data at rows 0..num_gens-1, not at
+            # absolute rows num_contexts..batch_size-1.
+            attn_metadata.spec_decoding_generation_lengths[:num_gens].fill_(num_step0_tokens)
 
-            tokens_per_req = self.tokens_per_gen_step
-            # Only view the portion needed for the current batch
-            # (buf_dim may not be divisible by tokens_per_req)
+            # Pack position offsets with stride = num_step0_tokens to match
+            # C++ kernel indexing: stride = generation_input_length =
+            # num_tokens / num_seqs = num_step0_tokens (NOT tokens_per_gen_step).
             pos_2d = attn_metadata.spec_decoding_position_offsets[
-                : batch_size * tokens_per_req
-            ].view(batch_size, tokens_per_req)
-            pos_2d[num_contexts:batch_size, :num_step0_tokens] = self._causal_offs[
-                :num_step0_tokens
-            ]
+                : num_gens * num_step0_tokens
+            ].view(num_gens, num_step0_tokens)
+            pos_2d[:] = self._causal_offs[:num_step0_tokens]
 
-            attn_metadata.spec_decoding_packed_mask[num_contexts:batch_size].fill_(0)
-            attn_metadata.spec_decoding_packed_mask[
-                num_contexts:batch_size, :num_step0_tokens, 0
-            ] = self._step0_causal_mask[:num_step0_tokens]
+            attn_metadata.spec_decoding_packed_mask[:num_gens].fill_(0)
+            attn_metadata.spec_decoding_packed_mask[:num_gens, :num_step0_tokens, 0] = (
+                self._step0_causal_mask[:num_step0_tokens]
+            )
 
         attn_metadata.use_spec_decoding = num_gens > 0
 

@@ -577,7 +577,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             inputs, attn_metadata, spec_metadata, draft_model,
             draft_kv_cache_manager, num_contexts, num_gens, batch_size,
             num_accepted_tokens, original_all_rank_num_tokens, resource_manager)
-
         # restore attn_metadata to support cuda graph
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
         # restore all_rank_num_tokens for attention DP
