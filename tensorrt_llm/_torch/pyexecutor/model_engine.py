@@ -2343,6 +2343,8 @@ class PyTorchModelEngine(ModelEngine):
                     spec_resource_manager, 'spec_tree_manager'):
                 spec_tree_manager = spec_resource_manager.spec_tree_manager
 
+        _gen_tree_idx = 0
+
         # For tree decoding, runtime_draft_len should match total tree
         # tokens (not tree depth).  py_executor resets it every iteration.
         if spec_config is not None and not spec_config.is_linear_tree:
@@ -2391,11 +2393,12 @@ class PyTorchModelEngine(ModelEngine):
                     assert spec_tree_manager is not None
                     assert num_draft_tokens == spec_tree_manager.max_total_draft_tokens
                     n_tokens = spec_tree_manager.max_total_draft_tokens + 1
+                    _gi = _gen_tree_idx
+                    _gen_tree_idx += 1
                     position_ids.extend(
                         past_seen_token_num +
                         spec_tree_manager.spec_dec_position_offsets[
-                            0, :n_tokens]  # [max_total_draft_tokens + 1]
-                    )
+                            _gi, :n_tokens])
                 else:
                     position_ids.extend(
                         list(
@@ -2424,11 +2427,12 @@ class PyTorchModelEngine(ModelEngine):
                 if not self.is_draft_model and not spec_config.is_linear_tree:
                     assert spec_tree_manager is not None
                     n_tokens = spec_tree_manager.max_total_draft_tokens + 1
+                    _gi = _gen_tree_idx
+                    _gen_tree_idx += 1
                     position_ids.extend(
                         past_seen_token_num +
                         spec_tree_manager.spec_dec_position_offsets[
-                            0, :n_tokens]  # [max_total_draft_tokens + 1]
-                    )
+                            _gi, :n_tokens])
                 else:
                     position_ids.extend(
                         list(
@@ -3633,6 +3637,25 @@ class PyTorchModelEngine(ModelEngine):
             # to spec_metadata so downstream code (eagle3, interface, trtllm) can read it.
             spec_metadata.runtime_draft_len = self.runtime_draft_len
 
+            # Gather dynamic tree data from stable slots before target forward
+            if (spec_tree_manager is not None
+                    and spec_tree_manager.use_dynamic_tree
+                    and not self.is_draft_model
+                    and hasattr(spec_tree_manager, '_slot_packed_mask')):
+                dummy_slot = spec_tree_manager._dummy_slot_id
+                gen_requests = list(scheduled_requests.generation_requests)
+                num_gens = len(gen_requests)
+                if num_gens > 0:
+                    gen_slot_ids = torch.tensor([
+                        r.py_seq_slot
+                        if r.py_seq_slot is not None else dummy_slot
+                        for r in gen_requests
+                    ],
+                                                device='cuda',
+                                                dtype=torch.long)
+                    spec_tree_manager.gather_trees_from_slots(
+                        gen_slot_ids, num_gens)
+
             attn_metadata.update_spec_dec_param(
                 batch_size=scheduled_requests.batch_size,
                 is_spec_decoding_enabled=is_spec_dec_mode,
@@ -3688,6 +3711,26 @@ class PyTorchModelEngine(ModelEngine):
                     spec_metadata = self.spec_metadata
                 else:
                     spec_metadata = None
+
+            # Fill slot-ID buffer for scatter inside draft loop
+            if (self.enable_spec_decode and spec_tree_manager is not None
+                    and spec_tree_manager.use_dynamic_tree
+                    and not self.is_draft_model
+                    and hasattr(spec_tree_manager, '_all_slot_ids_buf')):
+                dummy_slot = spec_tree_manager._dummy_slot_id
+                idx = 0
+                for req in padded_requests.context_requests:
+                    spec_tree_manager._all_slot_ids_buf[idx] = (
+                        req.py_seq_slot
+                        if req.py_seq_slot is not None else dummy_slot)
+                    idx += 1
+                for req in padded_requests.generation_requests:
+                    slot = req.py_seq_slot if (
+                        not getattr(req, 'is_cuda_graph_dummy', False)
+                        and req.py_seq_slot is not None) else dummy_slot
+                    spec_tree_manager._all_slot_ids_buf[idx] = slot
+                    idx += 1
+
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer,

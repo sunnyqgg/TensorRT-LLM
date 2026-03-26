@@ -181,6 +181,60 @@ class SpecTreeManager:
                        pin_memory=prefer_pinned()) * self.dynamic_tree_max_topK
         ]
 
+        # Stable-slot storage: indexed by py_seq_slot, persists across
+        # iterations so trees survive request reordering.
+        # +1 row for CUDA graph dummy requests (no valid py_seq_slot).
+        S = self.num_trees + 1
+        self._slot_packed_mask = torch.zeros(
+            (S, ) + self.spec_dec_packed_mask.shape[1:],
+            dtype=self.spec_dec_packed_mask.dtype,
+            device='cuda')
+        self._slot_position_offsets = torch.zeros(
+            (S, ) + self.spec_dec_position_offsets.shape[1:],
+            dtype=self.spec_dec_position_offsets.dtype,
+            device='cuda')
+        self._slot_retrieve_index = torch.zeros((S, num_draft_with_root),
+                                                dtype=torch.int32,
+                                                device='cuda')
+        self._slot_retrieve_next_token = torch.full((S, num_draft_with_root),
+                                                    -1,
+                                                    dtype=torch.int32,
+                                                    device='cuda')
+        self._slot_retrieve_next_sibling = torch.full((S, num_draft_with_root),
+                                                      -1,
+                                                      dtype=torch.int32,
+                                                      device='cuda')
+        self._all_slot_ids_buf = torch.zeros(self.num_trees,
+                                             dtype=torch.long,
+                                             device='cuda')
+        self._dummy_slot_id = self.num_trees
+
+    def scatter_trees_to_slots(self, slot_ids, count):
+        """After build_dynamic_tree: copy work[:count] -> slot storage."""
+        if count == 0:
+            return
+        ids = slot_ids[:count]
+        self._slot_packed_mask[ids] = self.spec_dec_packed_mask[:count]
+        self._slot_position_offsets[
+            ids] = self.spec_dec_position_offsets[:count]
+        self._slot_retrieve_index[ids] = self.retrieve_index[:count]
+        self._slot_retrieve_next_token[ids] = self.retrieve_next_token[:count]
+        self._slot_retrieve_next_sibling[
+            ids] = self.retrieve_next_sibling[:count]
+
+    def gather_trees_from_slots(self, slot_ids, count):
+        """Before target forward: copy slot storage -> work[:count]."""
+        if count == 0:
+            return
+        ids = slot_ids[:count]
+        self.spec_dec_packed_mask[:count] = self._slot_packed_mask[ids]
+        self.spec_dec_position_offsets[:count] = self._slot_position_offsets[
+            ids]
+        self.retrieve_index[:count] = self._slot_retrieve_index[ids]
+        self.retrieve_next_token[:count] = self._slot_retrieve_next_token[ids]
+        self.retrieve_next_sibling[:count] = self._slot_retrieve_next_sibling[
+            ids]
+
     def init_tree_info_for_static_tree(self):
         self.index_mapping_set = {}
         self.nodes_list_per_layer = [[] for _ in range(self.max_draft_len + 1)]

@@ -141,6 +141,13 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
             dynamic_tree_max_topK=config.dynamic_tree_max_topK,
         )
 
+    def add_dummy_requests(self, request_ids: List[int]):
+        """Handle CUDA graph dummy request registration.
+
+        Dummies use _dummy_slot_id on the spec_tree_manager, so no
+        per-request slot allocation is needed.
+        """
+
     def get_max_resource_count(self) -> int:
         return self.max_num_requests
 

@@ -263,6 +263,44 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             max_batch_size, loop_max_tokens, dtype=torch.int32, device="cuda"
         )
 
+        # Pre-allocated scratch buffer for mask repack (CUDA graph safe).
+        # Avoids dynamic allocation via .contiguous() inside the draft loop.
+        buf_dim = max(self.max_total_draft_tokens + 1, K * max_draft_len)
+        mask_width = (buf_dim + 31) // 32
+        self._mask_repack_buf = torch.zeros(
+            max_batch_size * buf_dim * mask_width, dtype=torch.int64, device="cuda"
+        )
+
+    def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
+        """Repack mask from padded 3D layout to packed 1D layout.
+
+        The XQA precompiled kernel reads the tree attention mask in packed
+        layout using cumulative sequence lengths (cuQSeqLens), i.e.::
+
+            flat[cuSeqLens[i] * maskWidth + row * maskWidth + col]
+
+        But Python writes the mask into the 3D tensor
+        ``[max_num_requests, buf_dim, maskWidth]`` (padded layout), where
+        the batch stride is ``buf_dim * maskWidth`` instead of
+        ``n_tok * maskWidth``.  When ``n_tok < buf_dim`` and
+        ``n_req > 1``, batch 1+ reads stale/zero data.
+
+        This function extracts the valid mask rows from the padded tensor
+        and writes them contiguously (packed) at the start of the buffer.
+        Uses a pre-allocated scratch buffer for CUDA graph compatibility.
+        """
+        buf_dim = mask_buf.shape[1]
+        if n_tok >= buf_dim or n_req <= 1:
+            return
+        mask_width = mask_buf.shape[2]
+        total_elems = n_req * n_tok * mask_width
+        # Copy strided (padded) rows to pre-allocated scratch buffer
+        scratch = self._mask_repack_buf[:total_elems].view(n_req, n_tok, mask_width)
+        scratch.copy_(mask_buf[:n_req, :n_tok, :])
+        # Write packed data to beginning of flat buffer (no overlap)
+        flat = mask_buf.view(-1)
+        flat[:total_elems] = scratch.view(-1)
+
     @nvtx_range("eagle3_dyn._ensure_spec_tree_manager")
     def _ensure_spec_tree_manager(self, resource_manager):
         """Lazily initialize spec_tree_manager and KV head metadata."""
@@ -536,6 +574,12 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             attn_metadata.spec_decoding_packed_mask[:num_gens, :num_step0_tokens, 0] = (
                 self._step0_causal_mask[:num_step0_tokens]
             )
+            # Repack mask from padded 3D to packed 1D layout so the XQA
+            # kernel (which indexes via cuQSeqLens) reads the correct rows
+            # for each batch element.
+            self._repack_mask_padded_to_packed(
+                attn_metadata.spec_decoding_packed_mask, num_gens, num_step0_tokens
+            )
 
         attn_metadata.use_spec_decoding = num_gens > 0
 
@@ -661,6 +705,12 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 retrieve_next_sibling=spec_tree_manager.retrieve_next_sibling[:batch_size],
                 use_packed_mask=True,
             )
+
+            # Scatter trees to stable slot storage
+            if hasattr(spec_tree_manager, "_all_slot_ids_buf"):
+                spec_tree_manager.scatter_trees_to_slots(
+                    spec_tree_manager._all_slot_ids_buf[:batch_size], batch_size
+                )
 
         return real_draft_tokens.to(torch.int32)
 
@@ -894,6 +944,13 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             attn_metadata.spec_decoding_position_offsets[
                 : batch_size * num_tokens_current_layer
             ] = new_pos.reshape(-1)
+
+        # Repack mask from padded 3D to packed 1D layout so the XQA
+        # kernel (which indexes via cuQSeqLens) reads the correct rows
+        # for each batch element.
+        self._repack_mask_padded_to_packed(
+            attn_metadata.spec_decoding_packed_mask, batch_size, num_tokens_current_layer
+        )
 
     def prepare_for_generation(
         self,
