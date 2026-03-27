@@ -221,7 +221,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         # Step 0 buffers
         self._step0_causal_mask = torch.tensor(
             [(1 << (t + 1)) - 1 for t in range(self._max_path_len)],
-            dtype=torch.int64,
+            dtype=torch.int32,
             device="cuda",
         )
         self._arange_max_batch = torch.arange(max_batch_size, device="cuda")
@@ -268,7 +268,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         buf_dim = max(self.max_total_draft_tokens + 1, K * max_draft_len)
         mask_width = (buf_dim + 31) // 32
         self._mask_repack_buf = torch.zeros(
-            max_batch_size * buf_dim * mask_width, dtype=torch.int64, device="cuda"
+            max_batch_size * buf_dim * mask_width, dtype=torch.int32, device="cuda"
         )
 
     def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
@@ -693,24 +693,26 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         real_draft_tokens, topk_score_indices = self.resampling_final_draft_tokens(batch_size)
 
         if spec_tree_manager is not None:
+            # Build trees only for generation requests (skip context requests).
+            # The XQA kernel reads spec-dec params from position 0 with
+            # batch_size = num_generations, so gen trees must be at [0..num_gens-1].
             self.tree_ops_converter.build_dynamic_tree(
                 history_draft_tokens_parent_buffer=self.history_draft_tokens_parent_buffer[
-                    :batch_size
+                    num_contexts:batch_size
                 ],
-                topk_score_indices=topk_score_indices,
-                tree_mask=spec_tree_manager.spec_dec_packed_mask[:batch_size],
-                positions=spec_tree_manager.spec_dec_position_offsets[:batch_size],
-                retrieve_index=spec_tree_manager.retrieve_index[:batch_size],
-                retrieve_next_token=spec_tree_manager.retrieve_next_token[:batch_size],
-                retrieve_next_sibling=spec_tree_manager.retrieve_next_sibling[:batch_size],
+                topk_score_indices=topk_score_indices[num_contexts:],
+                tree_mask=spec_tree_manager.spec_dec_packed_mask[:num_gens],
+                positions=spec_tree_manager.spec_dec_position_offsets[:num_gens],
+                retrieve_index=spec_tree_manager.retrieve_index[:num_gens],
+                retrieve_next_token=spec_tree_manager.retrieve_next_token[:num_gens],
+                retrieve_next_sibling=spec_tree_manager.retrieve_next_sibling[:num_gens],
                 use_packed_mask=True,
             )
 
-            # Scatter trees to stable slot storage
+            # Scatter only gen trees to stable slot storage
             if hasattr(spec_tree_manager, "_all_slot_ids_buf"):
-                spec_tree_manager.scatter_trees_to_slots(
-                    spec_tree_manager._all_slot_ids_buf[:batch_size], batch_size
-                )
+                gen_slots = spec_tree_manager._all_slot_ids_buf[num_contexts:batch_size]
+                spec_tree_manager.scatter_trees_to_slots(gen_slots, num_gens)
 
         return real_draft_tokens.to(torch.int32)
 
