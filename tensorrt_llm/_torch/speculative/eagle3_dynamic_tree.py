@@ -20,7 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import get_sm_version, nvtx_range
 
 from ..attention_backend import AttentionMetadata
 from .eagle3 import Eagle3OneModelWorker
@@ -270,6 +270,12 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._mask_repack_buf = torch.zeros(
             max_batch_size * buf_dim * mask_width, dtype=torch.int32, device="cuda"
         )
+
+        # Blackwell (sm >= 100, excluding sm 120/121) uses prepareCustomMask
+        # which expects padded 3D layout (batch stride = buf_dim * mask_width).
+        # The packed 1D repack would corrupt that layout, so skip it.
+        sm = get_sm_version()
+        self._needs_mask_repack = sm < 100 or sm in (120, 121)
 
     def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
         """Repack mask from padded 3D layout to packed 1D layout.
@@ -574,12 +580,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             attn_metadata.spec_decoding_packed_mask[:num_gens, :num_step0_tokens, 0] = (
                 self._step0_causal_mask[:num_step0_tokens]
             )
-            # Repack mask from padded 3D to packed 1D layout so the XQA
-            # kernel (which indexes via cuQSeqLens) reads the correct rows
-            # for each batch element.
-            self._repack_mask_padded_to_packed(
-                attn_metadata.spec_decoding_packed_mask, num_gens, num_step0_tokens
-            )
+            # Repack mask from padded 3D to packed 1D layout so the Hopper
+            # XQA kernel (which indexes via cuQSeqLens) reads the correct
+            # rows for each batch element.  Blackwell's prepareCustomMask
+            # expects padded 3D, so skip the repack on Blackwell.
+            if self._needs_mask_repack:
+                self._repack_mask_padded_to_packed(
+                    attn_metadata.spec_decoding_packed_mask, num_gens, num_step0_tokens
+                )
 
         attn_metadata.use_spec_decoding = num_gens > 0
 
@@ -947,12 +955,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 : batch_size * num_tokens_current_layer
             ] = new_pos.reshape(-1)
 
-        # Repack mask from padded 3D to packed 1D layout so the XQA
-        # kernel (which indexes via cuQSeqLens) reads the correct rows
-        # for each batch element.
-        self._repack_mask_padded_to_packed(
-            attn_metadata.spec_decoding_packed_mask, batch_size, num_tokens_current_layer
-        )
+        # Repack mask from padded 3D to packed 1D layout so the Hopper
+        # XQA kernel (which indexes via cuQSeqLens) reads the correct
+        # rows for each batch element.  Blackwell's prepareCustomMask
+        # expects padded 3D, so skip the repack on Blackwell.
+        if self._needs_mask_repack:
+            self._repack_mask_padded_to_packed(
+                attn_metadata.spec_decoding_packed_mask, batch_size, num_tokens_current_layer
+            )
 
     def prepare_for_generation(
         self,
