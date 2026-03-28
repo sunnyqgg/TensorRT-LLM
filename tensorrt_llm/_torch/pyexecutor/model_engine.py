@@ -3640,19 +3640,12 @@ class PyTorchModelEngine(ModelEngine):
             # Gather dynamic tree data from stable slots before target forward
             if (spec_tree_manager is not None
                     and spec_tree_manager.use_dynamic_tree
-                    and not self.is_draft_model
-                    and hasattr(spec_tree_manager, '_slot_packed_mask')):
-                dummy_slot = spec_tree_manager._dummy_slot_id
+                    and not self.is_draft_model):
                 gen_requests = list(scheduled_requests.generation_requests)
                 num_gens = len(gen_requests)
                 if num_gens > 0:
-                    gen_slot_ids = torch.tensor([
-                        r.py_seq_slot
-                        if r.py_seq_slot is not None else dummy_slot
-                        for r in gen_requests
-                    ],
-                                                device='cuda',
-                                                dtype=torch.long)
+                    gen_slot_ids, _ = spec_tree_manager.fill_gen_slot_ids(
+                        gen_requests)
                     spec_tree_manager.gather_trees_from_slots(
                         gen_slot_ids, num_gens)
 
@@ -3715,8 +3708,7 @@ class PyTorchModelEngine(ModelEngine):
             # Fill slot-ID buffer for scatter inside draft loop
             if (self.enable_spec_decode and spec_tree_manager is not None
                     and spec_tree_manager.use_dynamic_tree
-                    and not self.is_draft_model
-                    and hasattr(spec_tree_manager, '_all_slot_ids_buf')):
+                    and not self.is_draft_model):
                 dummy_slot = spec_tree_manager._dummy_slot_id
                 idx = 0
                 for req in padded_requests.context_requests:

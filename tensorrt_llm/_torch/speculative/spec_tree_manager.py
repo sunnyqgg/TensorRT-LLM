@@ -120,10 +120,12 @@ class SpecTreeManager:
                 device='cuda',
             ).unsqueeze(0).repeat(self.num_trees, 1, 1)
 
-        # CUDA kernel facing — MUST be max_total_draft_tokens + 1
+        # CUDA kernel facing — rows = max_total_draft_tokens + 1,
+        # columns widened to match attn_metadata mask_width so that the
+        # Hopper flat copy in update_spec_dec_param needs no per-row padding.
         self.spec_dec_packed_mask = torch.zeros(
             (self.num_trees, self.max_total_draft_tokens + 1,
-             math.ceil((self.max_total_draft_tokens + 1) / 32)),
+             math.ceil(self._internal_buf_dim / 32)),
             dtype=torch.int32,
             device='cuda',
         )
@@ -193,21 +195,62 @@ class SpecTreeManager:
             (S, ) + self.spec_dec_position_offsets.shape[1:],
             dtype=self.spec_dec_position_offsets.dtype,
             device='cuda')
-        self._slot_retrieve_index = torch.zeros((S, num_draft_with_root),
+        # Packed retrieve storage: [S, n_dt, 3] holds (index, next_token, next_sibling)
+        # in a single tensor for fewer scatter/gather kernel launches.
+        self._slot_retrieve_packed = torch.full((S, num_draft_with_root, 3),
+                                                -1,
                                                 dtype=torch.int32,
                                                 device='cuda')
-        self._slot_retrieve_next_token = torch.full((S, num_draft_with_root),
-                                                    -1,
-                                                    dtype=torch.int32,
-                                                    device='cuda')
-        self._slot_retrieve_next_sibling = torch.full((S, num_draft_with_root),
-                                                      -1,
-                                                      dtype=torch.int32,
-                                                      device='cuda')
+        # Initialise the index channel to 0 (matching retrieve_index init)
+        self._slot_retrieve_packed[:, :, 0] = 0
         self._all_slot_ids_buf = torch.zeros(self.num_trees,
                                              dtype=torch.long,
                                              device='cuda')
         self._dummy_slot_id = self.num_trees
+
+        # Per-slot flag: True after scatter (valid tree), False initially
+        # and after free_resources.  The dummy row (S-1) is always False.
+        self.slot_has_tree = torch.zeros(S, dtype=torch.bool, device='cuda')
+
+        # Pre-allocated buffer for gather slot IDs (avoids per-forward
+        # torch.tensor() host→device allocation).
+        self._gather_gen_slot_ids_buf = torch.zeros(self.num_trees,
+                                                    dtype=torch.long,
+                                                    device='cuda')
+
+        # Pre-allocated staging buffer for scatter (avoids per-call
+        # torch.stack temporary allocation).
+        self._scatter_retrieve_staging = torch.empty(
+            (self.num_trees, num_draft_with_root, 3),
+            dtype=torch.int32,
+            device='cuda')
+
+    def fill_gen_slot_ids(self, gen_requests):
+        """Write py_seq_slot for gen requests into _gather_gen_slot_ids_buf.
+
+        Args:
+            gen_requests: iterable of LlmRequest (gen only).
+
+        Returns:
+            (slot_ids_slice, count) where slot_ids_slice = buf[:count].
+        """
+        buf = self._gather_gen_slot_ids_buf
+        dummy = self._dummy_slot_id
+        count = 0
+        for r in gen_requests:
+            buf[count] = r.py_seq_slot if r.py_seq_slot is not None else dummy
+            count += 1
+        return buf[:count], count
+
+    def mark_tree_valid(self, slot_ids, count):
+        """After scatter: mark slots as having valid tree data."""
+        if count == 0:
+            return
+        self.slot_has_tree[slot_ids[:count]] = True
+
+    def mark_tree_invalid(self, slot_id):
+        """On request completion: clear tree validity for freed slot."""
+        self.slot_has_tree[slot_id] = False
 
     def scatter_trees_to_slots(self, slot_ids, count):
         """After build_dynamic_tree: copy work[:count] -> slot storage."""
@@ -217,23 +260,36 @@ class SpecTreeManager:
         self._slot_packed_mask[ids] = self.spec_dec_packed_mask[:count]
         self._slot_position_offsets[
             ids] = self.spec_dec_position_offsets[:count]
-        self._slot_retrieve_index[ids] = self.retrieve_index[:count]
-        self._slot_retrieve_next_token[ids] = self.retrieve_next_token[:count]
-        self._slot_retrieve_next_sibling[
-            ids] = self.retrieve_next_sibling[:count]
+        # Pack 3 retrieve buffers into pre-allocated staging (no temp alloc)
+        staging = self._scatter_retrieve_staging[:count]
+        staging[:, :, 0] = self.retrieve_index[:count]
+        staging[:, :, 1] = self.retrieve_next_token[:count]
+        staging[:, :, 2] = self.retrieve_next_sibling[:count]
+        self._slot_retrieve_packed[ids] = staging
 
-    def gather_trees_from_slots(self, slot_ids, count):
-        """Before target forward: copy slot storage -> work[:count]."""
+    def gather_attn_params_from_slots(self, slot_ids, count):
+        """Gather mask + positions from slot storage to work buffers."""
         if count == 0:
             return
         ids = slot_ids[:count]
         self.spec_dec_packed_mask[:count] = self._slot_packed_mask[ids]
         self.spec_dec_position_offsets[:count] = self._slot_position_offsets[
             ids]
-        self.retrieve_index[:count] = self._slot_retrieve_index[ids]
-        self.retrieve_next_token[:count] = self._slot_retrieve_next_token[ids]
-        self.retrieve_next_sibling[:count] = self._slot_retrieve_next_sibling[
-            ids]
+
+    def gather_retrieve_from_slots(self, slot_ids, count):
+        """Gather retrieve buffers from slot storage to work buffers."""
+        if count == 0:
+            return
+        ids = slot_ids[:count]
+        packed = self._slot_retrieve_packed[ids]
+        self.retrieve_index[:count] = packed[..., 0]
+        self.retrieve_next_token[:count] = packed[..., 1]
+        self.retrieve_next_sibling[:count] = packed[..., 2]
+
+    def gather_trees_from_slots(self, slot_ids, count):
+        """Gather all tree data from slot storage. Convenience wrapper."""
+        self.gather_attn_params_from_slots(slot_ids, count)
+        self.gather_retrieve_from_slots(slot_ids, count)
 
     def init_tree_info_for_static_tree(self):
         self.index_mapping_set = {}

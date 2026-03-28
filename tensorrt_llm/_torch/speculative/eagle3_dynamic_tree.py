@@ -718,9 +718,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             )
 
             # Scatter only gen trees to stable slot storage
-            if hasattr(spec_tree_manager, "_all_slot_ids_buf"):
-                gen_slots = spec_tree_manager._all_slot_ids_buf[num_contexts:batch_size]
-                spec_tree_manager.scatter_trees_to_slots(gen_slots, num_gens)
+            gen_slots = spec_tree_manager._all_slot_ids_buf[num_contexts:batch_size]
+            spec_tree_manager.scatter_trees_to_slots(gen_slots, num_gens)
+            spec_tree_manager.mark_tree_valid(gen_slots, num_gens)
 
         return real_draft_tokens.to(torch.int32)
 
@@ -765,6 +765,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, N - 1).to(torch.int64)
             candidates[:, 0] = target_predict[:, 0]
 
+            # Build per-request tree validity from slot storage.
+            # _all_slot_ids_buf[num_contexts:batch_size] holds py_seq_slot
+            # for real gen requests and _dummy_slot_id for dummies.
+            # slot_has_tree[_dummy_slot_id] is always False.
+            gen_slot_ids = spec_tree_manager._all_slot_ids_buf[
+                num_contexts : num_contexts + num_gens
+            ]
+            tree_valid = spec_tree_manager.slot_has_tree[gen_slot_ids]
+
             _, accept_index, accept_token_num, accept_token = (
                 self.tree_ops_converter.verify_dynamic_tree_greedy_out(
                     candidates,
@@ -774,6 +783,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     target_predict,
                     num_gens,
                     self._max_path_len,
+                    tree_valid=tree_valid,
                 )
             )
 
