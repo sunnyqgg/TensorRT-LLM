@@ -240,14 +240,21 @@ __global__ void buildDynamicTreeKernelPacked(int64_t const* parentList, int64_t 
 
 void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIndex, void* treeMask, int32_t* positions,
     int32_t* retrieveIndex, int32_t* retrieveNextToken, int32_t* retrieveNextSibling, SizeType32 batchSize,
-    SizeType32 topK, SizeType32 depth, SizeType32 numDraftTokens, TreeMaskMode treeMaskMode, cudaStream_t stream)
+    SizeType32 topK, SizeType32 depth, SizeType32 numDraftTokens, TreeMaskMode treeMaskMode, cudaStream_t stream,
+    SizeType32 numInt32PerRow)
 {
     dim3 grid(batchSize);
     dim3 block(numDraftTokens);
 
     if (treeMaskMode == TreeMaskMode::QLEN_ONLY_BITPACKING)
     {
-        SizeType32 numInt32PerRow = (numDraftTokens + 31) / 32;
+        // Use caller-provided row stride if given; otherwise derive from numDraftTokens.
+        // The treeMask buffer may be wider than ceil(numDraftTokens/32) when padded
+        // to _internal_buf_dim (e.g. numDraftTokens=11 but buffer stride=ceil(60/32)=2).
+        if (numInt32PerRow <= 0)
+        {
+            numInt32PerRow = (numDraftTokens + 31) / 32;
+        }
 
         buildDynamicTreeKernelPacked<<<grid, block, 0, stream>>>(parentList, selectedIndex,
             static_cast<int32_t*>(treeMask), positions, retrieveIndex, retrieveNextToken, retrieveNextSibling, topK,

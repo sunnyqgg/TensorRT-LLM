@@ -57,7 +57,7 @@ enum class TreeMaskMode : int32_t
 void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIndex, void* treeMask, int32_t* positions,
     int32_t* retrieveIndex, int32_t* retrieveNextToken, int32_t* retrieveNextSibling, runtime::SizeType32 batchSize,
     runtime::SizeType32 topK, runtime::SizeType32 depth, runtime::SizeType32 numDraftTokens, TreeMaskMode treeMaskMode,
-    cudaStream_t stream);
+    cudaStream_t stream, runtime::SizeType32 numInt32PerRow = 0);
 
 //! \brief Verify dynamic tree using greedy strategy
 //! Verifies draft tokens against target model predictions using tree traversal.

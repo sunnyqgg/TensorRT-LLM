@@ -109,6 +109,11 @@ class DynamicTreeOpsConverter:
         num_draft_tokens = topk_score_indices.shape[1] + 1
         tree_mask_mode = 2 if use_packed_mask else 1  # QLEN_ONLY_BITPACKING / QLEN_ONLY
 
+        # Pass the actual buffer row stride (in int32s) so the kernel uses
+        # the correct stride instead of computing ceil(num_draft_tokens / 32).
+        # The buffer may be wider when padded to _internal_buf_dim.
+        num_int32_per_row = tree_mask.shape[-1] if use_packed_mask else 0
+
         # Call CUDA kernel in-place
         try:
             torch.ops.trtllm.build_dynamic_tree_op(
@@ -123,6 +128,7 @@ class DynamicTreeOpsConverter:
                 self.depth,
                 num_draft_tokens,
                 tree_mask_mode,
+                num_int32_per_row,
             )
         except Exception as e:
             raise RuntimeError(

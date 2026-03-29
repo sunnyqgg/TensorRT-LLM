@@ -32,7 +32,7 @@ namespace torch_ext
 //! All index tensors use int64 to match PyTorch's default integer dtype.
 void build_dynamic_tree_op(th::Tensor& parentList, th::Tensor& selectedIndex, th::Tensor& treeMask,
     th::Tensor& positions, th::Tensor& retrieveIndex, th::Tensor& retrieveNextToken, th::Tensor& retrieveNextSibling,
-    int64_t topK, int64_t depth, int64_t numDraftTokens, int64_t treeMaskMode)
+    int64_t topK, int64_t depth, int64_t numDraftTokens, int64_t treeMaskMode, int64_t numInt32PerRow)
 {
     // Validate inputs
     TORCH_CHECK(parentList.dim() == 2, "parentList must be 2D tensor");
@@ -58,7 +58,7 @@ void build_dynamic_tree_op(th::Tensor& parentList, th::Tensor& selectedIndex, th
     tk::invokeBuildDynamicTree(parentList.data_ptr<int64_t>(), selectedIndex.data_ptr<int64_t>(), treeMask.data_ptr(),
         positions.data_ptr<int32_t>(), retrieveIndex.data_ptr<int32_t>(), retrieveNextToken.data_ptr<int32_t>(),
         retrieveNextSibling.data_ptr<int32_t>(), batchSize, topK, depth, numDraftTokens,
-        static_cast<tk::TreeMaskMode>(treeMaskMode), stream);
+        static_cast<tk::TreeMaskMode>(treeMaskMode), stream, numInt32PerRow);
 }
 
 //! \brief Verify dynamic tree using greedy strategy
@@ -189,7 +189,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "build_dynamic_tree_op(Tensor parentList, Tensor selectedIndex, "
         "Tensor(a!) treeMask, Tensor(b!) positions, Tensor(c!) retrieveIndex, "
         "Tensor(d!) retrieveNextToken, Tensor(e!) retrieveNextSibling, "
-        "int topK, int depth, int numDraftTokens, int treeMaskMode) -> ()");
+        "int topK, int depth, int numDraftTokens, int treeMaskMode, "
+        "int numInt32PerRow=0) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
