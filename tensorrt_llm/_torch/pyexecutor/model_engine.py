@@ -2341,9 +2341,7 @@ class PyTorchModelEngine(ModelEngine):
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_resource_manager is not None and hasattr(
                     spec_resource_manager, 'spec_tree_manager'):
-                spec_tree_manager = spec_resource_manager.spec_tree_manager
-
-        _gen_tree_idx = 0
+                spec_resource_manager.spec_tree_manager
 
         # For tree decoding, runtime_draft_len should match total tree
         # tokens (not tree depth).  py_executor resets it every iteration.
@@ -2388,22 +2386,10 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(len(position_ids),
                               len(position_ids) + 1 + num_draft_tokens)))
-                # For the target model + tree decoding
-                if not self.is_draft_model and not spec_config.is_linear_tree:
-                    assert spec_tree_manager is not None
-                    assert num_draft_tokens == spec_tree_manager.max_total_draft_tokens
-                    n_tokens = spec_tree_manager.max_total_draft_tokens + 1
-                    _gi = _gen_tree_idx
-                    _gen_tree_idx += 1
-                    position_ids.extend(
-                        past_seen_token_num +
-                        spec_tree_manager.spec_dec_position_offsets[
-                            _gi, :n_tokens])
-                else:
-                    position_ids.extend(
-                        list(
-                            range(past_seen_token_num,
-                                  past_seen_token_num + 1 + num_draft_tokens)))
+                position_ids.extend(
+                    list(
+                        range(past_seen_token_num,
+                              past_seen_token_num + 1 + num_draft_tokens)))
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 # update batch index
@@ -2423,22 +2409,10 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(len(position_ids),
                               len(position_ids) + 1 + self.runtime_draft_len)))
-                # For the target model + tree decoding
-                if not self.is_draft_model and not spec_config.is_linear_tree:
-                    assert spec_tree_manager is not None
-                    n_tokens = spec_tree_manager.max_total_draft_tokens + 1
-                    _gi = _gen_tree_idx
-                    _gen_tree_idx += 1
-                    position_ids.extend(
-                        past_seen_token_num +
-                        spec_tree_manager.spec_dec_position_offsets[
-                            _gi, :n_tokens])
-                else:
-                    position_ids.extend(
-                        list(
-                            range(
-                                past_seen_token_num, past_seen_token_num + 1 +
-                                self.runtime_draft_len)))
+                position_ids.extend(
+                    list(
+                        range(past_seen_token_num, past_seen_token_num + 1 +
+                              self.runtime_draft_len)))
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
