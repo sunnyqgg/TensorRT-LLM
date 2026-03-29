@@ -140,6 +140,7 @@ class DynamicTreeOpsConverter:
         target_predict: torch.Tensor,
         num_gens: int,
         num_spec_step: int,
+        tree_valid: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         In-place verify using pre-allocated output buffers (CUDA graph friendly).
@@ -152,6 +153,9 @@ class DynamicTreeOpsConverter:
             target_predict: [num_gens, N] int64 target predictions.
             num_gens: Number of generation requests.
             num_spec_step: Number of speculative steps.
+            tree_valid: [num_gens] bool per-request flag.  When False the
+                kernel early-returns with acceptTokenNum=0 (first-gen /
+                dummy requests).  None means all trees are valid.
 
         Returns:
             Tuple of (predicts, accept_index, accept_token_num, accept_token)
@@ -162,6 +166,9 @@ class DynamicTreeOpsConverter:
         accept_index = self._verify_accept_index_buf[:num_gens]
         accept_token_num = self._verify_accept_token_num_buf[:num_gens]
         accept_token = self._verify_accept_token_buf[:num_gens]
+
+        if tree_valid is None:
+            tree_valid = torch.ones(num_gens, dtype=torch.bool, device=candidates.device)
 
         try:
             torch.ops.trtllm.verify_dynamic_tree_greedy_out_op(
@@ -174,6 +181,7 @@ class DynamicTreeOpsConverter:
                 accept_index,
                 accept_token_num,
                 accept_token,
+                tree_valid,
                 num_spec_step,
             )
         except Exception as e:

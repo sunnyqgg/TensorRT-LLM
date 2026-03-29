@@ -88,8 +88,9 @@ void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIn
 //! \param stream cuda stream
 void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
     int64_t* acceptToken, int64_t const* candidates, int32_t const* retrieveIndex, int32_t const* retrieveNextToken,
-    int32_t const* retrieveNextSibling, int64_t const* targetPredict, runtime::SizeType32 batchSize,
-    runtime::SizeType32 numDraftTokens, runtime::SizeType32 numSpecStep, cudaStream_t stream);
+    int32_t const* retrieveNextSibling, int64_t const* targetPredict, bool const* treeValid,
+    runtime::SizeType32 batchSize, runtime::SizeType32 numDraftTokens, runtime::SizeType32 numSpecStep,
+    cudaStream_t stream);
 
 } // namespace kernels::speculative_decoding
 

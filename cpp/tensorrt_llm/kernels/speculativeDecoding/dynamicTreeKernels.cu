@@ -275,11 +275,21 @@ void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIn
 //! \param numDraftTokens       total tree nodes per batch (including root)
 __global__ void verifyDynamicTreeGreedyKernel(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
     int64_t* acceptToken, int64_t const* candidates, int32_t const* retrieveIndex, int32_t const* retrieveNextToken,
-    int32_t const* retrieveNextSibling, int64_t const* targetPredict, uint32_t batchSize, uint32_t numSpeculativeTokens,
-    uint32_t numDraftTokens)
+    int32_t const* retrieveNextSibling, int64_t const* targetPredict, bool const* treeValid, uint32_t batchSize,
+    uint32_t numSpeculativeTokens, uint32_t numDraftTokens)
 {
     uint32_t bx = blockIdx.x;
     uint32_t batchOffset = bx * numDraftTokens;
+
+    // First-gen or dummy request: no valid tree, accept only the bonus token
+    if (treeValid != nullptr && !treeValid[bx])
+    {
+        acceptTokenNum[bx] = 0;
+        acceptIndex[bx * numSpeculativeTokens] = 0;
+        acceptToken[bx * numSpeculativeTokens] = targetPredict[batchOffset];
+        predicts[batchOffset] = targetPredict[batchOffset];
+        return;
+    }
 
     int32_t lastAcceptedLocalIdx = retrieveIndex[batchOffset];
     acceptIndex[bx * numSpeculativeTokens] = lastAcceptedLocalIdx;
@@ -326,15 +336,15 @@ __global__ void verifyDynamicTreeGreedyKernel(int64_t* predicts, int64_t* accept
 
 void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
     int64_t* acceptToken, int64_t const* candidates, int32_t const* retrieveIndex, int32_t const* retrieveNextToken,
-    int32_t const* retrieveNextSibling, int64_t const* targetPredict, SizeType32 batchSize, SizeType32 numDraftTokens,
-    SizeType32 numSpecStep, cudaStream_t stream)
+    int32_t const* retrieveNextSibling, int64_t const* targetPredict, bool const* treeValid, SizeType32 batchSize,
+    SizeType32 numDraftTokens, SizeType32 numSpecStep, cudaStream_t stream)
 {
     dim3 grid(batchSize);
     dim3 block(1);
 
     verifyDynamicTreeGreedyKernel<<<grid, block, 0, stream>>>(predicts, acceptIndex, acceptTokenNum, acceptToken,
-        candidates, retrieveIndex, retrieveNextToken, retrieveNextSibling, targetPredict, batchSize, numSpecStep,
-        numDraftTokens);
+        candidates, retrieveIndex, retrieveNextToken, retrieveNextSibling, targetPredict, treeValid, batchSize,
+        numSpecStep, numDraftTokens);
 
     sync_check_cuda_error(stream);
 }

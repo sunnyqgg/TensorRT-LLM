@@ -66,7 +66,7 @@ void build_dynamic_tree_op(th::Tensor& parentList, th::Tensor& selectedIndex, th
 //! Returns tuple of (predicts, acceptIndex, acceptTokenNum, acceptToken)
 std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> verify_dynamic_tree_greedy_op(th::Tensor& candidates,
     th::Tensor& retrieveIndex, th::Tensor& retrieveNextToken, th::Tensor& retrieveNextSibling,
-    th::Tensor& targetPredict, int64_t numSpecStep)
+    th::Tensor& targetPredict, th::Tensor& treeValid, int64_t numSpecStep)
 {
     // Validate inputs
     TORCH_CHECK(candidates.dim() == 2, "candidates must be 2D tensor");
@@ -87,6 +87,10 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> verify_dynamic_tree_g
     TORCH_CHECK(retrieveNextToken.size(1) == numDraftTokens, "retrieveNextToken size mismatch");
     TORCH_CHECK(retrieveNextSibling.size(1) == numDraftTokens, "retrieveNextSibling size mismatch");
     TORCH_CHECK(targetPredict.size(1) == numDraftTokens, "targetPredict size mismatch");
+
+    TORCH_CHECK(treeValid.dim() == 1, "treeValid must be 1D tensor");
+    TORCH_CHECK(treeValid.size(0) >= batchSize, "treeValid buffer too small");
+    TORCH_CHECK(treeValid.scalar_type() == torch::kBool, "treeValid must be bool tensor");
 
     auto device = candidates.device();
     auto stream = at::cuda::getCurrentCUDAStream(device.index());
@@ -109,8 +113,8 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> verify_dynamic_tree_g
     tk::invokeVerifyDynamicTreeGreedy(predicts.data_ptr<int64_t>(), acceptIndex.data_ptr<int64_t>(),
         acceptTokenNum.data_ptr<int64_t>(), acceptToken.data_ptr<int64_t>(), candidatesInt64.data_ptr<int64_t>(),
         retrieveIndex.data_ptr<int32_t>(), retrieveNextToken.data_ptr<int32_t>(),
-        retrieveNextSibling.data_ptr<int32_t>(), targetPredictInt64.data_ptr<int64_t>(), batchSize, numDraftTokens,
-        numSpecStep, stream);
+        retrieveNextSibling.data_ptr<int32_t>(), targetPredictInt64.data_ptr<int64_t>(), treeValid.data_ptr<bool>(),
+        batchSize, numDraftTokens, numSpecStep, stream);
 
     return std::make_tuple(predicts, acceptIndex, acceptTokenNum, acceptToken);
 }
@@ -120,7 +124,7 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor, th::Tensor> verify_dynamic_tree_g
 //! Inputs (candidates, targetPredict) MUST already be int64.
 void verify_dynamic_tree_greedy_out_op(th::Tensor& candidates, th::Tensor& retrieveIndex, th::Tensor& retrieveNextToken,
     th::Tensor& retrieveNextSibling, th::Tensor& targetPredict, th::Tensor& predicts, th::Tensor& acceptIndex,
-    th::Tensor& acceptTokenNum, th::Tensor& acceptToken, int64_t numSpecStep)
+    th::Tensor& acceptTokenNum, th::Tensor& acceptToken, th::Tensor& treeValid, int64_t numSpecStep)
 {
     // Validate inputs
     TORCH_CHECK(candidates.dim() == 2, "candidates must be 2D tensor");
@@ -144,6 +148,10 @@ void verify_dynamic_tree_greedy_out_op(th::Tensor& candidates, th::Tensor& retri
     TORCH_CHECK(retrieveNextSibling.size(1) == numDraftTokens, "retrieveNextSibling size mismatch");
     TORCH_CHECK(targetPredict.size(1) == numDraftTokens, "targetPredict size mismatch");
 
+    TORCH_CHECK(treeValid.dim() == 1, "treeValid must be 1D tensor");
+    TORCH_CHECK(treeValid.size(0) >= batchSize, "treeValid buffer too small");
+    TORCH_CHECK(treeValid.scalar_type() == torch::kBool, "treeValid must be bool tensor");
+
     // Validate output buffers
     TORCH_CHECK(predicts.scalar_type() == torch::kInt64, "predicts must be int64 tensor");
     TORCH_CHECK(acceptIndex.scalar_type() == torch::kInt64, "acceptIndex must be int64 tensor");
@@ -165,8 +173,8 @@ void verify_dynamic_tree_greedy_out_op(th::Tensor& candidates, th::Tensor& retri
     tk::invokeVerifyDynamicTreeGreedy(predicts.data_ptr<int64_t>(), acceptIndex.data_ptr<int64_t>(),
         acceptTokenNum.data_ptr<int64_t>(), acceptToken.data_ptr<int64_t>(), candidates.data_ptr<int64_t>(),
         retrieveIndex.data_ptr<int32_t>(), retrieveNextToken.data_ptr<int32_t>(),
-        retrieveNextSibling.data_ptr<int32_t>(), targetPredict.data_ptr<int64_t>(), batchSize, numDraftTokens,
-        numSpecStep, stream);
+        retrieveNextSibling.data_ptr<int32_t>(), targetPredict.data_ptr<int64_t>(), treeValid.data_ptr<bool>(),
+        batchSize, numDraftTokens, numSpecStep, stream);
 }
 
 } // namespace torch_ext
@@ -195,7 +203,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "verify_dynamic_tree_greedy_op(Tensor candidates, Tensor retrieveIndex, Tensor retrieveNextToken, "
-        "Tensor retrieveNextSibling, Tensor targetPredict, int numSpecStep) -> (Tensor, Tensor, Tensor, Tensor)");
+        "Tensor retrieveNextSibling, Tensor targetPredict, Tensor treeValid, int numSpecStep) -> (Tensor, Tensor, "
+        "Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -212,7 +221,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor candidates, Tensor retrieveIndex, Tensor retrieveNextToken, "
         "Tensor retrieveNextSibling, Tensor targetPredict, "
         "Tensor(a!) predicts, Tensor(b!) acceptIndex, Tensor(c!) acceptTokenNum, "
-        "Tensor(d!) acceptToken, int numSpecStep) -> ()");
+        "Tensor(d!) acceptToken, Tensor treeValid, int numSpecStep) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

@@ -246,26 +246,33 @@ class SpecTreeManager:
         """After scatter: mark slots as having valid tree data."""
         if count == 0:
             return
-        self.slot_has_tree[slot_ids[:count]] = True
+        # Use index_fill_ instead of advanced indexing for CUDA graph
+        # compatibility (fancy indexing is not permitted during capture).
+        self.slot_has_tree.index_fill_(0, slot_ids[:count], True)
 
     def mark_tree_invalid(self, slot_id):
         """On request completion: clear tree validity for freed slot."""
         self.slot_has_tree[slot_id] = False
 
     def scatter_trees_to_slots(self, slot_ids, count):
-        """After build_dynamic_tree: copy work[:count] -> slot storage."""
+        """After build_dynamic_tree: copy work[:count] -> slot storage.
+
+        Uses index_copy_ instead of advanced indexing for CUDA graph
+        compatibility (fancy indexing is not permitted during capture).
+        """
         if count == 0:
             return
         ids = slot_ids[:count]
-        self._slot_packed_mask[ids] = self.spec_dec_packed_mask[:count]
-        self._slot_position_offsets[
-            ids] = self.spec_dec_position_offsets[:count]
+        self._slot_packed_mask.index_copy_(0, ids,
+                                           self.spec_dec_packed_mask[:count])
+        self._slot_position_offsets.index_copy_(
+            0, ids, self.spec_dec_position_offsets[:count])
         # Pack 3 retrieve buffers into pre-allocated staging (no temp alloc)
         staging = self._scatter_retrieve_staging[:count]
         staging[:, :, 0] = self.retrieve_index[:count]
         staging[:, :, 1] = self.retrieve_next_token[:count]
         staging[:, :, 2] = self.retrieve_next_sibling[:count]
-        self._slot_retrieve_packed[ids] = staging
+        self._slot_retrieve_packed.index_copy_(0, ids, staging)
 
     def gather_attn_params_from_slots(self, slot_ids, count):
         """Gather mask + positions from slot storage to work buffers."""

@@ -1467,12 +1467,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def update_blackwell_first_sparse_mask_offset(self) -> None:
         """Update first_sparse_mask_offset_kv for current batch.
 
+        Writes gen-relative offsets: gen request data at indices [0..ng-1].
+        This matches the C++ gen kernel which reads firstSparseMaskOffsetsKvPtr
+        from data_ptr() without offsetting by num_contexts.
+
         Uses in-place copy to preserve tensor address for CUDA graph compatibility.
         """
+        nc = self.num_contexts
         n = self.num_seqs
-        offset = (self.kv_lens_cuda[:n] - self._seq_lens_cuda[:n]).to(
-            torch.int32)
-        self.spec_bl_tree_first_sparse_mask_offset_kv[:n].copy_(offset)
+        ng = n - nc
+        if ng > 0:
+            gen_offset = (self.kv_lens_cuda[nc:n] -
+                          self._seq_lens_cuda[nc:n]).to(torch.int32)
+            self.spec_bl_tree_first_sparse_mask_offset_kv[:ng].copy_(gen_offset)
 
     def update_spec_dec_param(
         self,
@@ -1566,31 +1573,35 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 if is_target_model:
                     # Case 1.1.1: dynamic tree
                     if self.is_spec_dec_dynamic_tree:
-                        # For the dynamic tree, we just copy batch_size's spec_tree_manager.spec_dec_position_offsets, spec_dec_packed_mask.
-                        # - For the context requests, we do not need to prepare these spec-dec parameters.
-                        # - For the generation requests, their spec-dec parameters are updated via the one-model dynamic tree worker.
-                        #   And the XQA kernel will only handle the generation requests.
-                        #
-                        # spec_tree_manager buffers are sized [num_trees, max_total_draft_tokens + 1]
-                        # (CUDA kernel facing), while attn buffers are sized with _internal_buf_dim
-                        # (which may be larger to accommodate K*max_draft_len in the draft loop).
+                        # Copy per-request dynamic tree params from spec_tree_manager.
                         n_dt = spec_tree_manager.max_total_draft_tokens + 1
-                        n_blk = spec_tree_manager.spec_dec_packed_mask.shape[-1]
+                        mask_width = spec_tree_manager.spec_dec_packed_mask.shape[
+                            -1]
 
-                        # Position offsets: pack contiguously with stride = n_dt
-                        # (XQA reads raw pointer with stride = generation_lengths[i] = n_dt)
+                        # Position offsets
                         self.spec_decoding_position_offsets[:batch_size * n_dt].view(
                             batch_size,
                             n_dt).copy_(spec_tree_manager.
                                         spec_dec_position_offsets[:batch_size],
                                         non_blocking=True)
 
-                        # Packed mask: zero stale data, copy top-left corner
-                        # (XQA uses sizes()[1] = buf_dim as row stride, extra cols = 0)
-                        self.spec_decoding_packed_mask[:batch_size].zero_()
-                        self.spec_decoding_packed_mask[:batch_size, :n_dt, :n_blk].copy_(
-                            spec_tree_manager.spec_dec_packed_mask[:batch_size],
-                            non_blocking=True)
+                        # Packed mask — Blackwell uses padded 3D layout,
+                        # Hopper uses flat packed layout.
+                        if self.is_sm_version_trtllm_gen_kernel(
+                                sm=get_sm_version()):
+                            self.spec_decoding_packed_mask[:batch_size].zero_()
+                            self.spec_decoding_packed_mask[:batch_size, :n_dt, :].copy_(
+                                spec_tree_manager.
+                                spec_dec_packed_mask[:batch_size],
+                                non_blocking=True)
+                        else:
+                            total = batch_size * n_dt * mask_width
+                            self.spec_decoding_packed_mask.view(
+                                -1)[:total].copy_(
+                                    spec_tree_manager.
+                                    spec_dec_packed_mask[:batch_size].reshape(
+                                        -1),
+                                    non_blocking=True)
 
                         self.spec_decoding_generation_lengths[:
                                                               batch_size].fill_(
