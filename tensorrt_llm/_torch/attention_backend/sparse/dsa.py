@@ -603,9 +603,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         super().update_spec_dec_param(batch_size, is_spec_decoding_enabled,
                                       is_spec_dec_tree,
                                       is_spec_dec_dynamic_tree, max_draft_len,
-                                      max_total_draft_tokens,
-                                      model_is_wrapped, spec_metadata,
-                                      spec_tree_manager,
+                                      max_total_draft_tokens, model_is_wrapped,
+                                      spec_metadata, spec_tree_manager,
                                       spec_decoding_tensor)
         self.max_draft_tokens = max_draft_len
         init_shape = self.kv_lens_expanded_host.shape[0]
