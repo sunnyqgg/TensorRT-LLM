@@ -285,7 +285,7 @@ bool XqaDispatcher::isSupported()
         tllmRunnerParams.mIsSpecDecTree = mFixedParams.isSpecDecoding;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mTileScheduler = TileScheduler::Static;
-        tllmRunnerParams.mMultiCtasKvMode = false;
+        tllmRunnerParams.mMultiCtasKvMode = true;
         // Assume same head size for Qk and V here.
         tllmRunnerParams.mHeadDimQk = mFixedParams.headSize;
         tllmRunnerParams.mHeadDimV = mFixedParams.headSize;
