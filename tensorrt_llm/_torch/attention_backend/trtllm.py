@@ -522,18 +522,12 @@ class TrtllmAttentionWrapper:
             self.is_spec_decoding_enabled, self.use_spec_decoding,
             self.is_spec_dec_tree
         ]
-        # For dynamic tree, reshape 1D position_offsets to 2D for C++ kernel compatibility
-        position_offsets_for_cpp = self.spec_decoding_position_offsets
-        if (self.spec_decoding_position_offsets is not None
-                and self.spec_decoding_position_offsets.dim() == 1):
-            # Reshape 1D [max_num_requests * N] to 2D [max_num_requests, N]
-            # C++ kernel requires 2D to extract max_generation_length from sizes()[1]
-            position_offsets_for_cpp = self.spec_decoding_position_offsets.view(
-                self.max_num_requests, -1)
-
+        # For dynamic tree, 1D→2D reshape is done before wrapper creation
+        # (in TrtllmAttention.forward) since it needs metadata attributes.
+        # Here spec_decoding_position_offsets is already 2D or None.
         spec_decoding_tensor_params = [
-            self.spec_decoding_generation_lengths, position_offsets_for_cpp,
-            self.spec_decoding_packed_mask
+            self.spec_decoding_generation_lengths,
+            self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
         if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
             spec_decoding_tensor_params.append(
@@ -866,6 +860,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     is_spec_dec_tree: bool = False
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
     is_spec_dec_dynamic_tree: bool = False
+
+    # Row width (stride) of the 1D spec_decoding_position_offsets buffer.
+    # Set by each writer (target model, drafter step 0, drafter step 1+)
+    # so readers can reshape without GPU→CPU sync. CPU int, CUDA-graph safe.
+    position_offsets_stride: int = 0
 
     # parameters required for spec-dec mode
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
@@ -1637,6 +1636,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     n_dt).copy_(spec_tree_manager.
                                 spec_dec_position_offsets[:batch_size],
                                 non_blocking=True)
+                self.position_offsets_stride = n_dt
 
                 if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
                     self.spec_decoding_packed_mask[:batch_size].zero_()
@@ -1896,6 +1896,31 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return self.wrapper.create_output(q, out_dtype, use_nvfp4_output,
                                           is_gen_only)
 
+    @staticmethod
+    def _reshape_position_offsets_for_cpp(metadata):
+        """Reshape 1D dynamic-tree position offsets to 2D for C++ kernel.
+
+        C++ kernel reads sizes()[1] as max_generation_length. Uses
+        position_offsets_stride (CPU int, set by each writer) to determine
+        the correct row width without GPU→CPU sync.
+        """
+        offsets = metadata.spec_decoding_position_offsets
+        if offsets is None or offsets.dim() != 1:
+            return offsets
+        stride = metadata.position_offsets_stride
+        if stride > 0:
+            n = metadata.num_seqs - metadata.num_contexts
+            total = offsets.numel()
+            if n > 0 and n * stride <= total:
+                return offsets[:n * stride].view(n, stride)
+        # Fallback: original layout
+        if metadata.max_num_requests > 0:
+            total = offsets.numel()
+            if total % metadata.max_num_requests == 0:
+                return offsets.view(metadata.max_num_requests, -1)
+        logger.warning("[EAGLE3 RESHAPE] no reshape, returning 1D")
+        return offsets
+
     def forward(
         self,
         q: torch.Tensor,
@@ -2084,8 +2109,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
             use_spec_decoding=metadata.use_spec_decoding,
             is_spec_dec_tree=metadata.is_spec_dec_tree,
-            spec_decoding_position_offsets=metadata.
-            spec_decoding_position_offsets,
+            spec_decoding_position_offsets=self.
+            _reshape_position_offsets_for_cpp(metadata),
             spec_decoding_packed_mask=metadata.spec_decoding_packed_mask,
             spec_decoding_generation_lengths=metadata.
             spec_decoding_generation_lengths,
