@@ -577,6 +577,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 : num_gens * num_step0_tokens
             ].view(num_gens, num_step0_tokens)
             pos_2d[:] = self._causal_offs[:num_step0_tokens]
+            attn_metadata.position_offsets_stride = num_step0_tokens
 
             attn_metadata.spec_decoding_packed_mask[:num_gens].fill_(0)
             attn_metadata.spec_decoding_packed_mask[:num_gens, :num_step0_tokens, 0] = (
@@ -918,6 +919,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             ].copy_(self.tree_mask_init_buffer[:batch_size].view(-1))
             attn_metadata.spec_decoding_position_offsets.fill_(0)
             attn_metadata.spec_decoding_generation_lengths[:batch_size] = num_tokens_current_layer
+            attn_metadata.position_offsets_stride = num_tokens_current_layer
         else:
             num_parent_mask = batch_size * cur_draft_idx * self.K * cur_draft_idx * self.K
             parent_mask = self.tree_mask_buffer[:num_parent_mask].reshape(
@@ -966,6 +968,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             attn_metadata.spec_decoding_position_offsets[
                 : batch_size * num_tokens_current_layer
             ] = new_pos.reshape(-1)
+            attn_metadata.position_offsets_stride = num_tokens_current_layer
 
         # Repack mask from padded 3D to packed 1D layout so the Hopper
         # XQA kernel (which indexes via cuQSeqLens) reads the correct
