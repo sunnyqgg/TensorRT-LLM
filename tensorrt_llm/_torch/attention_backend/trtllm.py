@@ -1615,15 +1615,25 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     src.reshape(-1), non_blocking=True)
                 self.position_offsets_stride = buf_dim
 
-                # Packed mask — use padded 3D copy for both Blackwell
-                # and Hopper. Flat copy breaks when n_dt < buf_dim
-                # because the row stride in dest (buf_dim) differs from
-                # source (n_dt), causing data misalignment that leads
-                # to illegal memory access in the XQA kernel.
-                self.spec_decoding_packed_mask[:batch_size].zero_()
-                self.spec_decoding_packed_mask[:batch_size, :n_dt, :].copy_(
-                    spec_tree_manager.spec_dec_packed_mask[:batch_size],
-                    non_blocking=True)
+                # Packed mask copy.
+                # Blackwell (sm>=100): padded 3D layout.
+                # Hopper: flat packed layout — kernel indexes via
+                # qCuSeqLens, so n_dt rows per request must be
+                # contiguous. Slice valid rows then flatten.
+                mask_width = spec_tree_manager.spec_dec_packed_mask.shape[-1]
+                if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
+                    # Blackwell: padded 3D
+                    self.spec_decoding_packed_mask[:batch_size].zero_()
+                    self.spec_decoding_packed_mask[:batch_size, :n_dt, :].copy_(
+                        spec_tree_manager.spec_dec_packed_mask[:batch_size],
+                        non_blocking=True)
+                else:
+                    # Hopper: flat packed — n_dt rows per request contiguously
+                    src_mask = spec_tree_manager.spec_dec_packed_mask[:
+                                                                      batch_size]
+                    total_mask = batch_size * n_dt * mask_width
+                    self.spec_decoding_packed_mask.view(-1)[:total_mask].copy_(
+                        src_mask.reshape(-1), non_blocking=True)
 
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
 
