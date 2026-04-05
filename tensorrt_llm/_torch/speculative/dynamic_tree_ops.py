@@ -216,7 +216,9 @@ class DynamicTreeOpsConverter:
         if tree_valid is None:
             tree_valid = torch.ones(num_gens, dtype=torch.bool, device=candidates.device)
 
-        rp = retrieve_packed.contiguous()
+        # Slice retrieve_packed to match candidates dim1 (N = tokens_per_gen_step).
+        # The staging buffer may be wider (buf_dim > N) when padded for K*max_draft_len.
+        rp = retrieve_packed[:, :N, :].contiguous()
         try:
             torch.ops.trtllm.verify_dynamic_tree_greedy_out_packed_op(
                 candidates,
