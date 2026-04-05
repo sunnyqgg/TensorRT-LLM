@@ -976,7 +976,11 @@ class Attention(nn.Module):
         stride = getattr(attn_metadata, 'position_offsets_stride', 0)
         if stride <= 0:
             return position_ids
-        offsets = offsets_flat.view(-1, stride)[:num_gens, :gen_len]
+        # Data is written flat with input_seq_length (= gen_len) stride.
+        # Use gen_len to view, not position_offsets_stride (which may be
+        # buf_dim for _reshape_position_offsets_for_cpp / mask width).
+        total = num_gens * gen_len
+        offsets = offsets_flat[:total].view(num_gens, gen_len)
         start = attn_metadata.num_ctx_tokens
         end = start + num_gens * gen_len
         adjusted = (base_pos.unsqueeze(1) + offsets).reshape(-1)
