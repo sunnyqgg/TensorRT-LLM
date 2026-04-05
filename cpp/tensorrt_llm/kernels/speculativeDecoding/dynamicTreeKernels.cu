@@ -336,6 +336,65 @@ __global__ void verifyDynamicTreeGreedyKernel(int64_t* predicts, int64_t* accept
     predicts[batchOffset + lastAcceptedLocalIdx] = targetPredict[batchOffset + lastAcceptedLocalIdx];
 }
 
+//! retrievePacked layout [bs, numDraftTokens, 3] int32 row-major:
+//! [b,n,0]=retrieveIndex, [b,n,1]=retrieveNextToken, [b,n,2]=retrieveNextSibling
+__global__ void verifyDynamicTreeGreedyPackedKernel(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
+    int64_t* acceptToken, int64_t const* candidates, int32_t const* retrievePacked, int64_t const* targetPredict,
+    bool const* treeValid, uint32_t batchSize, uint32_t numSpeculativeTokens, uint32_t numDraftTokens)
+{
+    uint32_t bx = blockIdx.x;
+    uint32_t batchOffset = bx * numDraftTokens;
+    int32_t const* row = retrievePacked + static_cast<size_t>(bx) * numDraftTokens * 3;
+
+    if (treeValid != nullptr && !treeValid[bx])
+    {
+        acceptTokenNum[bx] = 0;
+        acceptIndex[bx * numSpeculativeTokens] = 0;
+        acceptToken[bx * numSpeculativeTokens] = targetPredict[batchOffset];
+        predicts[batchOffset] = targetPredict[batchOffset];
+        return;
+    }
+
+    int32_t lastAcceptedLocalIdx = row[0];
+    acceptIndex[bx * numSpeculativeTokens] = lastAcceptedLocalIdx;
+    uint32_t numAcceptedTokens = 0;
+    int32_t curIndex = 0;
+
+    acceptToken[bx * numSpeculativeTokens] = targetPredict[batchOffset + lastAcceptedLocalIdx];
+
+    for (uint32_t j = 1; j < numSpeculativeTokens; ++j)
+    {
+        curIndex = row[static_cast<size_t>(curIndex) * 3 + 1];
+
+        while (curIndex != -1)
+        {
+            int32_t draftLocalIdx = row[static_cast<size_t>(curIndex) * 3];
+            int64_t draftTokenId = candidates[batchOffset + curIndex];
+            int64_t targetTokenId = targetPredict[batchOffset + lastAcceptedLocalIdx];
+
+            if (draftTokenId == targetTokenId)
+            {
+                predicts[batchOffset + lastAcceptedLocalIdx] = targetTokenId;
+                ++numAcceptedTokens;
+                acceptIndex[bx * numSpeculativeTokens + numAcceptedTokens] = draftLocalIdx;
+                acceptToken[bx * numSpeculativeTokens + numAcceptedTokens] = targetPredict[batchOffset + draftLocalIdx];
+                lastAcceptedLocalIdx = draftLocalIdx;
+                break;
+            }
+            else
+            {
+                curIndex = row[static_cast<size_t>(curIndex) * 3 + 2];
+            }
+        }
+
+        if (curIndex == -1)
+            break;
+    }
+
+    acceptTokenNum[bx] = numAcceptedTokens;
+    predicts[batchOffset + lastAcceptedLocalIdx] = targetPredict[batchOffset + lastAcceptedLocalIdx];
+}
+
 void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
     int64_t* acceptToken, int64_t const* candidates, int32_t const* retrieveIndex, int32_t const* retrieveNextToken,
     int32_t const* retrieveNextSibling, int64_t const* targetPredict, bool const* treeValid, SizeType32 batchSize,
@@ -347,6 +406,19 @@ void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int6
     verifyDynamicTreeGreedyKernel<<<grid, block, 0, stream>>>(predicts, acceptIndex, acceptTokenNum, acceptToken,
         candidates, retrieveIndex, retrieveNextToken, retrieveNextSibling, targetPredict, treeValid, batchSize,
         numSpecStep, numDraftTokens);
+
+    sync_check_cuda_error(stream);
+}
+
+void invokeVerifyDynamicTreeGreedyPacked(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
+    int64_t* acceptToken, int64_t const* candidates, int32_t const* retrievePacked, int64_t const* targetPredict,
+    bool const* treeValid, SizeType32 batchSize, SizeType32 numDraftTokens, SizeType32 numSpecStep, cudaStream_t stream)
+{
+    dim3 grid(batchSize);
+    dim3 block(1);
+
+    verifyDynamicTreeGreedyPackedKernel<<<grid, block, 0, stream>>>(predicts, acceptIndex, acceptTokenNum, acceptToken,
+        candidates, retrievePacked, targetPredict, treeValid, batchSize, numSpecStep, numDraftTokens);
 
     sync_check_cuda_error(stream);
 }
