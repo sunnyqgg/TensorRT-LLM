@@ -1602,17 +1602,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             if self.is_spec_dec_dynamic_tree:
                 assert spec_tree_manager is not None, "spec_tree_manager is required for dynamic tree"
                 n_dt = spec_tree_manager.max_total_draft_tokens + 1
-                spec_tree_manager.spec_dec_packed_mask.shape[-1]
 
-                # Position offsets — write with buf_dim stride to match
-                # packed_mask's 3D layout. C++ kernel uses sizes()[1] from
-                # position_offsets as stride for BOTH offsets and mask.
+                # C++ indexes position_offsets with stride =
+                # input_seq_length (= n_dt), not buf_dim. Write flat
+                # with n_dt stride. sizes()[1] stays buf_dim via
+                # _reshape_position_offsets_for_cpp (for mask width).
                 buf_dim = spec_tree_manager._internal_buf_dim
-                self.spec_decoding_position_offsets.view(
-                    self.max_num_requests, buf_dim)[:batch_size, :n_dt].copy_(
-                        spec_tree_manager.
-                        spec_dec_position_offsets[:batch_size, :n_dt],
-                        non_blocking=True)
+                src = spec_tree_manager.spec_dec_position_offsets[:batch_size, :
+                                                                  n_dt]
+                total = batch_size * n_dt
+                self.spec_decoding_position_offsets[:total].copy_(
+                    src.reshape(-1), non_blocking=True)
                 self.position_offsets_stride = buf_dim
 
                 # Packed mask — use padded 3D copy for both Blackwell
