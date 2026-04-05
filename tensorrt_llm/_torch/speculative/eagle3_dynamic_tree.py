@@ -545,17 +545,17 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             # Gen kernel uses base data_ptr (no num_contexts offset); fill rows [:num_gens].
             attn_metadata.spec_decoding_generation_lengths[:num_gens].fill_(num_step0_tokens)
 
-            # Pack position offsets with stride = buf_dim to match packed_mask 3D layout.
-            # C++ kernel uses sizes()[1] from position_offsets as stride for
-            # both offsets and mask — they must be consistent.
+            # C++ indexes position_offsets with stride = input_seq_length
+            # (= num_tokens / num_seqs), not buf_dim. Write data flat with
+            # actual token stride. sizes()[1] stays buf_dim (for mask width).
+            total = num_gens * num_step0_tokens
+            attn_metadata.spec_decoding_position_offsets[:total] = self._causal_offs[
+                :num_step0_tokens
+            ].repeat(num_gens)
             _buf_dim = (
                 attn_metadata.spec_decoding_position_offsets.numel()
                 // attn_metadata.max_num_requests
             )
-            pos_2d = attn_metadata.spec_decoding_position_offsets.view(
-                attn_metadata.max_num_requests, _buf_dim
-            )[:num_gens, :num_step0_tokens]
-            pos_2d[:] = self._causal_offs[:num_step0_tokens]
             attn_metadata.position_offsets_stride = _buf_dim
 
             attn_metadata.spec_decoding_packed_mask[:num_gens].fill_(0)
@@ -935,21 +935,25 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             attn_metadata.spec_decoding_generation_lengths[:batch_size] = num_tokens_current_layer
 
-            _buf_dim = (
-                attn_metadata.spec_decoding_position_offsets.numel()
-                // attn_metadata.max_num_requests
-            )
-            offsets_2d = attn_metadata.spec_decoding_position_offsets.view(
-                attn_metadata.max_num_requests, _buf_dim
-            )
-            previous_position_offsets = offsets_2d[:batch_size, :num_tokens_previous_layer]
+            # C++ indexes position_offsets with stride = input_seq_length,
+            # not buf_dim. Read previous data and write new data using flat
+            # layout with actual token stride per request.
+            prev_total = batch_size * num_tokens_previous_layer
+            previous_position_offsets = attn_metadata.spec_decoding_position_offsets[
+                :prev_total
+            ].view(batch_size, num_tokens_previous_layer)
 
             new_pos = self._new_pos_offset_buf[:batch_size, :num_tokens_current_layer]
             new_pos[:, :num_tokens_previous_layer].copy_(previous_position_offsets)
             new_pos[:, num_tokens_previous_layer:num_tokens_current_layer].copy_(
                 previous_position_offsets[:, -self.K :] + 1
             )
-            offsets_2d[:batch_size, :num_tokens_current_layer] = new_pos
+            cur_total = batch_size * num_tokens_current_layer
+            attn_metadata.spec_decoding_position_offsets[:cur_total] = new_pos.reshape(-1)
+            _buf_dim = (
+                attn_metadata.spec_decoding_position_offsets.numel()
+                // attn_metadata.max_num_requests
+            )
             attn_metadata.position_offsets_stride = _buf_dim
 
         # Hopper XQA needs packed 1D mask; Blackwell expects padded 3D.
