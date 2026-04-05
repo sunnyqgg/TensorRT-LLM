@@ -130,7 +130,7 @@ class SpecTreeManager:
             device='cuda',
         )
         self.spec_dec_position_offsets = torch.zeros(
-            (self.num_trees, self.max_total_draft_tokens + 1),
+            (self.num_trees, self._internal_buf_dim),
             dtype=torch.int32,
             device='cuda',
         )
@@ -301,16 +301,14 @@ class SpecTreeManager:
             ids]
 
     def gather_retrieve_from_slots(self, slot_ids, count):
-        """Copy packed retrieve from slots into _scatter_retrieve_staging[:count] for verify.
-
-        Avoids splitting into retrieve_index / retrieve_next_token / retrieve_next_sibling;
-        dynamic-tree verify uses verify_dynamic_tree_greedy_out_packed on this staging.
-        """
+        """Gather retrieve buffers from slot storage to work buffers."""
         if count == 0:
             return
         ids = slot_ids[:count]
-        self._scatter_retrieve_staging[:count].copy_(
-            self._slot_retrieve_packed[ids])
+        packed = self._slot_retrieve_packed[ids]
+        self.retrieve_index[:count] = packed[..., 0]
+        self.retrieve_next_token[:count] = packed[..., 1]
+        self.retrieve_next_sibling[:count] = packed[..., 2]
 
     def gather_trees_from_slots(self, slot_ids, count):
         """gather_attn_params_from_slots + gather_retrieve_from_slots."""

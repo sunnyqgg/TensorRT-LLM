@@ -545,12 +545,18 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             # Gen kernel uses base data_ptr (no num_contexts offset); fill rows [:num_gens].
             attn_metadata.spec_decoding_generation_lengths[:num_gens].fill_(num_step0_tokens)
 
-            # Position stride num_step0_tokens matches C++ generation_input_length.
-            pos_2d = attn_metadata.spec_decoding_position_offsets[
-                : num_gens * num_step0_tokens
-            ].view(num_gens, num_step0_tokens)
+            # Pack position offsets with stride = buf_dim to match packed_mask 3D layout.
+            # C++ kernel uses sizes()[1] from position_offsets as stride for
+            # both offsets and mask — they must be consistent.
+            _buf_dim = (
+                attn_metadata.spec_decoding_position_offsets.numel()
+                // attn_metadata.max_num_requests
+            )
+            pos_2d = attn_metadata.spec_decoding_position_offsets.view(
+                attn_metadata.max_num_requests, _buf_dim
+            )[:num_gens, :num_step0_tokens]
             pos_2d[:] = self._causal_offs[:num_step0_tokens]
-            attn_metadata.position_offsets_stride = num_step0_tokens
+            attn_metadata.position_offsets_stride = _buf_dim
 
             attn_metadata.spec_decoding_packed_mask[:num_gens].fill_(0)
             attn_metadata.spec_decoding_packed_mask[:num_gens, :num_step0_tokens, 0] = (
@@ -740,7 +746,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             ]
             tree_valid = spec_tree_manager.slot_has_tree[gen_slot_ids]
 
-            retrieve_packed = spec_tree_manager._scatter_retrieve_staging[:num_gens]
+            retrieve_packed = torch.stack(
+                [
+                    spec_tree_manager.retrieve_index[:num_gens],
+                    spec_tree_manager.retrieve_next_token[:num_gens],
+                    spec_tree_manager.retrieve_next_sibling[:num_gens],
+                ],
+                dim=-1,
+            )
             _, accept_index, accept_token_num, accept_token = (
                 self.tree_ops_converter.verify_dynamic_tree_greedy_out_packed(
                     candidates,
@@ -881,7 +894,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             ].copy_(self.tree_mask_init_buffer[:batch_size].view(-1))
             attn_metadata.spec_decoding_position_offsets.fill_(0)
             attn_metadata.spec_decoding_generation_lengths[:batch_size] = num_tokens_current_layer
-            attn_metadata.position_offsets_stride = num_tokens_current_layer
+            _buf_dim = (
+                attn_metadata.spec_decoding_position_offsets.numel()
+                // attn_metadata.max_num_requests
+            )
+            attn_metadata.position_offsets_stride = _buf_dim
         else:
             num_parent_mask = batch_size * cur_draft_idx * self.K * cur_draft_idx * self.K
             parent_mask = self.tree_mask_buffer[:num_parent_mask].reshape(
@@ -918,19 +935,22 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             attn_metadata.spec_decoding_generation_lengths[:batch_size] = num_tokens_current_layer
 
-            previous_position_offsets = attn_metadata.spec_decoding_position_offsets[
-                : batch_size * num_tokens_previous_layer
-            ].view(batch_size, num_tokens_previous_layer)
+            _buf_dim = (
+                attn_metadata.spec_decoding_position_offsets.numel()
+                // attn_metadata.max_num_requests
+            )
+            offsets_2d = attn_metadata.spec_decoding_position_offsets.view(
+                attn_metadata.max_num_requests, _buf_dim
+            )
+            previous_position_offsets = offsets_2d[:batch_size, :num_tokens_previous_layer]
 
             new_pos = self._new_pos_offset_buf[:batch_size, :num_tokens_current_layer]
             new_pos[:, :num_tokens_previous_layer].copy_(previous_position_offsets)
             new_pos[:, num_tokens_previous_layer:num_tokens_current_layer].copy_(
                 previous_position_offsets[:, -self.K :] + 1
             )
-            attn_metadata.spec_decoding_position_offsets[
-                : batch_size * num_tokens_current_layer
-            ] = new_pos.reshape(-1)
-            attn_metadata.position_offsets_stride = num_tokens_current_layer
+            offsets_2d[:batch_size, :num_tokens_current_layer] = new_pos
+            attn_metadata.position_offsets_stride = _buf_dim
 
         # Hopper XQA needs packed 1D mask; Blackwell expects padded 3D.
         if self._needs_mask_repack:
