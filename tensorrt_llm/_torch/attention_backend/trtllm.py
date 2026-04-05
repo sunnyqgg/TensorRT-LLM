@@ -507,8 +507,7 @@ class TrtllmAttentionWrapper:
             self.is_spec_dec_tree
         ]
         # For dynamic tree, 1D→2D reshape is done before wrapper creation
-        # (in TrtllmAttention.forward) since it needs metadata attributes.
-        # Here spec_decoding_position_offsets is already 2D or None.
+        # (in TrtllmAttention.forward via _reshape_position_offsets_for_cpp).
         spec_decoding_tensor_params = [
             self.spec_decoding_generation_lengths,
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
@@ -840,8 +839,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     is_spec_dec_dynamic_tree: bool = False
 
     # Row width (stride) of the 1D spec_decoding_position_offsets buffer.
-    # Set by each writer (target model, drafter step 0, drafter step 1+)
-    # so readers can reshape without GPU→CPU sync. CPU int, CUDA-graph safe.
+    # Set by each writer so readers can reshape without GPU→CPU sync.
     position_offsets_stride: int = 0
 
     # parameters required for spec-dec mode
@@ -1604,26 +1602,28 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             if self.is_spec_dec_dynamic_tree:
                 assert spec_tree_manager is not None, "spec_tree_manager is required for dynamic tree"
                 n_dt = spec_tree_manager.max_total_draft_tokens + 1
-                mask_width = spec_tree_manager.spec_dec_packed_mask.shape[-1]
+                spec_tree_manager.spec_dec_packed_mask.shape[-1]
 
-                self.spec_decoding_position_offsets[:batch_size * n_dt].view(
-                    batch_size,
-                    n_dt).copy_(spec_tree_manager.
-                                spec_dec_position_offsets[:batch_size],
-                                non_blocking=True)
-                self.position_offsets_stride = n_dt
+                # Position offsets — write with buf_dim stride to match
+                # packed_mask's 3D layout. C++ kernel uses sizes()[1] from
+                # position_offsets as stride for BOTH offsets and mask.
+                buf_dim = spec_tree_manager._internal_buf_dim
+                self.spec_decoding_position_offsets.view(
+                    self.max_num_requests, buf_dim)[:batch_size, :n_dt].copy_(
+                        spec_tree_manager.
+                        spec_dec_position_offsets[:batch_size, :n_dt],
+                        non_blocking=True)
+                self.position_offsets_stride = buf_dim
 
-                if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
-                    self.spec_decoding_packed_mask[:batch_size].zero_()
-                    self.spec_decoding_packed_mask[:batch_size, :n_dt, :].copy_(
-                        spec_tree_manager.spec_dec_packed_mask[:batch_size],
-                        non_blocking=True)
-                else:
-                    total = batch_size * n_dt * mask_width
-                    self.spec_decoding_packed_mask.view(-1)[:total].copy_(
-                        spec_tree_manager.spec_dec_packed_mask[:batch_size].
-                        reshape(-1),
-                        non_blocking=True)
+                # Packed mask — use padded 3D copy for both Blackwell
+                # and Hopper. Flat copy breaks when n_dt < buf_dim
+                # because the row stride in dest (buf_dim) differs from
+                # source (n_dt), causing data misalignment that leads
+                # to illegal memory access in the XQA kernel.
+                self.spec_decoding_packed_mask[:batch_size].zero_()
+                self.spec_decoding_packed_mask[:batch_size, :n_dt, :].copy_(
+                    spec_tree_manager.spec_dec_packed_mask[:batch_size],
+                    non_blocking=True)
 
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
 
@@ -1875,25 +1875,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def _reshape_position_offsets_for_cpp(metadata):
         """Reshape 1D dynamic-tree position offsets to 2D for C++ kernel.
 
-        C++ kernel reads sizes()[1] as max_generation_length. Uses
-        position_offsets_stride (CPU int, set by each writer) to determine
-        the correct row width without GPU→CPU sync.
+        Uses position_offsets_stride (= buf_dim, same as packed_mask dim1).
+        C++ kernel reads sizes()[1] as stride for BOTH position_offsets and
+        packed_mask, so they must use the same row width.
         """
         offsets = metadata.spec_decoding_position_offsets
         if offsets is None or offsets.dim() != 1:
             return offsets
         stride = metadata.position_offsets_stride
-        if stride > 0:
-            n = metadata.num_seqs - metadata.num_contexts
-            total = offsets.numel()
-            if n > 0 and n * stride <= total:
-                return offsets[:n * stride].view(n, stride)
-        # Fallback: original layout
-        if metadata.max_num_requests > 0:
-            total = offsets.numel()
-            if total % metadata.max_num_requests == 0:
-                return offsets.view(metadata.max_num_requests, -1)
-        logger.warning("[EAGLE3 RESHAPE] no reshape, returning 1D")
+        if stride > 0 and metadata.max_num_requests > 0:
+            return offsets.view(metadata.max_num_requests, stride)
         return offsets
 
     def forward(

@@ -366,7 +366,7 @@ __global__ void verifyDynamicTreeGreedyPackedKernel(int64_t* predicts, int64_t* 
     {
         curIndex = row[static_cast<size_t>(curIndex) * 3 + 1];
 
-        while (curIndex != -1)
+        while (curIndex >= 0 && static_cast<uint32_t>(curIndex) < numDraftTokens)
         {
             int32_t draftLocalIdx = row[static_cast<size_t>(curIndex) * 3];
             int64_t draftTokenId = candidates[batchOffset + curIndex];
@@ -387,7 +387,7 @@ __global__ void verifyDynamicTreeGreedyPackedKernel(int64_t* predicts, int64_t* 
             }
         }
 
-        if (curIndex == -1)
+        if (curIndex < 0 || static_cast<uint32_t>(curIndex) >= numDraftTokens)
             break;
     }
 
