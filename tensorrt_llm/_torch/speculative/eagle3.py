@@ -516,7 +516,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.spec_decoding_position_offsets.copy_(
                 self._saved_position_offsets)
             self._saved_position_offsets = None
-        if self._saved_position_offsets_stride is not None:
+        if getattr(self, '_saved_position_offsets_stride', None) is not None:
             attn_metadata.position_offsets_stride = self._saved_position_offsets_stride
             self._saved_position_offsets_stride = None
         if self._saved_generation_lengths is not None:

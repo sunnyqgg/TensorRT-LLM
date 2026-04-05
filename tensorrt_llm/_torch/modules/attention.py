@@ -873,11 +873,7 @@ class Attention(nn.Module):
             q, k, v = qkv, None, None
 
         # For dynamic tree spec decoding with Python RoPE, adjust position_ids
-        # to use tree offsets (same as C++ kernel: rotary_pos = past_seq_len +
-        # offset). Applies during ALL spec-dec phases: target model verification,
-        # drafter step 0, and drafter step 1+. The C++ attention kernel reads
-        # spec_decoding_position_offsets internally, but the Python RoPE path
-        # needs explicit adjustment via position_ids.
+        # to use tree offsets (same as C++ kernel: past_seq_len + offset).
         if (not self.rope_fusion
                 and getattr(attn_metadata, 'is_spec_dec_dynamic_tree', False)
                 and getattr(attn_metadata, 'use_spec_decoding', False)
@@ -938,13 +934,7 @@ class Attention(nn.Module):
         return q, k, v
 
     def _adjust_position_ids_for_spec_dec(self, position_ids, attn_metadata):
-        """Replicate C++ kernel's rotary_pos = past_seq_len + offset.
-
-        The 1D offsets buffer is written with a per-phase row width (stride).
-        Each writer sets attn_metadata.position_offsets_stride (CPU int, no
-        GPU sync). We use it to reshape correctly. Falls back to gen_len
-        if stride is not set.
-        """
+        """Replicate C++ kernel's rotary_pos = past_seq_len + offset."""
         num_contexts = attn_metadata.num_contexts
         num_gens = attn_metadata.num_seqs - num_contexts
         if num_gens <= 0:
@@ -955,17 +945,14 @@ class Attention(nn.Module):
         base_pos = attn_metadata.kv_lens_cuda[num_contexts:num_contexts +
                                               num_gens] - gen_len
         offsets_flat = attn_metadata.spec_decoding_position_offsets
-        # CPU int set by each writer — no GPU→CPU sync.
-        stride = getattr(attn_metadata, 'position_offsets_stride', 0) or gen_len
-        if stride <= 0 or num_gens * stride > offsets_flat.numel():
+        stride = getattr(attn_metadata, 'position_offsets_stride', 0)
+        if stride <= 0:
             return position_ids
-        offsets = offsets_flat[:num_gens * stride].view(num_gens,
-                                                        stride)[:, :gen_len]
+        offsets = offsets_flat.view(-1, stride)[:num_gens, :gen_len]
         start = attn_metadata.num_ctx_tokens
-        adjusted = (base_pos.unsqueeze(1) + offsets).reshape(-1)
         end = start + num_gens * gen_len
+        adjusted = (base_pos.unsqueeze(1) + offsets).reshape(-1)
         # position_ids may be 1D [num_tokens] or 2D [1, num_tokens].
-        # Use flat indexing to handle both cases.
         position_ids.view(-1)[start:end] = adjusted
         return position_ids
 
