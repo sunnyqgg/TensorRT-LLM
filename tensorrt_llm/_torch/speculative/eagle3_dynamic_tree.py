@@ -777,12 +777,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             ]
             tree_valid = spec_tree_manager.slot_has_tree[gen_slot_ids]
 
+            retrieve_packed = spec_tree_manager._scatter_retrieve_staging[:num_gens]
             _, accept_index, accept_token_num, accept_token = (
-                self.tree_ops_converter.verify_dynamic_tree_greedy_out(
+                self.tree_ops_converter.verify_dynamic_tree_greedy_out_packed(
                     candidates,
-                    spec_tree_manager.retrieve_index[:num_gens],
-                    spec_tree_manager.retrieve_next_token[:num_gens],
-                    spec_tree_manager.retrieve_next_sibling[:num_gens],
+                    retrieve_packed,
                     target_predict,
                     num_gens,
                     self._max_path_len,
