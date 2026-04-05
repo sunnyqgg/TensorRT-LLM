@@ -3822,19 +3822,11 @@ class PyTorchModelEngine(ModelEngine):
             if (self.enable_spec_decode and spec_tree_manager is not None
                     and spec_tree_manager.use_dynamic_tree
                     and not self.is_draft_model):
-                dummy_slot = spec_tree_manager._dummy_slot_id
-                idx = 0
-                for req in padded_requests.context_requests:
-                    spec_tree_manager._all_slot_ids_buf[idx] = (
-                        req.py_seq_slot
-                        if req.py_seq_slot is not None else dummy_slot)
-                    idx += 1
-                for req in padded_requests.generation_requests:
-                    slot = req.py_seq_slot if (
-                        not getattr(req, 'is_cuda_graph_dummy', False)
-                        and req.py_seq_slot is not None) else dummy_slot
-                    spec_tree_manager._all_slot_ids_buf[idx] = slot
-                    idx += 1
+                spec_tree_manager.fill_all_slot_ids_buf_from_requests(
+                    padded_requests.context_requests,
+                    padded_requests.generation_requests,
+                    spec_tree_manager._dummy_slot_id,
+                )
 
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
