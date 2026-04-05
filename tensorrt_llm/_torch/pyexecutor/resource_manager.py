@@ -719,6 +719,11 @@ class KVCacheManager(BaseResourceManager):
         is_gen: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
+        # KV cache may need more reserved tokens than py_draft_tokens length.
+        # For dynamic tree: draft loop needs K*max_draft_len KV slots but
+        # target model only processes max_total_draft_tokens. If None, falls
+        # back to max_num_draft_tokens.
+        kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
         # For capturable drafting loops. During normal inference, the draft model always
@@ -728,6 +733,7 @@ class KVCacheManager(BaseResourceManager):
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
     ):
+        _kv_draft = kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         available_blocks = self.get_num_free_blocks()
         # No padding if not enough KV cache space
         if available_blocks < 1:
@@ -837,10 +843,10 @@ class KVCacheManager(BaseResourceManager):
                         req.py_decoding_iter = 1
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
-                    for _ in range(max_num_draft_tokens):
+                    for _ in range(_kv_draft):
                         self.impl.add_token(req.request_id)
                     if draft_kv_cache_manager is not None:
-                        for _ in range(max_num_draft_tokens):
+                        for _ in range(_kv_draft):
                             draft_kv_cache_manager.impl.add_token(
                                 req.request_id)
 
@@ -2444,10 +2450,12 @@ class KVCacheManagerV2(BaseResourceManager):
             is_gen: bool = False,
             prepare_resource: bool = True,
             max_num_draft_tokens: int = 0,
+            kv_reserve_draft_tokens: Optional[int] = None,
             use_mrope: bool = False,
             max_beam_width: int = 1,
             num_extra_decoding_steps: int = 0,
             draft_kv_cache_manager: Optional['BaseResourceManager'] = None):
+        _kv_draft = kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
 
         beam_width = max_beam_width
         requests = []
@@ -2526,7 +2534,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.py_prompt_len = req.prompt_len
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
-                    new_capacity = kv_cache.capacity + max_num_draft_tokens + 1
+                    new_capacity = kv_cache.capacity + _kv_draft + 1
                     success = kv_cache.resize(new_capacity,
                                               history_length=history_hint)
                     if not success:
