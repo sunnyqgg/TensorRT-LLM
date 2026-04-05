@@ -175,6 +175,62 @@ void verify_dynamic_tree_greedy_out_op(th::Tensor& candidates, th::Tensor& retri
         batchSize, numDraftTokens, numSpecStep, stream);
 }
 
+//! In-place verify with retrieve packed as [B, N, 3] int32 (index, next_token, next_sibling).
+void verify_dynamic_tree_greedy_out_packed_op(th::Tensor& candidates, th::Tensor& retrievePacked,
+    th::Tensor& targetPredict, th::Tensor& predicts, th::Tensor& acceptIndex, th::Tensor& acceptTokenNum,
+    th::Tensor& acceptToken, th::Tensor& treeValid, int64_t numSpecStep)
+{
+    TORCH_CHECK(candidates.is_cuda(), "candidates must be a CUDA tensor");
+    TORCH_CHECK(retrievePacked.is_cuda(), "retrievePacked must be a CUDA tensor");
+    TORCH_CHECK(targetPredict.is_cuda(), "targetPredict must be a CUDA tensor");
+    TORCH_CHECK(predicts.is_cuda(), "predicts must be a CUDA tensor");
+    TORCH_CHECK(acceptIndex.is_cuda(), "acceptIndex must be a CUDA tensor");
+    TORCH_CHECK(acceptTokenNum.is_cuda(), "acceptTokenNum must be a CUDA tensor");
+    TORCH_CHECK(acceptToken.is_cuda(), "acceptToken must be a CUDA tensor");
+    TORCH_CHECK(treeValid.is_cuda(), "treeValid must be a CUDA tensor");
+    TORCH_CHECK(candidates.dim() == 2, "candidates must be 2D tensor");
+    TORCH_CHECK(retrievePacked.dim() == 3, "retrievePacked must be 3D tensor");
+    TORCH_CHECK(targetPredict.dim() == 2, "targetPredict must be 2D tensor");
+    TORCH_CHECK(candidates.scalar_type() == torch::kInt64, "candidates must be int64 tensor");
+    TORCH_CHECK(retrievePacked.scalar_type() == torch::kInt32, "retrievePacked must be int32 tensor");
+    TORCH_CHECK(targetPredict.scalar_type() == torch::kInt64, "targetPredict must be int64 tensor");
+
+    int64_t batchSize = candidates.size(0);
+    int64_t numDraftTokens = candidates.size(1);
+
+    TORCH_CHECK(retrievePacked.size(0) == batchSize, "Batch size mismatch");
+    TORCH_CHECK(retrievePacked.size(1) == numDraftTokens, "retrievePacked dim1 must match numDraftTokens");
+    TORCH_CHECK(retrievePacked.size(2) == 3, "retrievePacked last dim must be 3");
+    TORCH_CHECK(retrievePacked.is_contiguous(), "retrievePacked must be contiguous");
+    TORCH_CHECK(targetPredict.size(0) == batchSize, "Batch size mismatch");
+    TORCH_CHECK(targetPredict.size(1) == numDraftTokens, "targetPredict size mismatch");
+
+    TORCH_CHECK(treeValid.dim() == 1, "treeValid must be 1D tensor");
+    TORCH_CHECK(treeValid.size(0) >= batchSize, "treeValid buffer too small");
+    TORCH_CHECK(treeValid.scalar_type() == torch::kBool, "treeValid must be bool tensor");
+
+    TORCH_CHECK(predicts.scalar_type() == torch::kInt64, "predicts must be int64 tensor");
+    TORCH_CHECK(acceptIndex.scalar_type() == torch::kInt64, "acceptIndex must be int64 tensor");
+    TORCH_CHECK(acceptTokenNum.scalar_type() == torch::kInt64, "acceptTokenNum must be int64 tensor");
+    TORCH_CHECK(acceptToken.scalar_type() == torch::kInt64, "acceptToken must be int64 tensor");
+    TORCH_CHECK(predicts.size(0) >= batchSize * numDraftTokens, "predicts buffer too small");
+    TORCH_CHECK(acceptIndex.size(0) >= batchSize && acceptIndex.size(1) >= numSpecStep, "acceptIndex buffer too small");
+    TORCH_CHECK(acceptTokenNum.size(0) >= batchSize, "acceptTokenNum buffer too small");
+    TORCH_CHECK(acceptToken.size(0) >= batchSize && acceptToken.size(1) >= numSpecStep, "acceptToken buffer too small");
+
+    auto stream = at::cuda::getCurrentCUDAStream(candidates.device().index());
+
+    predicts.zero_();
+    acceptIndex.zero_();
+    acceptTokenNum.zero_();
+    acceptToken.zero_();
+
+    tk::invokeVerifyDynamicTreeGreedyPacked(predicts.data_ptr<int64_t>(), acceptIndex.data_ptr<int64_t>(),
+        acceptTokenNum.data_ptr<int64_t>(), acceptToken.data_ptr<int64_t>(), candidates.data_ptr<int64_t>(),
+        retrievePacked.data_ptr<int32_t>(), targetPredict.data_ptr<int64_t>(), treeValid.data_ptr<bool>(), batchSize,
+        numDraftTokens, numSpecStep, stream);
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -226,4 +282,21 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("verify_dynamic_tree_greedy_out_op", &tensorrt_llm::torch_ext::verify_dynamic_tree_greedy_out_op);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def(
+        "verify_dynamic_tree_greedy_out_packed_op("
+        "Tensor candidates, Tensor retrievePacked, Tensor targetPredict, "
+        "Tensor(a!) predicts, Tensor(b!) acceptIndex, Tensor(c!) acceptTokenNum, "
+        "Tensor(d!) acceptToken, Tensor treeValid, int numSpecStep) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl(
+        "verify_dynamic_tree_greedy_out_packed_op", &tensorrt_llm::torch_ext::verify_dynamic_tree_greedy_out_packed_op);
 }

@@ -71,8 +71,8 @@ class SpecTreeManager:
     draft_tokens_indices_cumsum: torch.Tensor = None
 
     ############################ Auxiliary buffers for the dynamic tree. ############################
-    # CUDA kernel outputs for dynamic tree verification.
-    # These are produced by build_dynamic_tree CUDA kernel and used by verify_dynamic_tree_greedy.
+    # CUDA kernel outputs for dynamic tree draft build; packed into slots then
+    # _scatter_retrieve_staging for verify_dynamic_tree_greedy_out_packed.
     # shape: [num_trees, max_total_draft_tokens + 1], int32, device tensor.
     retrieve_index: torch.Tensor = None
     retrieve_next_token: torch.Tensor = None
@@ -218,15 +218,52 @@ class SpecTreeManager:
             dtype=torch.int32,
             device='cuda')
 
+        # Pinned CPU for batched HtoD of slot ids (avoid per-element CUDA scalar writes).
+        self._slot_ids_cpu_pin_gen = torch.empty(self.num_trees,
+                                                 dtype=torch.long,
+                                                 pin_memory=prefer_pinned())
+        self._slot_ids_cpu_pin_batch = torch.empty(self.num_trees,
+                                                   dtype=torch.long,
+                                                   pin_memory=prefer_pinned())
+
     def fill_gen_slot_ids(self, gen_requests):
-        """Fill _gather_gen_slot_ids_buf; return (buf[:count], count). Gen LlmRequest only."""
-        buf = self._gather_gen_slot_ids_buf
+        """Fill _gather_gen_slot_ids_buf; return (buf[:count], count). Gen LlmRequest only.
+
+        Args:
+            gen_requests: iterable of LlmRequest (gen only).
+
+        Returns:
+            (slot_ids_slice, count) where slot_ids_slice = buf[:count].
+        """
         dummy = self._dummy_slot_id
+        pin = self._slot_ids_cpu_pin_gen
         count = 0
         for r in gen_requests:
-            buf[count] = r.py_seq_slot if r.py_seq_slot is not None else dummy
+            pin[count] = r.py_seq_slot if r.py_seq_slot is not None else dummy
             count += 1
+        if count == 0:
+            return self._gather_gen_slot_ids_buf[:0], 0
+        buf = self._gather_gen_slot_ids_buf
+        buf[:count].copy_(pin[:count], non_blocking=True)
         return buf[:count], count
+
+    def fill_all_slot_ids_buf_from_requests(self, context_requests,
+                                            generation_requests,
+                                            dummy_slot: int):
+        """Fill _all_slot_ids_buf for full batch [ctx | gen] via one HtoD copy."""
+        pin = self._slot_ids_cpu_pin_batch
+        idx = 0
+        for req in context_requests:
+            pin[idx] = req.py_seq_slot if req.py_seq_slot is not None else dummy_slot
+            idx += 1
+        for req in generation_requests:
+            slot = req.py_seq_slot if (
+                not getattr(req, 'is_cuda_graph_dummy', False)
+                and req.py_seq_slot is not None) else dummy_slot
+            pin[idx] = slot
+            idx += 1
+        if idx > 0:
+            self._all_slot_ids_buf[:idx].copy_(pin[:idx], non_blocking=True)
 
     def mark_tree_valid(self, slot_ids, count):
         """Set slot_has_tree True for scattered slots."""
@@ -264,14 +301,16 @@ class SpecTreeManager:
             ids]
 
     def gather_retrieve_from_slots(self, slot_ids, count):
-        """Copy retrieve tensors from slots into work buffers [:count]."""
+        """Copy packed retrieve from slots into _scatter_retrieve_staging[:count] for verify.
+
+        Avoids splitting into retrieve_index / retrieve_next_token / retrieve_next_sibling;
+        dynamic-tree verify uses verify_dynamic_tree_greedy_out_packed on this staging.
+        """
         if count == 0:
             return
         ids = slot_ids[:count]
-        packed = self._slot_retrieve_packed[ids]
-        self.retrieve_index[:count] = packed[..., 0]
-        self.retrieve_next_token[:count] = packed[..., 1]
-        self.retrieve_next_sibling[:count] = packed[..., 2]
+        self._scatter_retrieve_staging[:count].copy_(
+            self._slot_retrieve_packed[ids])
 
     def gather_trees_from_slots(self, slot_ids, count):
         """gather_attn_params_from_slots + gather_retrieve_from_slots."""
