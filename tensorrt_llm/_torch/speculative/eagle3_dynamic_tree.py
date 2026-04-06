@@ -579,7 +579,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 :num_step0_tokens
             ].repeat(num_gens)
             attn_metadata.position_offsets_stride = _buf_dim
-            attn_metadata.position_offsets_query_len = num_step0_tokens
+            # Hopper XQA: sizes()[1] must be n_tok (packed mask row width).
+            # Blackwell trtllm-gen: sizes()[1] must be buf_dim (padded 3D row width).
+            attn_metadata.position_offsets_query_len = (
+                num_step0_tokens if self._needs_mask_repack else 0
+            )
 
             attn_metadata.spec_decoding_packed_mask[:num_gens].fill_(0)
             attn_metadata.spec_decoding_packed_mask[:num_gens, :num_step0_tokens, 0] = (
@@ -922,7 +926,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 // attn_metadata.max_num_requests
             )
             attn_metadata.position_offsets_stride = _buf_dim
-            attn_metadata.position_offsets_query_len = num_tokens_current_layer
+            attn_metadata.position_offsets_query_len = (
+                num_tokens_current_layer if self._needs_mask_repack else 0
+            )
         else:
             num_parent_mask = batch_size * cur_draft_idx * self.K * cur_draft_idx * self.K
             parent_mask = self.tree_mask_buffer[:num_parent_mask].reshape(
@@ -978,7 +984,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             cur_total = batch_size * num_tokens_current_layer
             attn_metadata.spec_decoding_position_offsets[:cur_total] = new_pos.reshape(-1)
             attn_metadata.position_offsets_stride = _buf_dim
-            attn_metadata.position_offsets_query_len = num_tokens_current_layer
+            attn_metadata.position_offsets_query_len = (
+                num_tokens_current_layer if self._needs_mask_repack else 0
+            )
 
         # Hopper XQA needs packed 1D mask; Blackwell expects padded 3D.
         if self._needs_mask_repack:

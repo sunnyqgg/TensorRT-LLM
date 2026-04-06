@@ -1642,17 +1642,24 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.spec_decoding_position_offsets[:total].copy_(
                     src.reshape(-1), non_blocking=True)
                 self.position_offsets_stride = buf_dim
-                self.position_offsets_query_len = n_dt
+                # Hopper XQA: sizes()[1] must be n_dt (packed mask row width).
+                # Blackwell trtllm-gen: sizes()[1] must be buf_dim (padded 3D).
+                is_blackwell = self.is_sm_version_trtllm_gen_kernel(
+                    sm=get_sm_version())
+                self.position_offsets_query_len = (n_dt
+                                                   if not is_blackwell else 0)
 
                 # Packed mask copy.
                 # Blackwell (sm>=100): padded 3D layout.
                 # Hopper: flat packed layout — kernel indexes via
                 # qCuSeqLens, so n_dt rows per request must be
                 # contiguous. Slice valid rows then flatten.
-                if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
-                    # Blackwell: padded 3D
+                if is_blackwell:
+                    # Blackwell: padded 3D — dest may be wider than source
+                    # after spec_tree_manager buffers were slimmed to n_dt.
+                    src_mw = spec_tree_manager.spec_dec_packed_mask.shape[-1]
                     self.spec_decoding_packed_mask[:batch_size].zero_()
-                    self.spec_decoding_packed_mask[:batch_size, :n_dt, :].copy_(
+                    self.spec_decoding_packed_mask[:batch_size, :n_dt, :src_mw].copy_(
                         spec_tree_manager.spec_dec_packed_mask[:batch_size],
                         non_blocking=True)
                 else:
