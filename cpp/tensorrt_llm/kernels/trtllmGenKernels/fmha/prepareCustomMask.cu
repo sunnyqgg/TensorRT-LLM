@@ -131,12 +131,18 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
     // The sequence length of tensor KV.
     int32_t const seqLenKv = seqLensKvPtr[batchIdx];
 
-    // The packed mask tensor row stride: use mPackedMaskMaxSeqLenQ when available,
-    // because the packed mask tensor has shape [bs, maxSeqLenQ, ceilDiv(maxSeqLenQ, 32)]
-    // even when the actual seqLenQ is smaller (e.g., drafter layers in dynamic tree).
-    int32_t const packedMaskSeqLenQ
+    // Packed mask row width in int32 words.  mPackedMaskMaxSeqLenQ is the
+    // batch-wide max generation length; when > 0 use it for row width so
+    // every request reads the correct number of bits per mask row.
+    int32_t const packedMaskMaxSeqLenQ
         = runnerParams.mPackedMaskMaxSeqLenQ > 0 ? runnerParams.mPackedMaskMaxSeqLenQ : seqLenQ;
-    int32_t const packedMaskNumBlocks = ceilDiv(packedMaskSeqLenQ, 32);
+    int32_t const packedMaskNumBlocks = ceilDiv(packedMaskMaxSeqLenQ, 32);
+    // Cumulative Q sequence lengths for packed mask batch indexing.
+    // When available, mask is in packed layout (like Hopper XQA):
+    //   mask row i of request b starts at (cumSeqLensQ[b] + i) * packedMaskNumBlocks
+    // When null, mask is in padded 3D layout:
+    //   mask row i of request b starts at (b * packedMaskMaxSeqLenQ + i) * packedMaskNumBlocks
+    int32_t const* cumSeqLensQPtr = runnerParams.cumSeqLensQPtr;
 
     // Calculate global Q token index (flattened across heads)
     int32_t const qTokensPerBlock = static_cast<int32_t>(blockDim.x);
@@ -172,12 +178,15 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
     else
     {
         // Sparse region: check the input mask
-        // Input mask shape: [bs, packedMaskSeqLenQ, packedMaskNumBlocks]
         // The KV dimension in the mask corresponds to Q positions (tree mask)
         int32_t const qPosInTree = tokenIdxKv - firstSparseMaskOffsetKv;
         if (qPosInTree < seqLenQ)
         {
-            int32_t const qMaskBaseIdx = (batchIdx * packedMaskSeqLenQ + tokenIdxQ) * packedMaskNumBlocks;
+            // Packed layout (cumSeqLensQPtr != null): row offset = cumSeqLensQ[b] + tokenIdxQ
+            // Padded 3D layout (cumSeqLensQPtr == null): row offset = b * packedMaskMaxSeqLenQ + tokenIdxQ
+            int32_t const rowOffset = cumSeqLensQPtr != nullptr ? (cumSeqLensQPtr[batchIdx] + tokenIdxQ)
+                                                                : (batchIdx * packedMaskMaxSeqLenQ + tokenIdxQ);
+            int32_t const qMaskBaseIdx = rowOffset * packedMaskNumBlocks;
             int32_t const packedMaskIdx = qMaskBaseIdx + (qPosInTree >> 5);
             int32_t const bitPos = qPosInTree & 0x1F;
             randomMask = (customMaskInputPtr[packedMaskIdx] >> bitPos) & 1;

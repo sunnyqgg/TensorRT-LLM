@@ -1617,38 +1617,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.spec_decoding_position_offsets[:total].copy_(
                     src.reshape(-1), non_blocking=True)
                 self.position_offsets_stride = buf_dim
-                # Hopper XQA: sizes()[1] must be n_dt (packed mask row width).
-                # Blackwell trtllm-gen: sizes()[1] must be buf_dim (padded 3D).
-                is_blackwell = self.is_sm_version_trtllm_gen_kernel(
-                    sm=get_sm_version())
-                self.position_offsets_query_len = (n_dt
-                                                   if not is_blackwell else 0)
+                self.position_offsets_query_len = n_dt
 
-                # Packed mask copy.
-                # Blackwell (sm>=100): padded 3D layout.
-                # Hopper: flat packed layout — kernel indexes via
-                # qCuSeqLens, so n_dt rows per request must be
-                # contiguous. Slice valid rows then flatten.
-                if is_blackwell:
-                    # Blackwell: padded 3D — dest may be wider than source
-                    # after spec_tree_manager buffers were slimmed to n_dt.
-                    src_mw = spec_tree_manager.spec_dec_packed_mask.shape[-1]
-                    self.spec_decoding_packed_mask[:batch_size].zero_()
-                    self.spec_decoding_packed_mask[:batch_size, :n_dt, :src_mw].copy_(
-                        spec_tree_manager.spec_dec_packed_mask[:batch_size],
-                        non_blocking=True)
-                else:
-                    # Hopper: flat packed — C++ XQA kernel reads
-                    # divUp(qSeqLen, 32) int32s per mask row.
-                    # Trim to actual_mask_width when it differs
-                    # from stored mask_width (n_dt < buf_dim).
-                    actual_mask_width = math.ceil(n_dt / 32)
-                    src = spec_tree_manager.spec_dec_packed_mask[:
-                                                                 batch_size, :, :
-                                                                 actual_mask_width]
-                    total = batch_size * n_dt * actual_mask_width
-                    self.spec_decoding_packed_mask.view(-1)[:total].copy_(
-                        src.reshape(-1), non_blocking=True)
+                # Packed mask copy — unified layout for Hopper and
+                # Blackwell: n_dt rows per request, packed flat with
+                # row width = ceil(n_dt / 32).  Blackwell's
+                # prepareCustomMask now reads via cumSeqLensQ.
+                actual_mask_width = math.ceil(n_dt / 32)
+                src = spec_tree_manager.spec_dec_packed_mask[:batch_size, :, :
+                                                             actual_mask_width]
+                total = batch_size * n_dt * actual_mask_width
+                self.spec_decoding_packed_mask.view(-1)[:total].copy_(
+                    src.reshape(-1), non_blocking=True)
 
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
 
