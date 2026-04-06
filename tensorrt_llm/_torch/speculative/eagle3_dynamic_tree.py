@@ -14,6 +14,7 @@
 # limitations under the License.
 """Eagle3 one-model dynamic tree speculative decoding."""
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -280,16 +281,38 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._needs_mask_repack = sm < 100 or sm in (120, 121)
 
     def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
-        """XQA indexes mask flat via cuQSeqLens; padded [n_req, buf_dim, maskW] has
-        batch stride buf_dim*maskW, so when n_tok < buf_dim and n_req > 1 packed
-        reads are wrong. Copy [:n_req,:n_tok] through scratch into flat prefix."""
+        """Repack mask from padded 3D layout to packed 1D layout.
+
+        The XQA precompiled kernel reads the tree attention mask in packed
+        layout using cumulative sequence lengths (cuQSeqLens), with row
+        stride ``divUp(qSeqLen, 32)`` int32s — i.e. ``math.ceil(n_tok/32)``.
+
+        But Python writes the mask into the 3D tensor
+        ``[max_num_requests, buf_dim, stored_mask_width]`` where
+        ``stored_mask_width = ceil(buf_dim / 32)``.  When ``n_tok < buf_dim``,
+        the stored row width can exceed what the C++ kernel expects.
+
+        This function extracts valid rows *and* valid columns (trimming
+        to ``actual_mask_width = ceil(n_tok / 32)``) and writes them
+        contiguously (packed) at the start of the buffer.
+        Uses a pre-allocated scratch buffer for CUDA graph compatibility.
+        """
         buf_dim = mask_buf.shape[1]
-        if n_tok >= buf_dim or n_req <= 1:
+        stored_mask_width = mask_buf.shape[2]
+        # C++ XQA kernel reads divUp(n_tok, 32) int32s per mask row.
+        actual_mask_width = math.ceil(n_tok / 32)
+
+        needs_batch_repack = n_tok < buf_dim and n_req > 1
+        needs_width_repack = actual_mask_width < stored_mask_width
+
+        if not needs_batch_repack and not needs_width_repack:
             return
-        mask_width = mask_buf.shape[2]
-        total_elems = n_req * n_tok * mask_width
-        scratch = self._mask_repack_buf[:total_elems].view(n_req, n_tok, mask_width)
-        scratch.copy_(mask_buf[:n_req, :n_tok, :])
+
+        total_elems = n_req * n_tok * actual_mask_width
+        # Copy valid rows and columns to pre-allocated scratch buffer
+        scratch = self._mask_repack_buf[:total_elems].view(n_req, n_tok, actual_mask_width)
+        scratch.copy_(mask_buf[:n_req, :n_tok, :actual_mask_width])
+        # Write packed data to beginning of flat buffer (no overlap)
         flat = mask_buf.view(-1)
         flat[:total_elems] = scratch.view(-1)
 
@@ -545,18 +568,18 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             # Gen kernel uses base data_ptr (no num_contexts offset); fill rows [:num_gens].
             attn_metadata.spec_decoding_generation_lengths[:num_gens].fill_(num_step0_tokens)
 
-            # C++ indexes position_offsets with stride = input_seq_length
-            # (= num_tokens / num_seqs), not buf_dim. Write data flat with
-            # actual token stride. sizes()[1] stays buf_dim (for mask width).
-            total = num_gens * num_step0_tokens
-            attn_metadata.spec_decoding_position_offsets[:total] = self._causal_offs[
-                :num_step0_tokens
-            ].repeat(num_gens)
+            # C++ kernel indexes with stride = input_seq_length (= num_step0_tokens),
+            # NOT buf_dim. Write data flat/compact with actual token stride.
             _buf_dim = (
                 attn_metadata.spec_decoding_position_offsets.numel()
                 // attn_metadata.max_num_requests
             )
+            total = num_gens * num_step0_tokens
+            attn_metadata.spec_decoding_position_offsets[:total] = self._causal_offs[
+                :num_step0_tokens
+            ].repeat(num_gens)
             attn_metadata.position_offsets_stride = _buf_dim
+            attn_metadata.position_offsets_query_len = num_step0_tokens
 
             attn_metadata.spec_decoding_packed_mask[:num_gens].fill_(0)
             attn_metadata.spec_decoding_packed_mask[:num_gens, :num_step0_tokens, 0] = (
@@ -899,6 +922,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 // attn_metadata.max_num_requests
             )
             attn_metadata.position_offsets_stride = _buf_dim
+            attn_metadata.position_offsets_query_len = num_tokens_current_layer
         else:
             num_parent_mask = batch_size * cur_draft_idx * self.K * cur_draft_idx * self.K
             parent_mask = self.tree_mask_buffer[:num_parent_mask].reshape(
@@ -935,9 +959,12 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             attn_metadata.spec_decoding_generation_lengths[:batch_size] = num_tokens_current_layer
 
-            # C++ indexes position_offsets with stride = input_seq_length,
-            # not buf_dim. Read previous data and write new data using flat
-            # layout with actual token stride per request.
+            # C++ kernel indexes with stride = actual token count per request.
+            # Data is flat/compact. Read prev with prev stride, write new with new stride.
+            _buf_dim = (
+                attn_metadata.spec_decoding_position_offsets.numel()
+                // attn_metadata.max_num_requests
+            )
             prev_total = batch_size * num_tokens_previous_layer
             previous_position_offsets = attn_metadata.spec_decoding_position_offsets[
                 :prev_total
@@ -950,11 +977,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             )
             cur_total = batch_size * num_tokens_current_layer
             attn_metadata.spec_decoding_position_offsets[:cur_total] = new_pos.reshape(-1)
-            _buf_dim = (
-                attn_metadata.spec_decoding_position_offsets.numel()
-                // attn_metadata.max_num_requests
-            )
             attn_metadata.position_offsets_stride = _buf_dim
+            attn_metadata.position_offsets_query_len = num_tokens_current_layer
 
         # Hopper XQA needs packed 1D mask; Blackwell expects padded 3D.
         if self._needs_mask_repack:
