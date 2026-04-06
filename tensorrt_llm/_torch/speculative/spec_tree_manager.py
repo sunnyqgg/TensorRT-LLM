@@ -120,17 +120,16 @@ class SpecTreeManager:
                 device='cuda',
             ).unsqueeze(0).repeat(self.num_trees, 1, 1)
 
-        # CUDA kernel facing — rows = max_total_draft_tokens + 1,
-        # columns widened to match attn_metadata mask_width so that the
-        # Hopper flat copy in update_spec_dec_param needs no per-row padding.
+        # CUDA kernel facing — rows = n_dt = max_total_draft_tokens + 1,
+        # columns = ceil(n_dt / 32) (exact width for n_dt token bits).
+        n_dt = self.max_total_draft_tokens + 1
         self.spec_dec_packed_mask = torch.zeros(
-            (self.num_trees, self.max_total_draft_tokens + 1,
-             math.ceil(self._internal_buf_dim / 32)),
+            (self.num_trees, n_dt, math.ceil(n_dt / 32)),
             dtype=torch.int32,
             device='cuda',
         )
         self.spec_dec_position_offsets = torch.zeros(
-            (self.num_trees, self._internal_buf_dim),
+            (self.num_trees, n_dt),
             dtype=torch.int32,
             device='cuda',
         )
