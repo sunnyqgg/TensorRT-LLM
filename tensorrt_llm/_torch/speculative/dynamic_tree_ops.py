@@ -108,9 +108,16 @@ class DynamicTreeOpsConverter:
         # +1 because num_draft_tokens includes root node in SGLang's convention
         num_draft_tokens = topk_score_indices.shape[1] + 1
         tree_mask_mode = 2 if use_packed_mask else 1  # QLEN_ONLY_BITPACKING / QLEN_ONLY
-        # Packed layout: last dim is int32 row stride (may exceed ceil(N/32) if padded).
-        # Non-packed path ignores this (bool [bs,N,N] still has a last dim).
-        num_int32_per_row = tree_mask.shape[-1]
+
+        # Pass the actual buffer row stride (in int32s) so the kernel uses
+        # the correct stride instead of computing ceil(num_draft_tokens / 32).
+        num_int32_per_row = tree_mask.shape[-1] if use_packed_mask else 0
+
+        # The CUDA kernel indexes positions/retrieve buffers as
+        # ptr[bid * draftTokenNum + tid], so dim1 MUST equal num_draft_tokens.
+        assert positions.shape[-1] == num_draft_tokens, (
+            f"positions dim1 ({positions.shape[-1]}) != num_draft_tokens ({num_draft_tokens})"
+        )
 
         # Call CUDA kernel in-place
         try:
