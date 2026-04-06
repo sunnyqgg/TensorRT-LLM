@@ -111,8 +111,13 @@ class DynamicTreeOpsConverter:
 
         # Pass the actual buffer row stride (in int32s) so the kernel uses
         # the correct stride instead of computing ceil(num_draft_tokens / 32).
-        # The buffer may be wider when padded to _internal_buf_dim.
         num_int32_per_row = tree_mask.shape[-1] if use_packed_mask else 0
+
+        # The CUDA kernel indexes positions/retrieve buffers as
+        # ptr[bid * draftTokenNum + tid], so dim1 MUST equal num_draft_tokens.
+        assert positions.shape[-1] == num_draft_tokens, (
+            f"positions dim1 ({positions.shape[-1]}) != num_draft_tokens ({num_draft_tokens})"
+        )
 
         # Call CUDA kernel in-place
         try:

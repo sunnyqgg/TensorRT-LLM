@@ -14,6 +14,7 @@
 # limitations under the License.
 """Eagle3 one-model dynamic tree speculative decoding."""
 
+import math
 from typing import TYPE_CHECKING, override
 
 import torch
@@ -283,28 +284,34 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         """Repack mask from padded 3D layout to packed 1D layout.
 
         The XQA precompiled kernel reads the tree attention mask in packed
-        layout using cumulative sequence lengths (cuQSeqLens), i.e.::
-
-            flat[cuSeqLens[i] * maskWidth + row * maskWidth + col]
+        layout using cumulative sequence lengths (cuQSeqLens), with row
+        stride ``divUp(qSeqLen, 32)`` int32s — i.e. ``math.ceil(n_tok/32)``.
 
         But Python writes the mask into the 3D tensor
-        ``[max_num_requests, buf_dim, maskWidth]`` (padded layout), where
-        the batch stride is ``buf_dim * maskWidth`` instead of
-        ``n_tok * maskWidth``.  When ``n_tok < buf_dim`` and
-        ``n_req > 1``, batch 1+ reads stale/zero data.
+        ``[max_num_requests, buf_dim, stored_mask_width]`` where
+        ``stored_mask_width = ceil(buf_dim / 32)``.  When ``n_tok < buf_dim``,
+        the stored row width can exceed what the C++ kernel expects.
 
-        This function extracts the valid mask rows from the padded tensor
-        and writes them contiguously (packed) at the start of the buffer.
+        This function extracts valid rows *and* valid columns (trimming
+        to ``actual_mask_width = ceil(n_tok / 32)``) and writes them
+        contiguously (packed) at the start of the buffer.
         Uses a pre-allocated scratch buffer for CUDA graph compatibility.
         """
         buf_dim = mask_buf.shape[1]
-        if n_tok >= buf_dim or n_req <= 1:
+        stored_mask_width = mask_buf.shape[2]
+        # C++ XQA kernel reads divUp(n_tok, 32) int32s per mask row.
+        actual_mask_width = math.ceil(n_tok / 32)
+
+        needs_batch_repack = n_tok < buf_dim and n_req > 1
+        needs_width_repack = actual_mask_width < stored_mask_width
+
+        if not needs_batch_repack and not needs_width_repack:
             return
-        mask_width = mask_buf.shape[2]
-        total_elems = n_req * n_tok * mask_width
-        # Copy strided (padded) rows to pre-allocated scratch buffer
-        scratch = self._mask_repack_buf[:total_elems].view(n_req, n_tok, mask_width)
-        scratch.copy_(mask_buf[:n_req, :n_tok, :])
+
+        total_elems = n_req * n_tok * actual_mask_width
+        # Copy valid rows and columns to pre-allocated scratch buffer
+        scratch = self._mask_repack_buf[:total_elems].view(n_req, n_tok, actual_mask_width)
+        scratch.copy_(mask_buf[:n_req, :n_tok, :actual_mask_width])
         # Write packed data to beginning of flat buffer (no overlap)
         flat = mask_buf.view(-1)
         flat[:total_elems] = scratch.view(-1)
@@ -570,14 +577,18 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             # absolute rows num_contexts..batch_size-1.
             attn_metadata.spec_decoding_generation_lengths[:num_gens].fill_(num_step0_tokens)
 
-            # C++ indexes position_offsets with stride = input_seq_length
-            # (= num_tokens / num_seqs), not buf_dim. Write data flat with
-            # actual token stride. sizes()[1] stays buf_dim (for mask width).
+            # C++ kernel indexes with stride = input_seq_length (= num_step0_tokens),
+            # NOT buf_dim. Write data flat/compact with actual token stride.
+            _buf_dim = (
+                attn_metadata.spec_decoding_position_offsets.numel()
+                // attn_metadata.max_num_requests
+            )
             total = num_gens * num_step0_tokens
-            attn_metadata.spec_decoding_position_offsets[:total] = (
-                self._causal_offs[:num_step0_tokens].repeat(num_gens))
-            _buf_dim = attn_metadata.spec_decoding_position_offsets.numel() // attn_metadata.max_num_requests
+            attn_metadata.spec_decoding_position_offsets[:total] = self._causal_offs[
+                :num_step0_tokens
+            ].repeat(num_gens)
             attn_metadata.position_offsets_stride = _buf_dim
+            attn_metadata.position_offsets_query_len = num_step0_tokens
 
             attn_metadata.spec_decoding_packed_mask[:num_gens].fill_(0)
             attn_metadata.spec_decoding_packed_mask[:num_gens, :num_step0_tokens, 0] = (
@@ -777,11 +788,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             ]
             tree_valid = spec_tree_manager.slot_has_tree[gen_slot_ids]
 
-            retrieve_packed = torch.stack([
-                spec_tree_manager.retrieve_index[:num_gens],
-                spec_tree_manager.retrieve_next_token[:num_gens],
-                spec_tree_manager.retrieve_next_sibling[:num_gens],
-            ], dim=-1)
+            retrieve_packed = torch.stack(
+                [
+                    spec_tree_manager.retrieve_index[:num_gens],
+                    spec_tree_manager.retrieve_next_token[:num_gens],
+                    spec_tree_manager.retrieve_next_sibling[:num_gens],
+                ],
+                dim=-1,
+            )
             _, accept_index, accept_token_num, accept_token = (
                 self.tree_ops_converter.verify_dynamic_tree_greedy_out_packed(
                     candidates,
@@ -922,8 +936,12 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             ].copy_(self.tree_mask_init_buffer[:batch_size].view(-1))
             attn_metadata.spec_decoding_position_offsets.fill_(0)
             attn_metadata.spec_decoding_generation_lengths[:batch_size] = num_tokens_current_layer
-            _buf_dim = attn_metadata.spec_decoding_position_offsets.numel() // attn_metadata.max_num_requests
+            _buf_dim = (
+                attn_metadata.spec_decoding_position_offsets.numel()
+                // attn_metadata.max_num_requests
+            )
             attn_metadata.position_offsets_stride = _buf_dim
+            attn_metadata.position_offsets_query_len = num_tokens_current_layer
         else:
             num_parent_mask = batch_size * cur_draft_idx * self.K * cur_draft_idx * self.K
             parent_mask = self.tree_mask_buffer[:num_parent_mask].reshape(
@@ -960,12 +978,16 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             attn_metadata.spec_decoding_generation_lengths[:batch_size] = num_tokens_current_layer
 
-            # C++ indexes position_offsets with stride = input_seq_length,
-            # not buf_dim. Read previous data and write new data using flat
-            # layout with actual token stride per request.
+            # C++ kernel indexes with stride = actual token count per request.
+            # Data is flat/compact. Read prev with prev stride, write new with new stride.
+            _buf_dim = (
+                attn_metadata.spec_decoding_position_offsets.numel()
+                // attn_metadata.max_num_requests
+            )
             prev_total = batch_size * num_tokens_previous_layer
             previous_position_offsets = attn_metadata.spec_decoding_position_offsets[
-                :prev_total].view(batch_size, num_tokens_previous_layer)
+                :prev_total
+            ].view(batch_size, num_tokens_previous_layer)
 
             new_pos = self._new_pos_offset_buf[:batch_size, :num_tokens_current_layer]
             new_pos[:, :num_tokens_previous_layer].copy_(previous_position_offsets)
@@ -974,8 +996,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             )
             cur_total = batch_size * num_tokens_current_layer
             attn_metadata.spec_decoding_position_offsets[:cur_total] = new_pos.reshape(-1)
-            _buf_dim = attn_metadata.spec_decoding_position_offsets.numel() // attn_metadata.max_num_requests
             attn_metadata.position_offsets_stride = _buf_dim
+            attn_metadata.position_offsets_query_len = num_tokens_current_layer
 
         # Repack mask from padded 3D to packed 1D layout so the Hopper
         # XQA kernel (which indexes via cuQSeqLens) reads the correct

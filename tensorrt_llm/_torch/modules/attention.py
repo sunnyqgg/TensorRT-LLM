@@ -948,15 +948,13 @@ class Attention(nn.Module):
         stride = getattr(attn_metadata, 'position_offsets_stride', 0)
         if stride <= 0:
             return position_ids
-        # Data is written flat with input_seq_length (= gen_len) stride.
-        # Use gen_len to view, not position_offsets_stride (which may be
-        # buf_dim for _reshape_position_offsets_for_cpp / mask width).
+        # Data is flat/compact with gen_len stride per request (matching
+        # C++ kernel's input_seq_length stride = num_tokens / num_seqs).
         total = num_gens * gen_len
         offsets = offsets_flat[:total].view(num_gens, gen_len)
         start = attn_metadata.num_ctx_tokens
-        end = start + num_gens * gen_len
+        end = start + total
         adjusted = (base_pos.unsqueeze(1) + offsets).reshape(-1)
-        # position_ids may be 1D [num_tokens] or 2D [1, num_tokens].
         position_ids.view(-1)[start:end] = adjusted
         return position_ids
 
