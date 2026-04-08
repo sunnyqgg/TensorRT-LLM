@@ -72,6 +72,70 @@ def _resample_final_tokens(
     return real_draft_tokens, topk_score_indices
 
 
+@torch.compile(options={"max-autotune": True})
+def _build_mask_and_position(
+    parent_mask: torch.Tensor,
+    selected_parents: torch.Tensor,
+    tree_mask_init: torch.Tensor,
+    previous_position_offsets: torch.Tensor,
+    K: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused mask building + position offset computation for draft steps 1+.
+
+    Replaces multiple small kernel launches (zero_, gather, copy_, add) with
+    a single compiled graph.
+    """
+    batch_size = parent_mask.shape[0]
+    num_tokens_previous_layer = parent_mask.shape[1]
+    num_tokens_current_layer = num_tokens_previous_layer + K
+
+    # Gather parent mask rows for selected parents
+    selected_parents_expanded = selected_parents.unsqueeze(-1).expand(
+        batch_size, K, num_tokens_previous_layer
+    )
+    parent_mask_selected = torch.gather(
+        parent_mask[:, -K:, :], dim=1, index=selected_parents_expanded
+    )
+
+    # Build current_mask: [batch, num_tokens_current_layer, num_tokens_current_layer]
+    # Top rows: zeros padding
+    padding = torch.zeros(
+        batch_size,
+        num_tokens_previous_layer,
+        num_tokens_current_layer,
+        dtype=parent_mask.dtype,
+        device=parent_mask.device,
+    )
+    # Bottom rows: [parent_mask_selected | tree_mask_init]
+    bottom = torch.cat([parent_mask_selected, tree_mask_init], dim=2)
+    current_mask = torch.cat([padding, bottom], dim=1)
+
+    # Position offsets: copy previous + append (parent_last_K + 1)
+    new_positions = torch.cat(
+        [previous_position_offsets, previous_position_offsets[:, -K:] + 1],
+        dim=1,
+    )
+
+    return current_mask, new_positions
+
+
+@torch.compile(options={"max-autotune": True})
+def _gather_parent_hs(
+    hs_write_buffer: torch.Tensor,
+    read_idx: torch.Tensor,
+) -> torch.Tensor:
+    """Fused gather of parent hidden states.
+
+    Replaces gather(...unsqueeze...expand...) with a single compiled graph.
+    """
+    hs_dim = hs_write_buffer.shape[2]
+    return torch.gather(
+        hs_write_buffer,
+        1,
+        read_idx.unsqueeze(-1).expand(-1, -1, hs_dim),
+    )
+
+
 @triton.jit
 def _gather_repack_step0_kernel(
     hidden_states_ptr,
@@ -245,6 +309,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
         self._target_predict_buf = torch.zeros(
             max_batch_size, tokens_per_gen_step, dtype=torch.int64, device="cuda"
+        )
+        # Pre-allocated buffer for retrieve_packed (avoids torch.stack allocation per verify)
+        self._retrieve_packed_buf = torch.zeros(
+            max_batch_size, tokens_per_gen_step, 3, dtype=torch.int32, device="cuda"
         )
 
         # Step 0 input buffers
@@ -557,15 +625,16 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
 
         # === Step 0: Initial forward ===
-        num_step0_tokens = self._max_path_len
+        with nvtx_range("eagle3_dyn.draft_step_0.setup_mask"):
+            num_step0_tokens = self._max_path_len
 
-        # Triton kernel already wrote gen gather_ids into _gather_ids_buf;
-        # just prepend context gather_ids.
-        self._gather_ids_buf[:num_contexts].copy_(spec_metadata.gather_ids[:num_contexts])
-        gather_ids = self._gather_ids_buf[:batch_size]
+            # Triton kernel already wrote gen gather_ids into _gather_ids_buf;
+            # just prepend context gather_ids.
+            self._gather_ids_buf[:num_contexts].copy_(spec_metadata.gather_ids[:num_contexts])
+            gather_ids = self._gather_ids_buf[:batch_size]
 
-        if original_all_rank_num_tokens is not None:
-            attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+            if original_all_rank_num_tokens is not None:
+                attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
         # Set up uniform causal mask for step 0 (None during prefill-only warmup)
         if attn_metadata.spec_decoding_generation_lengths is not None:
@@ -606,130 +675,148 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= self._kv_correction
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-            hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+            with nvtx_range("eagle3_dyn.draft_step_0"):
+                with nvtx_range("eagle3_dyn.draft_step_0.draft_model_fwd"):
+                    hidden_states, hidden_states_to_save = draft_model.model(**inputs)
 
-            step0_hs = hidden_states_to_save[gather_ids]
+                with nvtx_range("eagle3_dyn.draft_step_0.logits_and_sample"):
+                    step0_hs = hidden_states_to_save[gather_ids]
 
-            logits = draft_model.logits_processor(
-                hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
-            )
+                    logits = draft_model.logits_processor(
+                        hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
+                    )
 
-            new_draft_tokens, new_draft_scores = self.sample(
-                logits, self.K, draft_model=draft_model
-            )
+                    new_draft_tokens, new_draft_scores = self.sample(
+                        logits, self.K, draft_model=draft_model
+                    )
 
-            previous_draft_scores = self.update_draft_tokens_and_scores(
-                cur_draft_idx=0,
-                new_draft_tokens=new_draft_tokens,
-                new_draft_scores=new_draft_scores,
-                previous_draft_scores=None,
-                batch_size=batch_size,
-                attn_metadata=attn_metadata,
-            )
+                with nvtx_range("eagle3_dyn.draft_step_0.update_tokens_scores"):
+                    previous_draft_scores = self.update_draft_tokens_and_scores(
+                        cur_draft_idx=0,
+                        new_draft_tokens=new_draft_tokens,
+                        new_draft_scores=new_draft_scores,
+                        previous_draft_scores=None,
+                        batch_size=batch_size,
+                        attn_metadata=attn_metadata,
+                    )
 
-            self.update_hidden_states(
-                cur_draft_idx=0,
-                batch_size=batch_size,
-                step0_hs=step0_hs,
-            )
+                with nvtx_range("eagle3_dyn.draft_step_0.update_hidden_states"):
+                    self.update_hidden_states(
+                        cur_draft_idx=0,
+                        batch_size=batch_size,
+                        step0_hs=step0_hs,
+                    )
 
-            self.prepare_for_generation(
-                0,
-                attn_metadata,
-                batch_size,
-                inputs=inputs,
-                gather_ids=gather_ids,
-                num_contexts=num_contexts,
-                num_gens=num_gens,
-                num_accepted_tokens=num_accepted_tokens,
-            )
+                with nvtx_range("eagle3_dyn.draft_step_0.prepare_for_gen"):
+                    self.prepare_for_generation(
+                        0,
+                        attn_metadata,
+                        batch_size,
+                        inputs=inputs,
+                        gather_ids=gather_ids,
+                        num_contexts=num_contexts,
+                        num_gens=num_gens,
+                        num_accepted_tokens=num_accepted_tokens,
+                    )
 
             for layer_idx in range(1, self.max_draft_len):
-                num_tokens_per_req = layer_idx * self.K
+                with nvtx_range(f"eagle3_dyn.draft_step_{layer_idx}"):
+                    num_tokens_per_req = layer_idx * self.K
 
-                if original_all_rank_num_tokens is not None:
-                    if spec_metadata.all_rank_num_seqs is not None:
-                        attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
+                    if original_all_rank_num_tokens is not None:
+                        if spec_metadata.all_rank_num_seqs is not None:
+                            attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
 
-                # Growing context: process ALL accumulated tokens
-                num_infer_tokens = batch_size * num_tokens_per_req
+                    with nvtx_range(f"eagle3_dyn.draft_step_{layer_idx}.prepare_inputs"):
+                        # Growing context: process ALL accumulated tokens
+                        num_infer_tokens = batch_size * num_tokens_per_req
 
-                inp_hs = self._accumulated_hs[:batch_size, :num_tokens_per_req, :].reshape(
-                    num_infer_tokens, -1
-                )
-                inp_ids = (
-                    self.draft_tokens_buffer[:batch_size, :num_tokens_per_req]
-                    .reshape(-1)
-                    .to(torch.int32)
-                )
-                inp_pos = self.position_ids_buffer[:batch_size, :num_tokens_per_req].reshape(-1)
-                inputs = {
-                    "input_ids": inp_ids,
-                    "position_ids": inp_pos,
-                    "hidden_states": inp_hs,
-                    "attn_metadata": attn_metadata,
-                    "spec_metadata": spec_metadata,
-                }
+                        inp_hs = self._accumulated_hs[:batch_size, :num_tokens_per_req, :].reshape(
+                            num_infer_tokens, -1
+                        )
+                        inp_ids = (
+                            self.draft_tokens_buffer[:batch_size, :num_tokens_per_req]
+                            .reshape(-1)
+                            .to(torch.int32)
+                        )
+                        inp_pos = self.position_ids_buffer[
+                            :batch_size, :num_tokens_per_req
+                        ].reshape(-1)
+                        inputs = {
+                            "input_ids": inp_ids,
+                            "position_ids": inp_pos,
+                            "hidden_states": inp_hs,
+                            "attn_metadata": attn_metadata,
+                            "spec_metadata": spec_metadata,
+                        }
 
-                hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+                    with nvtx_range(f"eagle3_dyn.draft_step_{layer_idx}.draft_model_fwd"):
+                        hidden_states, hidden_states_to_save = draft_model.model(**inputs)
 
-                # Take last K logits per request
-                hs_reshaped = hidden_states.reshape(batch_size, num_tokens_per_req, -1)
-                selected_hs = hs_reshaped[:, -self.K :, :].reshape(batch_size * self.K, -1)
-                logits = draft_model.logits_processor(
-                    selected_hs, draft_model.lm_head, attn_metadata, True
-                )
+                    with nvtx_range(f"eagle3_dyn.draft_step_{layer_idx}.logits_and_sample"):
+                        # Take last K logits per request
+                        hs_reshaped = hidden_states.reshape(batch_size, num_tokens_per_req, -1)
+                        selected_hs = hs_reshaped[:, -self.K :, :].reshape(batch_size * self.K, -1)
+                        logits = draft_model.logits_processor(
+                            selected_hs, draft_model.lm_head, attn_metadata, True
+                        )
 
-                new_draft_tokens, new_draft_scores = self.sample(
-                    logits, self.K, draft_model=draft_model
-                )
+                        new_draft_tokens, new_draft_scores = self.sample(
+                            logits, self.K, draft_model=draft_model
+                        )
 
-                # Reshape for update: [batch_size, K, K]
-                new_draft_tokens = new_draft_tokens.reshape(batch_size, self.K, self.K)
-                new_draft_scores = new_draft_scores.reshape(batch_size, self.K, self.K)
+                        # Reshape for update: [batch_size, K, K]
+                        new_draft_tokens = new_draft_tokens.reshape(batch_size, self.K, self.K)
+                        new_draft_scores = new_draft_scores.reshape(batch_size, self.K, self.K)
 
-                previous_draft_scores = self.update_draft_tokens_and_scores(
-                    cur_draft_idx=layer_idx,
-                    new_draft_tokens=new_draft_tokens,
-                    new_draft_scores=new_draft_scores,
-                    previous_draft_scores=previous_draft_scores,
-                    batch_size=batch_size,
-                    attn_metadata=attn_metadata,
-                )
+                    with nvtx_range(f"eagle3_dyn.draft_step_{layer_idx}.update_tokens_scores"):
+                        previous_draft_scores = self.update_draft_tokens_and_scores(
+                            cur_draft_idx=layer_idx,
+                            new_draft_tokens=new_draft_tokens,
+                            new_draft_scores=new_draft_scores,
+                            previous_draft_scores=previous_draft_scores,
+                            batch_size=batch_size,
+                            attn_metadata=attn_metadata,
+                        )
 
-                self.update_hidden_states(
-                    cur_draft_idx=layer_idx,
-                    batch_size=batch_size,
-                    hidden_states_to_save=hidden_states_to_save,
-                    selected_parents=self._last_selected_parents,
-                )
+                    with nvtx_range(f"eagle3_dyn.draft_step_{layer_idx}.update_hidden_states"):
+                        self.update_hidden_states(
+                            cur_draft_idx=layer_idx,
+                            batch_size=batch_size,
+                            hidden_states_to_save=hidden_states_to_save,
+                            selected_parents=self._last_selected_parents,
+                        )
 
-                self.prepare_for_generation(layer_idx, attn_metadata, batch_size)
+                    with nvtx_range(f"eagle3_dyn.draft_step_{layer_idx}.prepare_for_gen"):
+                        self.prepare_for_generation(layer_idx, attn_metadata, batch_size)
 
         # Resample final tokens and build tree
-        real_draft_tokens, topk_score_indices = self.resampling_final_draft_tokens(batch_size)
+        with nvtx_range("eagle3_dyn.resample_final"):
+            real_draft_tokens, topk_score_indices = self.resampling_final_draft_tokens(batch_size)
 
         if spec_tree_manager is not None:
-            # Build trees only for generation requests (skip context requests).
-            # The XQA kernel reads spec-dec params from position 0 with
-            # batch_size = num_generations, so gen trees must be at [0..num_gens-1].
-            self.tree_ops_converter.build_dynamic_tree(
-                history_draft_tokens_parent_buffer=self.history_draft_tokens_parent_buffer[
-                    num_contexts:batch_size
-                ],
-                topk_score_indices=topk_score_indices[num_contexts:],
-                tree_mask=spec_tree_manager.spec_dec_packed_mask[:num_gens],
-                positions=spec_tree_manager.spec_dec_position_offsets[:num_gens],
-                retrieve_index=spec_tree_manager.retrieve_index[:num_gens],
-                retrieve_next_token=spec_tree_manager.retrieve_next_token[:num_gens],
-                retrieve_next_sibling=spec_tree_manager.retrieve_next_sibling[:num_gens],
-                use_packed_mask=True,
-            )
+            with nvtx_range("eagle3_dyn.build_dynamic_tree"):
+                # Build trees only for generation requests (skip context requests).
+                # The XQA kernel reads spec-dec params from position 0 with
+                # batch_size = num_generations, so gen trees must be at [0..num_gens-1].
+                self.tree_ops_converter.build_dynamic_tree(
+                    history_draft_tokens_parent_buffer=self.history_draft_tokens_parent_buffer[
+                        num_contexts:batch_size
+                    ],
+                    topk_score_indices=topk_score_indices[num_contexts:],
+                    tree_mask=spec_tree_manager.spec_dec_packed_mask[:num_gens],
+                    positions=spec_tree_manager.spec_dec_position_offsets[:num_gens],
+                    retrieve_index=spec_tree_manager.retrieve_index[:num_gens],
+                    retrieve_next_token=spec_tree_manager.retrieve_next_token[:num_gens],
+                    retrieve_next_sibling=spec_tree_manager.retrieve_next_sibling[:num_gens],
+                    use_packed_mask=True,
+                )
 
-            # Scatter only gen trees to stable slot storage
-            gen_slots = spec_tree_manager._all_slot_ids_buf[num_contexts:batch_size]
-            spec_tree_manager.scatter_trees_to_slots(gen_slots, num_gens)
-            spec_tree_manager.mark_tree_valid(gen_slots, num_gens)
+            with nvtx_range("eagle3_dyn.scatter_trees"):
+                # Scatter only gen trees to stable slot storage
+                gen_slots = spec_tree_manager._all_slot_ids_buf[num_contexts:batch_size]
+                spec_tree_manager.scatter_trees_to_slots(gen_slots, num_gens)
+                spec_tree_manager.mark_tree_valid(gen_slots, num_gens)
 
         return real_draft_tokens.to(torch.int32)
 
@@ -742,16 +829,18 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         N = self.tokens_per_gen_step
         max_path_len = self._max_path_len
 
-        # Reset output buffers
-        self._accepted_tokens_buf[:batch_size].zero_()
-        accepted_tokens = self._accepted_tokens_buf[:batch_size, :max_path_len]
-        self._num_accepted_tokens_buf[:batch_size].fill_(1)
-        num_accepted_tokens = self._num_accepted_tokens_buf[:batch_size]
-        self._accepted_draft_indices_tensor[:batch_size].fill_(-1)
+        with nvtx_range("eagle3_dyn.verify.reset_buffers"):
+            # Reset output buffers
+            self._accepted_tokens_buf[:batch_size].zero_()
+            accepted_tokens = self._accepted_tokens_buf[:batch_size, :max_path_len]
+            self._num_accepted_tokens_buf[:batch_size].fill_(1)
+            num_accepted_tokens = self._num_accepted_tokens_buf[:batch_size]
+            self._accepted_draft_indices_tensor[:batch_size].fill_(-1)
 
-        num_flat_tokens = logits.shape[0]
-        torch.argmax(logits, dim=-1, out=self._target_tokens_buf[:num_flat_tokens])
-        target_tokens = self._target_tokens_buf[:num_flat_tokens]
+        with nvtx_range("eagle3_dyn.verify.argmax"):
+            num_flat_tokens = logits.shape[0]
+            torch.argmax(logits, dim=-1, out=self._target_tokens_buf[:num_flat_tokens])
+            target_tokens = self._target_tokens_buf[:num_flat_tokens]
 
         # Context requests: accept sampled token
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts].to(torch.int32)
@@ -760,47 +849,49 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         if num_gens > 0:
             spec_tree_manager = self.spec_tree_manager
 
-            target_predict = self._target_predict_buf[:num_gens]
-            target_predict[:] = target_tokens[num_contexts:].reshape(num_gens, N)
+            with nvtx_range("eagle3_dyn.verify.prepare_candidates"):
+                target_predict = self._target_predict_buf[:num_gens]
+                target_predict[:] = target_tokens[num_contexts:].reshape(num_gens, N)
 
-            if spec_tree_manager is None:
-                # CUDA graph warmup: accept only the first token per request
-                num_accepted_tokens[num_contexts:batch_size] = 1
-                accepted_tokens[num_contexts:batch_size, 0] = target_predict[:, 0].to(torch.int32)
-                self._accepted_draft_indices_tensor[num_contexts:batch_size] = -1
-                return accepted_tokens, num_accepted_tokens
+                if spec_tree_manager is None:
+                    # CUDA graph warmup: accept only the first token per request
+                    num_accepted_tokens[num_contexts:batch_size] = 1
+                    accepted_tokens[num_contexts:batch_size, 0] = target_predict[:, 0].to(
+                        torch.int32
+                    )
+                    self._accepted_draft_indices_tensor[num_contexts:batch_size] = -1
+                    return accepted_tokens, num_accepted_tokens
 
-            candidates = self._candidates_buf[:num_gens]
-            candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, N - 1).to(torch.int64)
-            candidates[:, 0] = target_predict[:, 0]
-
-            # Build per-request tree validity from slot storage.
-            # _all_slot_ids_buf[num_contexts:batch_size] holds py_seq_slot
-            # for real gen requests and _dummy_slot_id for dummies.
-            # slot_has_tree[_dummy_slot_id] is always False.
-            gen_slot_ids = spec_tree_manager._all_slot_ids_buf[
-                num_contexts : num_contexts + num_gens
-            ]
-            tree_valid = spec_tree_manager.slot_has_tree[gen_slot_ids]
-
-            retrieve_packed = torch.stack(
-                [
-                    spec_tree_manager.retrieve_index[:num_gens],
-                    spec_tree_manager.retrieve_next_token[:num_gens],
-                    spec_tree_manager.retrieve_next_sibling[:num_gens],
-                ],
-                dim=-1,
-            )
-            _, accept_index, accept_token_num, accept_token = (
-                self.tree_ops_converter.verify_dynamic_tree_greedy_out_packed(
-                    candidates,
-                    retrieve_packed,
-                    target_predict,
-                    num_gens,
-                    self._max_path_len,
-                    tree_valid=tree_valid,
+                candidates = self._candidates_buf[:num_gens]
+                candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, N - 1).to(
+                    torch.int64
                 )
-            )
+                candidates[:, 0] = target_predict[:, 0]
+
+            with nvtx_range("eagle3_dyn.verify.tree_validity"):
+                # Build per-request tree validity from slot storage.
+                gen_slot_ids = spec_tree_manager._all_slot_ids_buf[
+                    num_contexts : num_contexts + num_gens
+                ]
+                tree_valid = spec_tree_manager.slot_has_tree[gen_slot_ids]
+
+            with nvtx_range("eagle3_dyn.verify.pack_retrieve"):
+                retrieve_packed = self._retrieve_packed_buf[:num_gens]
+                retrieve_packed[:, :, 0] = spec_tree_manager.retrieve_index[:num_gens]
+                retrieve_packed[:, :, 1] = spec_tree_manager.retrieve_next_token[:num_gens]
+                retrieve_packed[:, :, 2] = spec_tree_manager.retrieve_next_sibling[:num_gens]
+
+            with nvtx_range("eagle3_dyn.verify.verify_tree_greedy"):
+                _, accept_index, accept_token_num, accept_token = (
+                    self.tree_ops_converter.verify_dynamic_tree_greedy_out_packed(
+                        candidates,
+                        retrieve_packed,
+                        target_predict,
+                        num_gens,
+                        self._max_path_len,
+                        tree_valid=tree_valid,
+                    )
+                )
 
             self._accept_token = accept_token
             n_acc_draft = accept_token_num[:num_gens]
@@ -943,25 +1034,22 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 batch_size, cur_draft_idx * self.K, cur_draft_idx * self.K
             )
 
-            selected_parents_expanded = selected_parents.unsqueeze(-1).expand(
-                batch_size, self.K, parent_mask.size(-1)
+            _buf_dim = (
+                attn_metadata.spec_decoding_position_offsets.numel()
+                // attn_metadata.max_num_requests
             )
-            parent_mask_selected = torch.gather(
-                parent_mask[:, -self.K :, :], dim=1, index=selected_parents_expanded
-            )
+            prev_total = batch_size * num_tokens_previous_layer
+            previous_position_offsets = attn_metadata.spec_decoding_position_offsets[
+                :prev_total
+            ].view(batch_size, num_tokens_previous_layer)
 
-            # current_mask = cat([parent_mask_selected, tree_mask_init], dim=2) then
-            # current_mask = cat([mask_padding, current_mask], dim=1)
-            current_mask = self._current_mask_buf[
-                :batch_size, :num_tokens_current_layer, :num_tokens_current_layer
-            ]
-            # Top rows: padding zeros
-            current_mask[:, :num_tokens_previous_layer, :].zero_()
-            # Bottom rows: [parent_mask_selected | tree_mask_init]
-            prev_cols = parent_mask.size(-1)  # = num_tokens_previous_layer
-            current_mask[:, num_tokens_previous_layer:, :prev_cols].copy_(parent_mask_selected)
-            current_mask[:, num_tokens_previous_layer:, prev_cols:num_tokens_current_layer].copy_(
-                self.tree_mask_init_buffer[:batch_size]
+            # Fused: gather parent masks + build current mask + compute positions
+            current_mask, new_positions = _build_mask_and_position(
+                parent_mask,
+                selected_parents,
+                self.tree_mask_init_buffer[:batch_size],
+                previous_position_offsets,
+                self.K,
             )
 
             spec_tree_manager.compute_spec_dec_packed_mask(
@@ -973,24 +1061,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             attn_metadata.spec_decoding_generation_lengths[:batch_size] = num_tokens_current_layer
 
-            # C++ kernel indexes with stride = actual token count per request.
-            # Data is flat/compact. Read prev with prev stride, write new with new stride.
-            _buf_dim = (
-                attn_metadata.spec_decoding_position_offsets.numel()
-                // attn_metadata.max_num_requests
-            )
-            prev_total = batch_size * num_tokens_previous_layer
-            previous_position_offsets = attn_metadata.spec_decoding_position_offsets[
-                :prev_total
-            ].view(batch_size, num_tokens_previous_layer)
-
-            new_pos = self._new_pos_offset_buf[:batch_size, :num_tokens_current_layer]
-            new_pos[:, :num_tokens_previous_layer].copy_(previous_position_offsets)
-            new_pos[:, num_tokens_previous_layer:num_tokens_current_layer].copy_(
-                previous_position_offsets[:, -self.K :] + 1
-            )
             cur_total = batch_size * num_tokens_current_layer
-            attn_metadata.spec_decoding_position_offsets[:cur_total] = new_pos.reshape(-1)
+            attn_metadata.spec_decoding_position_offsets[:cur_total] = new_positions.reshape(-1)
             attn_metadata.position_offsets_stride = _buf_dim
             attn_metadata.position_offsets_query_len = num_tokens_current_layer
 
@@ -1106,9 +1178,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             #    Positions 0:K retain step0_hs set in step 0 and are never modified.
             num_tokens_next = (cur_draft_idx + 1) * self.K
             read_idx = self._hs_read_map[:batch_size, self.K : num_tokens_next]
-            gathered = torch.gather(
+            self._accumulated_hs[:batch_size, self.K : num_tokens_next] = _gather_parent_hs(
                 self._hs_write_buffer[:batch_size],
-                1,
-                read_idx.unsqueeze(-1).expand(-1, -1, self._hs_dim),
+                read_idx,
             )
-            self._accumulated_hs[:batch_size, self.K : num_tokens_next] = gathered
