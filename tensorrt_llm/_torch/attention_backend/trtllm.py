@@ -1574,35 +1574,28 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 if is_target_model:
                     # Case 1.1.1: dynamic tree
                     if self.is_spec_dec_dynamic_tree:
-                        # Copy per-request dynamic tree params from spec_tree_manager.
                         n_dt = spec_tree_manager.max_total_draft_tokens + 1
-                        mask_width = spec_tree_manager.spec_dec_packed_mask.shape[
-                            -1]
-
-                        # C++ kernel indexes position_offsets with stride =
-                        # input_seq_length (= n_dt), NOT buf_dim. Write data
-                        # flat/compact with n_dt stride per request.
                         buf_dim = spec_tree_manager._internal_buf_dim
-                        src = spec_tree_manager.spec_dec_position_offsets[:
-                                                                          batch_size, :
-                                                                          n_dt]
+                        ss = spec_tree_manager.slot_storage
+                        slot_ids = ss.all_ids_buf[:batch_size]
+
+                        # Position offsets
+                        pos_src = torch.index_select(ss.position_offsets, 0,
+                                                     slot_ids)[:, :n_dt]
                         total = batch_size * n_dt
                         self.spec_decoding_position_offsets[:total].copy_(
-                            src.reshape(-1), non_blocking=True)
+                            pos_src.reshape(-1), non_blocking=True)
                         self.position_offsets_stride = buf_dim
                         self.position_offsets_query_len = n_dt
 
-                        # Packed mask copy — unified layout for Hopper and
-                        # Blackwell: n_dt rows per request, packed flat with
-                        # row width = ceil(n_dt / 32).  Blackwell's
-                        # prepareCustomMask now reads via cumSeqLensQ.
+                        # Packed mask
                         actual_mask_width = math.ceil(n_dt / 32)
-                        src = spec_tree_manager.spec_dec_packed_mask[:
-                                                                     batch_size, :, :
-                                                                     actual_mask_width]
+                        mask_src = torch.index_select(
+                            ss.packed_mask, 0,
+                            slot_ids)[:, :, :actual_mask_width]
                         total = batch_size * n_dt * actual_mask_width
                         self.spec_decoding_packed_mask.view(-1)[:total].copy_(
-                            src.reshape(-1), non_blocking=True)
+                            mask_src.reshape(-1), non_blocking=True)
 
                         self.spec_decoding_generation_lengths[:
                                                               batch_size].fill_(
@@ -1629,29 +1622,30 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     # Considering that these spec-dec params are accessed consecutively (without padding) in the attention Op,
                     # we need to write them consecutively when setting them.
                     # For the next drafter layers, we will prepare these spec-dec params in the drafting loops.
-                    # position_offsets
-                    position_offset = torch.arange(
-                        max_draft_len + 1,
-                        dtype=torch.int,
-                        device='cpu',
-                        pin_memory=prefer_pinned()).repeat(batch_size)
+
+                    # Cached GPU patterns (no per-call H2D)
+                    mdl1 = max_draft_len + 1
+                    if not hasattr(self, '_drafter0_pos_pattern'
+                                   ) or self._drafter0_pos_pattern is None:
+                        self._drafter0_pos_pattern = torch.arange(
+                            mdl1, dtype=torch.int, device='cuda')
+                        idx = torch.arange(mdl1, device='cuda')
+                        self._drafter0_mask_pattern = (torch.pow(2, idx + 1) -
+                                                       1).to(torch.int32)
+
+                    total = mdl1 * batch_size
                     self.spec_decoding_position_offsets.reshape(
-                        -1)[:(max_draft_len + 1) * batch_size].copy_(
-                            position_offset, non_blocking=True)
-                    # packed_mask
-                    dummy_idx = torch.arange(max_draft_len + 1)
-                    spec_decoding_packed_mask = torch.pow(
-                        2, dummy_idx + 1) - 1  # [max_draft_len + 1]
-                    spec_decoding_packed_mask = spec_decoding_packed_mask.repeat(
-                        batch_size)  # [batch_size * (max_draft_len + 1)]
-                    self.spec_decoding_packed_mask.reshape(
-                        -1)[:(max_draft_len + 1) * batch_size].copy_(
-                            spec_decoding_packed_mask, non_blocking=True)
+                        -1)[:total].copy_(
+                            self._drafter0_pos_pattern.repeat(batch_size),
+                            non_blocking=True)
+                    self.spec_decoding_packed_mask.reshape(-1)[:total].copy_(
+                        self._drafter0_mask_pattern.repeat(batch_size),
+                        non_blocking=True)
                     self.generate_spec_decoding_generation_length(
                         runtime_draft_len=max_draft_len)
                     if (self.spec_decoding_position_offsets is not None
                             and self.spec_decoding_position_offsets.dim() == 1):
-                        self.position_offsets_query_len = max_draft_len + 1
+                        self.position_offsets_query_len = mdl1
                     else:
                         self.position_offsets_query_len = 0
 

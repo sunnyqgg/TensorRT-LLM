@@ -3630,17 +3630,15 @@ class PyTorchModelEngine(ModelEngine):
             # to spec_metadata so downstream code (eagle3, interface, trtllm) can read it.
             spec_metadata.runtime_draft_len = self.runtime_draft_len
 
-            # Gather dynamic tree data from stable slots before target forward
+            # Fill slot-ID buffer for update_spec_dec_param
             if (spec_tree_manager is not None
                     and spec_tree_manager.use_dynamic_tree
                     and not self.is_draft_model):
-                gen_requests = list(scheduled_requests.generation_requests)
-                num_gens = len(gen_requests)
-                if num_gens > 0:
-                    gen_slot_ids, _ = spec_tree_manager.fill_gen_slot_ids(
-                        gen_requests)
-                    spec_tree_manager.gather_trees_from_slots(
-                        gen_slot_ids, num_gens)
+                spec_tree_manager.slot_storage.fill_all_slot_ids(
+                    scheduled_requests.context_requests,
+                    scheduled_requests.generation_requests,
+                    spec_tree_manager.slot_storage.dummy_slot_id,
+                )
 
             attn_metadata.update_spec_dec_param(
                 batch_size=scheduled_requests.batch_size,
@@ -3702,10 +3700,10 @@ class PyTorchModelEngine(ModelEngine):
             if (self.enable_spec_decode and spec_tree_manager is not None
                     and spec_tree_manager.use_dynamic_tree
                     and not self.is_draft_model):
-                spec_tree_manager.fill_all_slot_ids_buf_from_requests(
+                spec_tree_manager.slot_storage.fill_all_slot_ids(
                     padded_requests.context_requests,
                     padded_requests.generation_requests,
-                    spec_tree_manager._dummy_slot_id,
+                    spec_tree_manager.slot_storage.dummy_slot_id,
                 )
 
             inputs, gather_ids = self._prepare_inputs(
