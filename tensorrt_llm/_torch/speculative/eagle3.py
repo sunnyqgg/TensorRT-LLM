@@ -144,7 +144,8 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
     def free_resources(self, request: LlmRequest):
         """Clear tree validity for the freed request slot."""
         if request.py_seq_slot is not None:
-            self.spec_tree_manager.mark_tree_invalid(request.py_seq_slot)
+            self.spec_tree_manager.slot_storage.mark_invalid(
+                request.py_seq_slot)
 
     def add_dummy_requests(self, request_ids: List[int]):
         """Handle CUDA graph dummy request registration.
