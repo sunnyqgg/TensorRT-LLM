@@ -789,9 +789,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         if spec_tree_manager is not None:
             with nvtx_range("eagle3_dyn.build_dynamic_tree"):
-                # Build trees only for generation requests (skip context requests).
-                # The XQA kernel reads spec-dec params from position 0 with
-                # batch_size = num_generations, so gen trees must be at [0..num_gens-1].
+                # Build into contiguous work buffers indexed by bid (0..num_gens-1).
+                # Cannot use slotIds because padded dummies share dummy_slot_id.
                 self.tree_ops_converter.build_dynamic_tree(
                     history_draft_tokens_parent_buffer=self.history_draft_tokens_parent_buffer[
                         num_contexts:batch_size
@@ -806,10 +805,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 )
 
             with nvtx_range("eagle3_dyn.scatter_trees"):
-                # Scatter only gen trees to stable slot storage
-                gen_slots = spec_tree_manager._all_slot_ids_buf[num_contexts:batch_size]
-                spec_tree_manager.scatter_trees_to_slots(gen_slots, num_gens)
-                spec_tree_manager.mark_tree_valid(gen_slots, num_gens)
+                ss = spec_tree_manager.slot_storage
+                gen_slots = ss.all_ids_buf[num_contexts:batch_size]
+                spec_tree_manager.scatter_to_slot_storage(ss, gen_slots, num_gens)
 
         return real_draft_tokens.to(torch.int32)
 
@@ -860,17 +858,12 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 candidates[:, 0] = target_predict[:, 0]
 
             with nvtx_range("eagle3_dyn.verify.tree_validity"):
-                # Build per-request tree validity from slot storage.
-                gen_slot_ids = spec_tree_manager._all_slot_ids_buf[
-                    num_contexts : num_contexts + num_gens
-                ]
-                tree_valid = spec_tree_manager.slot_has_tree[gen_slot_ids]
+                ss = spec_tree_manager.slot_storage
+                gen_slot_ids = ss.all_ids_buf[num_contexts : num_contexts + num_gens]
+                tree_valid = ss.has_tree[gen_slot_ids]
 
             with nvtx_range("eagle3_dyn.verify.pack_retrieve"):
-                retrieve_packed = self._retrieve_packed_buf[:num_gens]
-                retrieve_packed[:, :, 0] = spec_tree_manager.retrieve_index[:num_gens]
-                retrieve_packed[:, :, 1] = spec_tree_manager.retrieve_next_token[:num_gens]
-                retrieve_packed[:, :, 2] = spec_tree_manager.retrieve_next_sibling[:num_gens]
+                retrieve_packed = ss.pack_retrieve_from_slots(gen_slot_ids, num_gens)
 
             with nvtx_range("eagle3_dyn.verify.verify_tree_greedy"):
                 _, accept_index, accept_token_num, accept_token = (
