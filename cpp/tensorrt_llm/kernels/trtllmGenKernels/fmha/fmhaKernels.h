@@ -747,23 +747,37 @@ private:
         // Check the conditions.
         if (params.mIsSpecDecTree)
         {
+            TLLM_CHECK_WITH_INFO(params.mHeadDimQk == 64 || params.mHeadDimQk == 128,
+                "Tree-based speculative decoding requires headDimQk 64 or 128");
 
-            bool isSupported = params.mNumHeadsQPerKv <= 16 && (params.mHeadDimQk == 64 || params.mHeadDimQk == 128);
-            if (isSupported)
+            // Same heuristic as Causal mask GQA selection, but use mPackedMaskMaxSeqLenQ
+            // (fixed upper bound = spec_decoding_max_generation_length) instead of mMaxSeqLenQ
+            // which varies per iteration and would cause inconsistent kernel selection.
+            // Use numHeadsQPerKv as heuristic (static model property, equivalent to
+            // Causal mask GQA with maxSeqLenQ=1). mPackedMaskMaxSeqLenQ varies across
+            // isSupported() vs run() calls, causing inconsistent kernel selection.
+            int numTokensHeadsQ = params.mNumHeadsQPerKv;
+            if (numTokensHeadsQ <= 8)
             {
-                kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-                // Only support tileSizeQ = 128 for tree-based speculative decoding.
-                tileSizeQ = 128;
+                tileSizeQ = 8;
+                kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+            }
+            else if (numTokensHeadsQ <= 16)
+            {
+                tileSizeQ = 16;
+                kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+            }
+            else if (numTokensHeadsQ <= 32)
+            {
+                tileSizeQ = 32;
+                kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
             }
             else
             {
-                TLLM_LOG_ERROR(
-                    "Tree-based speculative decoding is not supported with numHeadsQPerKv = %d and headDimQk = %d "
-                    "by TRTLLM-GEN",
-                    params.mNumHeadsQPerKv, params.mHeadDimQk);
+                // KeepsMmaAb + Custom mask cubins only exist for tileSizeQ=128.
+                tileSizeQ = 128;
+                kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
             }
-
-            // No need to select the kernel further.
             return;
         }
 
