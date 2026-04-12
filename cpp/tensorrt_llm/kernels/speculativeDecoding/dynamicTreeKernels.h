@@ -60,39 +60,6 @@ void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIn
     runtime::SizeType32 topK, runtime::SizeType32 depth, runtime::SizeType32 numDraftTokens, TreeMaskMode treeMaskMode,
     cudaStream_t stream, runtime::SizeType32 numInt32PerRow);
 
-//! \brief Verify dynamic tree using greedy strategy
-//! Verifies draft tokens against target model predictions using tree traversal.
-//! All index/token pointer parameters use int64.
-//! \param predicts output buffer [seqLensSum], on GPU. int64.
-//! Verified token predictions.
-//! \param acceptIndex output buffer [batchSize, numSpecStep], on GPU. int64.
-//! Indices of accepted tokens.
-//! \param acceptTokenNum output buffer [batchSize], on GPU. int64.
-//! Number of accepted tokens per request.
-//! \param acceptToken output buffer [batchSize, numSpecStep], on GPU. int64.
-//! Contiguous accepted token ids along the accepted path (root prediction,
-//! accepted draft predictions, bonus token). Entry count per request =
-//! acceptTokenNum + 1.
-//! \param candidates [batchSize, numDraftTokens], on GPU. int64.
-//! Candidate draft tokens.
-//! \param retrieveIndex [batchSize, numDraftTokens], on GPU. int32.
-//! Indices for retrieving tokens.
-//! \param retrieveNextToken [batchSize, numDraftTokens], on GPU. int32.
-//! Index of the first child token.
-//! \param retrieveNextSibling [batchSize, numDraftTokens], on GPU. int32.
-//! Index of the next sibling token.
-//! \param targetPredict [batchSize, numDraftTokens], on GPU. int64.
-//! Target model predictions.
-//! \param batchSize runtime::SizeType32. Batch size.
-//! \param numDraftTokens runtime::SizeType32. Total number of draft tokens.
-//! \param numSpecStep runtime::SizeType32. Number of speculative steps.
-//! \param stream cuda stream
-void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
-    int64_t* acceptToken, int64_t const* candidates, int32_t const* retrieveIndex, int32_t const* retrieveNextToken,
-    int32_t const* retrieveNextSibling, int64_t const* targetPredict, bool const* treeValid,
-    runtime::SizeType32 batchSize, runtime::SizeType32 numDraftTokens, runtime::SizeType32 numSpecStep,
-    cudaStream_t stream);
-
 void invokeVerifyDynamicTreeGreedyPacked(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
     int64_t* acceptToken, int64_t const* candidates, int32_t const* retrievePacked, int64_t const* targetPredict,
     bool const* treeValid, runtime::SizeType32 batchSize, runtime::SizeType32 numDraftTokens,
