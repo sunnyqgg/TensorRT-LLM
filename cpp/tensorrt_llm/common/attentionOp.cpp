@@ -3095,6 +3095,7 @@ int AttentionOp::initialize() noexcept
         fixedParams.multiBlockMode = mMultiBlockMode;
         fixedParams.isPagedKv = mPagedKVCache;
         fixedParams.isSpecDecoding = mIsSpecDecodingEnabled;
+        fixedParams.specDecodingMaxGenLen = mSpecDecodingMaxGenerationLength;
         fixedParams.hasAlibi = isALiBi();
         fixedParams.useTllmGenSparseAttention = useTllmGenSparseAttention();
 
