@@ -761,10 +761,15 @@ private:
             TLLM_CHECK_WITH_INFO(params.mHeadDimQk == 64 || params.mHeadDimQk == 128,
                 "Tree-based speculative decoding requires headDimQk 64 or 128");
 
-            // Same heuristic as Causal mask GQA selection (selectGqGenerationKernel).
-            // SwapsMmaAb + Custom uses groupsTokensHeadsQ=false (each CTA: 1 token × tileSizeQ heads),
-            // so numGroupedHeads = tileSizeQ (forced), independent of numHeadsQPerKv.
-            int numTokensHeadsQ = params.mNumHeadsQPerKv;
+            // Use (max_total_draft_tokens + 1) * numHeadsQPerKv as a fixed, deterministic
+            // heuristic for kernel type selection. This is consistent across isSupported(),
+            // CUDA graph warmup, and run() — avoiding kernel mismatch.
+            // mSpecDecodingMaxDraftTokens is set from the engine config (max_total_draft_tokens)
+            // and does NOT change per iteration (unlike mMaxSeqLenQ which varies with tree size).
+            int maxDraftTokens = params.mSpecDecodingMaxDraftTokens > 0
+                ? params.mSpecDecodingMaxDraftTokens + 1
+                : 1;
+            int numTokensHeadsQ = params.mNumHeadsQPerKv * maxDraftTokens;
             if (numTokensHeadsQ <= 8)
             {
                 tileSizeQ = 8;
@@ -782,7 +787,7 @@ private:
             }
             else
             {
-                // KeepsMmaAb + Custom mask cubins only exist for tileSizeQ=128.
+                // No Q64 Custom cubin (trtllm-gen Mask.h limitation). Fall through to Q128.
                 tileSizeQ = 128;
                 kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
             }

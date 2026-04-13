@@ -300,6 +300,10 @@ struct TllmGenFmhaRunnerParams
     // When cumSeqLensQPtr is set, mask is in packed layout (batch indexed via
     // cumulative offsets); otherwise padded 3D (batch indexed via fixed stride).
     int32_t mPackedMaskMaxSeqLenQ = 0;
+    // Engine-wide max draft tokens (max_total_draft_tokens) for spec-dec kernel selection.
+    // Used ONLY by selectGqGenerationKernel() to compute numTokensHeadsQ deterministically.
+    // Does NOT affect computeNumCtas() or mask preparation (those use mPackedMaskMaxSeqLenQ).
+    int32_t mSpecDecodingMaxDraftTokens = 0;
 
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)

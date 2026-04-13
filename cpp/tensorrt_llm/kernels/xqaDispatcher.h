@@ -61,6 +61,8 @@ struct XqaFixedParams
     bool isPagedKv;
     // Is speculative decoding enabled.
     bool isSpecDecoding;
+    // Max generation length for spec decoding (max_total_draft_tokens).
+    int specDecodingMaxGenLen;
     // Do we apply alibi ?
     bool hasAlibi;
 };
