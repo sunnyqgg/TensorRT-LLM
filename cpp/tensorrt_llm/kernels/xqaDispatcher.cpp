@@ -20,7 +20,6 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
-#include <algorithm>
 #include <cstdint>
 
 namespace
@@ -243,9 +242,9 @@ bool XqaDispatcher::shouldUse(XQAParams const& params)
             SHOULD_NOT_USE(
                 "Fallback to MMHA as variable attention_window_size is not supported by TRTLLM-GEN kernels.");
         }
-        if ((float(params.num_q_heads) / float(params.num_kv_heads)) > 16)
+        if ((float(params.num_q_heads) / float(params.num_kv_heads)) > 32)
         {
-            SHOULD_NOT_USE("Fallback to MMHA as num_q_heads per kv_head > 16 is not supported by TRTLLM-GEN kernels.");
+            SHOULD_NOT_USE("Fallback to MMHA as num_q_heads per kv_head > 32 is not supported by TRTLLM-GEN kernels.");
         }
 
         return true;
@@ -292,11 +291,19 @@ bool XqaDispatcher::isSupported()
         tllmRunnerParams.mNumHeadsQ = mFixedParams.numQHeads;
         tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
-        tllmRunnerParams.mNumTokensPerPage = mFixedParams.numTokensPerBlock;
+        // Align with ExportCubin: only PagedKv kernels are built with numTokensPerPage > 0.
+        // ContiguousKv must use 0 so hash matches registered cubins.
+        tllmRunnerParams.mNumTokensPerPage = mFixedParams.isPagedKv ? mFixedParams.numTokensPerBlock : 0;
         // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
         // the kernel is supported.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
         tllmRunnerParams.mAttentionWindowSize = INT_MAX;
+        // Problem size fields used by FMHA kernel selection (computeNumCtas). Must be non-zero to avoid
+        // integer divide-by-zero when mMultiCtasKvMode is true. Actual launch uses real sizes from runImpl.
+        tllmRunnerParams.mBatchSize = 1;
+        tllmRunnerParams.mMaxSeqLenQ = 1;
+        tllmRunnerParams.mMaxSeqLenKv = 1;
+        tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
 
         // Check if it is supported or not.
         auto [isSupported, info] = mTllmGenFMHARunner->isSupportedWithInfo(tllmRunnerParams);
@@ -336,19 +343,7 @@ void XqaDispatcher::runImpl(
         unsigned int beam_width = params.beam_width;
         unsigned int batch_beam_size = params.batch_size * beam_width;
 
-        KvCacheDataType cache_type{KvCacheDataType::BASE};
-        if (params.kv_cache_quant_mode.hasInt8KvCache())
-        {
-            cache_type = KvCacheDataType::INT8;
-        }
-        else if (params.kv_cache_quant_mode.hasFp8KvCache())
-        {
-            cache_type = KvCacheDataType::FP8;
-        }
-        else if (params.kv_cache_quant_mode.hasFp4KvCache())
-        {
-            cache_type = KvCacheDataType::NVFP4;
-        }
+        KvCacheDataType cache_type = cacheTypeFromQuantMode(params.kv_cache_quant_mode);
 
         XQALaunchParam<KVCacheBuffer> launchParams;
         void* inputScratch = nullptr;
@@ -381,9 +376,7 @@ void XqaDispatcher::runImpl(
         // Use the nullptr for cu_seqlens when it is not computed.
         int const* cu_seqlens{nullptr};
         int const* cu_kv_seqlens{nullptr};
-        bool const needDecoderInfo
-            = decoder_params.isBuildDecoderInfoKernelNeeded() || (params.is_spec_dec_tree && params.multi_query_tokens);
-        if (needDecoderInfo)
+        if (decoder_params.isBuildDecoderInfoKernelNeeded())
         {
             rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
             cu_seqlens = launchParams.cu_seq_lens;
@@ -485,9 +478,18 @@ void XqaDispatcher::runImpl(
         // It is used to construct contiguous kv cache TMA descriptors.
         tllmRunnerParams.mMaxSeqLenCacheKv = params.max_attention_window_size;
         tllmRunnerParams.mMaxSeqLenQ = params.generation_input_length;
-        tllmRunnerParams.mMaxSeqLenKv = (params.is_spec_dec_tree && params.multi_query_tokens)
-            ? std::max(params.max_past_kv_length, params.max_past_kv_length + params.generation_input_length)
-            : params.max_past_kv_length;
+        // For spec-dec tree, cap mMaxSeqLenQ to spec_decoding_max_generation_length.
+        // During warmup, generation_input_length may equal context length (131072),
+        // but actual draft tokens are bounded by spec_decoding_max_generation_length (~60).
+        // Without cap, SwapsMmaAb Custom mask with groupsTokensHeadsQ=false creates
+        // excessive CTAs (one per token) causing OOM during warmup.
+        if (params.is_spec_dec_tree && params.multi_query_tokens
+            && params.spec_decoding_max_generation_length > 0)
+        {
+            tllmRunnerParams.mMaxSeqLenQ
+                = std::min(tllmRunnerParams.mMaxSeqLenQ, params.spec_decoding_max_generation_length);
+        }
+        tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length;
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
         // The sliding window attention size.
         tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;

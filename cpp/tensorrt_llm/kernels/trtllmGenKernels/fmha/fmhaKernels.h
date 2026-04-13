@@ -385,6 +385,17 @@ private:
             if (!kernelMeta.mGroupsTokensHeadsQ)
             {
                 numCtasPerSeqQ = params.mMaxSeqLenQ;
+                // For spec-dec tree with groupsTokensHeadsQ=false (SwapsMmaAb Custom mask),
+                // cap numCtasPerSeqQ. During warmup, mMaxSeqLenQ may equal the context length
+                // (e.g., 131072) but actual spec-dec draft tokens are bounded by
+                // spec_decoding_max_generation_length (~60). Without cap, grid size explodes.
+                if (params.mIsSpecDecTree)
+                {
+                    int maxDraftSeqLen = params.mPackedMaskMaxSeqLenQ > 0
+                        ? params.mPackedMaskMaxSeqLenQ
+                        : 128;
+                    numCtasPerSeqQ = std::min(numCtasPerSeqQ, maxDraftSeqLen);
+                }
             }
             else
             {
@@ -750,12 +761,9 @@ private:
             TLLM_CHECK_WITH_INFO(params.mHeadDimQk == 64 || params.mHeadDimQk == 128,
                 "Tree-based speculative decoding requires headDimQk 64 or 128");
 
-            // Same heuristic as Causal mask GQA selection, but use mPackedMaskMaxSeqLenQ
-            // (fixed upper bound = spec_decoding_max_generation_length) instead of mMaxSeqLenQ
-            // which varies per iteration and would cause inconsistent kernel selection.
-            // Use numHeadsQPerKv as heuristic (static model property, equivalent to
-            // Causal mask GQA with maxSeqLenQ=1). mPackedMaskMaxSeqLenQ varies across
-            // isSupported() vs run() calls, causing inconsistent kernel selection.
+            // Same heuristic as Causal mask GQA selection (selectGqGenerationKernel).
+            // SwapsMmaAb + Custom uses groupsTokensHeadsQ=false (each CTA: 1 token × tileSizeQ heads),
+            // so numGroupedHeads = tileSizeQ (forced), independent of numHeadsQPerKv.
             int numTokensHeadsQ = params.mNumHeadsQPerKv;
             if (numTokensHeadsQ <= 8)
             {
