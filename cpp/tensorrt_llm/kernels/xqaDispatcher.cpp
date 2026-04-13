@@ -496,6 +496,17 @@ void XqaDispatcher::runImpl(
         // It is used to construct contiguous kv cache TMA descriptors.
         tllmRunnerParams.mMaxSeqLenCacheKv = params.max_attention_window_size;
         tllmRunnerParams.mMaxSeqLenQ = params.generation_input_length;
+        // For spec-dec tree, cap mMaxSeqLenQ to spec_decoding_max_generation_length.
+        // During warmup, generation_input_length may equal context length (131072),
+        // but actual draft tokens are bounded by spec_decoding_max_generation_length (~60).
+        // Without cap, SwapsMmaAb Custom mask with groupsTokensHeadsQ=false creates
+        // excessive CTAs (one per token) causing OOM during warmup.
+        if (params.is_spec_dec_tree && params.multi_query_tokens
+            && params.spec_decoding_max_generation_length > 0)
+        {
+            tllmRunnerParams.mMaxSeqLenQ
+                = std::min(tllmRunnerParams.mMaxSeqLenQ, params.spec_decoding_max_generation_length);
+        }
         tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length;
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
         // The sliding window attention size.
