@@ -3647,8 +3647,8 @@ class PyTorchModelEngine(ModelEngine):
                 is_spec_dec_dynamic_tree=spec_metadata.is_spec_dec_dynamic_tree,
                 max_draft_len=self.original_max_draft_len,
                 max_total_draft_tokens=self._spec_dec_max_total_draft_tokens,
-                is_target_model=not self.is_draft_model,
                 model_is_wrapped=self.model_is_wrapped,
+                spec_metadata=spec_metadata,
                 spec_tree_manager=spec_tree_manager)
         else:
             spec_resource_manager = None

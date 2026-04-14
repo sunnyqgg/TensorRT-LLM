@@ -376,8 +376,8 @@ class AttentionMetadata:
             is_spec_dec_dynamic_tree,
             max_draft_len,
             max_total_draft_tokens,
-            is_target_model: bool = True,
             model_is_wrapped: bool = False,
+            spec_metadata: Optional['SpecMetadata'] = None,
             spec_tree_manager: Optional['SpecTreeManager'] = None):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.

@@ -727,8 +727,6 @@ class TrtllmAttentionWrapper:
                 mla_bmm1_scale,
                 mla_bmm2_scale,
                 quant_q_buffer,
-                self.flash_mla_tile_scheduler_metadata,
-                self.flash_mla_num_splits,
             )
 
         if self.print_skip_softmax_stat:
@@ -1500,23 +1498,22 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             keeps_tile_q_per_cta = keeps_tile_q * num_instances_q
             keeps_num_tiles_q = math.ceil(
                 (seqLenQ * self.num_heads_per_kv) / keeps_tile_q_per_cta)
-            keeps_mask_size = int(
-                self.max_num_requests * keeps_num_tiles_q *
-                max_num_custom_mask_tiles_kv * num_instances_q *
-                num_instances_kv * keeps_tile_q * tile_size_kv / 32)
+            keeps_mask_size = int(self.max_num_requests * keeps_num_tiles_q *
+                                  max_num_custom_mask_tiles_kv *
+                                  num_instances_q * num_instances_kv *
+                                  keeps_tile_q * tile_size_kv / 32)
 
             # SwapsMmaAb Q8: 1 token per CTA, heads in tile, Q padded to 32
             swaps_tile_q = 8
             swaps_tile_q_padded = 32  # roundUp(8, 32)
             swaps_tile_q_per_cta = swaps_tile_q * num_instances_q
-            swaps_num_tiles_q_per_token = math.ceil(
-                self.num_heads_per_kv / swaps_tile_q_per_cta)
+            swaps_num_tiles_q_per_token = math.ceil(self.num_heads_per_kv /
+                                                    swaps_tile_q_per_cta)
             swaps_num_tiles_q = seqLenQ * swaps_num_tiles_q_per_token
             swaps_per_tile = (num_instances_q * num_instances_kv *
                               tile_size_kv * (swaps_tile_q_padded // 32))
             swaps_mask_size = int(self.max_num_requests * swaps_num_tiles_q *
-                                  max_num_custom_mask_tiles_kv *
-                                  swaps_per_tile)
+                                  max_num_custom_mask_tiles_kv * swaps_per_tile)
 
             # Allocate for the larger of the two layouts
             mask_size = max(keeps_mask_size, swaps_mask_size)
