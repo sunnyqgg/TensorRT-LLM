@@ -70,7 +70,6 @@ class AttentionMetadata:
     draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2] = None
     mapping: Optional[Mapping] = None
 
-    is_mla_enable: bool = False
     enable_flash_mla: bool = False
     enable_context_mla_with_cached_kv: bool = False
     # Whether CUDA graph is enabled.

@@ -1302,10 +1302,10 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
         draft_kv_cache_manager: Optional[Union[KVCacheManager,
                                                KVCacheManagerV2]] = None):
-        is_mla_enable = is_mla(self.model.model_config.pretrained_config)
-        enable_context_mla_with_cached_kv = is_mla_enable and (
-            self.attn_runtime_features.cache_reuse
-            or self.attn_runtime_features.chunked_prefill)
+        enable_context_mla_with_cached_kv = is_mla(
+            self.model.model_config.pretrained_config) and (
+                self.attn_runtime_features.cache_reuse
+                or self.attn_runtime_features.chunked_prefill)
         cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
         num_attention_heads = getattr(self.model.model_config.pretrained_config,
                                       'num_attention_heads', None)
@@ -1332,7 +1332,6 @@ class PyTorchModelEngine(ModelEngine):
                 kv_cache_manager=None,
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
-                is_mla_enable=is_mla_enable,
                 enable_flash_mla=self.model.model_config.enable_flash_mla,
                 enable_context_mla_with_cached_kv=
                 enable_context_mla_with_cached_kv,
@@ -1354,7 +1353,6 @@ class PyTorchModelEngine(ModelEngine):
             draft_kv_cache_manager=draft_kv_cache_manager,
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
-            is_mla_enable=is_mla_enable,
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             cache_indirection=cache_indirection,

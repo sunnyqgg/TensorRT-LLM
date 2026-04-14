@@ -1548,14 +1548,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             spec_tree_manager: Optional['SpecTreeManager'] = None, the spec_tree_manager for draft token tree.
         '''
 
-        # Disable spec decoding on Blackwell (sm100+) for MLA models
-        # (e.g. DeepSeek-V2/V3/R1). The trtllmGen FMHA kernel does not
-        # support spec-decoding with MLA's non-standard V head dimensions.
-        if is_spec_decoding_enabled and self.is_mla_enable \
-                and self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
-            is_spec_decoding_enabled = False
-
-        self.is_spec_decoding_enabled = is_spec_decoding_enabled
+        # Disable spec decoding on Blackwell (sm100+). The trtllmGen FMHA
+        # kernels do not yet support speculative decoding mode.
+        self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
+            not self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()))
 
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
         self.use_spec_decoding = self.is_spec_decoding_enabled
