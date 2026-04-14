@@ -972,6 +972,5 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
         assert text_spec == text_ref
 
 
-
 if __name__ == "__main__":
     unittest.main()
