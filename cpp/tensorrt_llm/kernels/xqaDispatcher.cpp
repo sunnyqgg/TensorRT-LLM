@@ -344,7 +344,19 @@ void XqaDispatcher::runImpl(
         unsigned int beam_width = params.beam_width;
         unsigned int batch_beam_size = params.batch_size * beam_width;
 
-        KvCacheDataType cache_type = cacheTypeFromQuantMode(params.kv_cache_quant_mode);
+        KvCacheDataType cache_type{KvCacheDataType::BASE};
+        if (params.kv_cache_quant_mode.hasInt8KvCache())
+        {
+            cache_type = KvCacheDataType::INT8;
+        }
+        else if (params.kv_cache_quant_mode.hasFp8KvCache())
+        {
+            cache_type = KvCacheDataType::FP8;
+        }
+        else if (params.kv_cache_quant_mode.hasFp4KvCache())
+        {
+            cache_type = KvCacheDataType::NVFP4;
+        }
 
         XQALaunchParam<KVCacheBuffer> launchParams;
         void* inputScratch = nullptr;
@@ -484,13 +496,15 @@ void XqaDispatcher::runImpl(
         // but actual draft tokens are bounded by spec_decoding_max_generation_length (~60).
         // Without cap, SwapsMmaAb Custom mask with groupsTokensHeadsQ=false creates
         // excessive CTAs (one per token) causing OOM during warmup.
-        if (params.is_spec_dec_tree && params.multi_query_tokens
-            && params.spec_decoding_max_generation_length > 0)
+        if (params.is_spec_dec_tree && params.multi_query_tokens && params.spec_decoding_max_generation_length > 0)
         {
             tllmRunnerParams.mMaxSeqLenQ
                 = std::min(tllmRunnerParams.mMaxSeqLenQ, params.spec_decoding_max_generation_length);
         }
-        tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length;
+        // For spec-dec tree, the KV range includes the current generation span as well.
+        tllmRunnerParams.mMaxSeqLenKv = (params.is_spec_dec_tree && params.multi_query_tokens)
+            ? std::max(params.max_past_kv_length, params.max_past_kv_length + params.generation_input_length)
+            : params.max_past_kv_length;
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
         // The sliding window attention size.
         tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;
