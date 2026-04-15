@@ -3107,6 +3107,7 @@ int AttentionOp::initialize() noexcept
         fixedParams.isPagedKv = mPagedKVCache;
         fixedParams.isSpecDecoding = mIsSpecDecodingEnabled;
         fixedParams.specDecodingMaxGenLen = mSpecDecodingMaxGenerationLength;
+        fixedParams.specDecodingTargetMaxGenLen = mSpecDecodingTargetMaxGenLen;
         fixedParams.hasAlibi = isALiBi();
         fixedParams.useTllmGenSparseAttention = useTllmGenSparseAttention();
 

@@ -73,6 +73,7 @@ void initBindings(nb::module_& m)
         nb::arg("flash_mla_num_splits") = std::nullopt, nb::arg("sage_attn_num_elts_per_blk_q") = 0,
         nb::arg("sage_attn_num_elts_per_blk_k") = 0, nb::arg("sage_attn_num_elts_per_blk_v") = 0,
         nb::arg("sage_attn_qk_int8") = false, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
+        nb::arg("spec_decoding_target_max_draft_tokens") = std::nullopt,
         "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
