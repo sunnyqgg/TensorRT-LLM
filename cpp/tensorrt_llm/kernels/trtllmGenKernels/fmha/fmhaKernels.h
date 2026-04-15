@@ -391,9 +391,7 @@ private:
                 // spec_decoding_max_generation_length (~60). Without cap, grid size explodes.
                 if (params.mIsSpecDecTree)
                 {
-                    int maxDraftSeqLen = params.mPackedMaskMaxSeqLenQ > 0
-                        ? params.mPackedMaskMaxSeqLenQ
-                        : 128;
+                    int maxDraftSeqLen = params.mPackedMaskMaxSeqLenQ > 0 ? params.mPackedMaskMaxSeqLenQ : 128;
                     numCtasPerSeqQ = std::min(numCtasPerSeqQ, maxDraftSeqLen);
                 }
             }
@@ -761,15 +759,11 @@ private:
             TLLM_CHECK_WITH_INFO(params.mHeadDimQk == 64 || params.mHeadDimQk == 128,
                 "Tree-based speculative decoding requires headDimQk 64 or 128");
 
-            // Use (max_total_draft_tokens + 1) * numHeadsQPerKv as a fixed, deterministic
-            // heuristic for kernel type selection. This is consistent across isSupported(),
-            // CUDA graph warmup, and run() — avoiding kernel mismatch.
-            // mSpecDecodingMaxDraftTokens is set from the engine config (max_total_draft_tokens)
-            // and does NOT change per iteration (unlike mMaxSeqLenQ which varies with tree size).
-            int maxDraftTokens = params.mSpecDecodingMaxDraftTokens > 0
-                ? params.mSpecDecodingMaxDraftTokens + 1
-                : 1;
-            int numTokensHeadsQ = params.mNumHeadsQPerKv * maxDraftTokens;
+            // Use mSpecDecodingTargetMaxGenLen (= max_total_draft_tokens + 1, from config)
+            // for deterministic kernel type selection. This value is fixed at init time
+            // and does NOT depend on tensor shapes at runtime.
+            int maxGenLen = params.mSpecDecodingTargetMaxGenLen > 0 ? params.mSpecDecodingTargetMaxGenLen : 1;
+            int numTokensHeadsQ = params.mNumHeadsQPerKv * maxGenLen;
             if (numTokensHeadsQ <= 8)
             {
                 tileSizeQ = 8;

@@ -727,6 +727,8 @@ class TrtllmAttentionWrapper:
                 mla_bmm1_scale,
                 mla_bmm2_scale,
                 quant_q_buffer,
+                self.max_total_draft_tokens if hasattr(
+                    self, 'max_total_draft_tokens') else None,
             )
 
         if self.print_skip_softmax_stat:
@@ -1565,6 +1567,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.use_spec_decoding = self.is_spec_decoding_enabled
         self.is_spec_dec_tree = is_spec_dec_tree
         self.is_spec_dec_dynamic_tree = is_spec_dec_dynamic_tree
+        self.max_total_draft_tokens = max_total_draft_tokens
 
         # Parameters can be fixed and not changed during runtime if the
         if self.is_spec_decoding_enabled:

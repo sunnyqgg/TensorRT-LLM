@@ -2971,6 +2971,7 @@ int AttentionOp::initialize() noexcept
         fixedParams.isPagedKv = mPagedKVCache;
         fixedParams.isSpecDecoding = mIsSpecDecodingEnabled;
         fixedParams.specDecodingMaxGenLen = mSpecDecodingMaxGenerationLength;
+        fixedParams.specDecodingTargetMaxGenLen = mSpecDecodingTargetMaxGenLen;
         fixedParams.hasAlibi = isALiBi();
 
         mXqaDispatcher.reset(new XqaDispatcher(fixedParams));
