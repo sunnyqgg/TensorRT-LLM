@@ -232,13 +232,13 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         # Pre-allocated 2D buffers
         self.draft_tokens_buffer = torch.zeros(
-            max_batch_size, loop_max_tokens, dtype=torch.int64, device="cuda"
+            max_batch_size, loop_max_tokens, dtype=torch.int32, device="cuda"
         )
         self.position_ids_buffer = torch.zeros(
-            max_batch_size, loop_max_tokens, dtype=torch.int64, device="cuda"
+            max_batch_size, loop_max_tokens, dtype=torch.int32, device="cuda"
         )
         self.history_draft_tokens_buffer = torch.zeros(
-            (max_batch_size, (K + K * K * (max_draft_len - 1))), dtype=torch.int64, device="cuda"
+            (max_batch_size, (K + K * K * (max_draft_len - 1))), dtype=torch.int32, device="cuda"
         )
         self.history_score_buffer = torch.zeros(
             (max_batch_size, K + K * K * (max_draft_len - 1)), dtype=torch.float32, device="cuda"
@@ -317,9 +317,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         # Step 0 input buffers
         max_total_tokens = max_batch_size * tokens_per_gen_step
-        self._step0_input_ids_buf = torch.zeros(max_total_tokens, dtype=torch.int64, device="cuda")
+        self._step0_input_ids_buf = torch.zeros(max_total_tokens, dtype=torch.int32, device="cuda")
         self._step0_position_ids_buf = torch.zeros(
-            max_total_tokens, dtype=torch.int64, device="cuda"
+            max_total_tokens, dtype=torch.int32, device="cuda"
         )
         self._step0_hidden_states_buf = None
         self._gather_ids_buf = torch.zeros(max_total_tokens, dtype=torch.long, device="cuda")
@@ -382,6 +382,12 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         # Write packed data to beginning of flat buffer (no overlap)
         flat = mask_buf.view(-1)
         flat[:total_elems] = scratch.view(-1)
+
+    def _get_compact_packed_mask_view(self, mask_buf, n_req, n_tok):
+        """Return a compact view matching the backend's packed 1D layout."""
+        actual_mask_width = math.ceil(n_tok / 32)
+        total_elems = n_req * n_tok * actual_mask_width
+        return mask_buf.view(-1)[:total_elems].view(n_req, n_tok, actual_mask_width)
 
     @nvtx_range("eagle3_dyn._ensure_spec_tree_manager")
     def _ensure_spec_tree_manager(self, resource_manager):
@@ -658,14 +664,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             attn_metadata.position_offsets_stride = _buf_dim
             attn_metadata.position_offsets_query_len = num_step0_tokens
 
-            attn_metadata.spec_decoding_packed_mask[:num_gens].fill_(0)
-            attn_metadata.spec_decoding_packed_mask[:num_gens, :num_step0_tokens, 0] = (
-                self._step0_causal_mask[:num_step0_tokens]
-            )
-            # Repack mask from padded 3D to packed 1D layout.
-            self._repack_mask_padded_to_packed(
+            compact_mask = self._get_compact_packed_mask_view(
                 attn_metadata.spec_decoding_packed_mask, num_gens, num_step0_tokens
             )
+            compact_mask.zero_()
+            compact_mask[:, :, 0] = self._step0_causal_mask[:num_step0_tokens]
 
         attn_metadata.use_spec_decoding = num_gens > 0
 
@@ -734,11 +737,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                         inp_hs = self._accumulated_hs[:batch_size, :num_tokens_per_req, :].reshape(
                             num_infer_tokens, -1
                         )
-                        inp_ids = (
-                            self.draft_tokens_buffer[:batch_size, :num_tokens_per_req]
-                            .reshape(-1)
-                            .to(torch.int32)
-                        )
+                        inp_ids = self.draft_tokens_buffer[
+                            :batch_size, :num_tokens_per_req
+                        ].reshape(-1)
                         inp_pos = self.position_ids_buffer[
                             :batch_size, :num_tokens_per_req
                         ].reshape(-1)
@@ -1004,11 +1005,13 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         batch_size = attn_metadata.num_seqs
         num_tokens_current_layer = self.K * (cur_draft_idx + 1)
         num_tokens_previous_layer = self.K * cur_draft_idx
+        compact_mask = self._get_compact_packed_mask_view(
+            attn_metadata.spec_decoding_packed_mask, batch_size, num_tokens_current_layer
+        )
         if cur_draft_idx == 0:
-            attn_metadata.spec_decoding_packed_mask.fill_(0)
             spec_tree_manager.compute_spec_dec_packed_mask(
                 self.tree_mask_init_buffer[:batch_size],
-                attn_metadata.spec_decoding_packed_mask[:batch_size],
+                compact_mask,
             )
             self.tree_mask_buffer[
                 : batch_size * num_tokens_current_layer * num_tokens_current_layer
@@ -1045,9 +1048,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 self.K,
             )
 
-            spec_tree_manager.compute_spec_dec_packed_mask(
-                current_mask, attn_metadata.spec_decoding_packed_mask[:batch_size]
-            )
+            spec_tree_manager.compute_spec_dec_packed_mask(current_mask, compact_mask)
             self.tree_mask_buffer[
                 : batch_size * num_tokens_current_layer * num_tokens_current_layer
             ].copy_(current_mask.reshape(-1))
@@ -1058,13 +1059,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             attn_metadata.spec_decoding_position_offsets[:cur_total] = new_positions.reshape(-1)
             attn_metadata.position_offsets_stride = _buf_dim
             attn_metadata.position_offsets_query_len = num_tokens_current_layer
-
-        # Repack mask from padded 3D to packed 1D layout.  Both Hopper
-        # XQA (cuQSeqLens) and Blackwell prepareCustomMask (cumSeqLensQ)
-        # now consume the same packed layout.
-        self._repack_mask_padded_to_packed(
-            attn_metadata.spec_decoding_packed_mask, batch_size, num_tokens_current_layer
-        )
 
     def prepare_for_generation(
         self,

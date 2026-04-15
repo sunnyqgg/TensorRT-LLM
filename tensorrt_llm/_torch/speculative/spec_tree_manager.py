@@ -457,13 +457,21 @@ class SpecTreeManager:
 
         # Use cached bit weights
         weights = self._pack_weights
+        src = mask_matrix if mask_matrix.dtype == torch.int32 else mask_matrix.to(
+            torch.int32)
+
+        if num_blocks == 1 and num_tokens_attend <= 32:
+            result = self._pack_result_buf[:bs, :num_tokens, :1]
+            torch.sum(src * weights[:num_tokens_attend],
+                      dim=-1,
+                      out=result[:, :, 0])
+            packed_mask[:, :num_tokens, :1] = result
+            return packed_mask
 
         # Pad into pre-allocated buffer
         total_bits = num_blocks * 32
         padded_m = self._padded_mask_buf[:bs, :num_tokens, :total_bits]
         padded_m.zero_()
-        src = mask_matrix if mask_matrix.dtype == torch.int32 else mask_matrix.to(
-            torch.int32)
         padded_m[:, :, :num_tokens_attend].copy_(src)
 
         # Reshape last dim into [num_blocks, 32] for blocked packing
