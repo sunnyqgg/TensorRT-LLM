@@ -166,6 +166,7 @@ class TrtllmAttentionWrapper:
         # Default disabled, but allow manual enabling through `TRTLLM_PRINT_SKIP_SOFTMAX_STAT=1`
         self.print_skip_softmax_stat = os.environ.get(
             "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
+        self.max_total_draft_tokens = None
 
     def update_quant_config(self, quant_config: Optional[QuantConfig] = None):
         quant_config = quant_config or QuantConfig()
@@ -245,6 +246,7 @@ class TrtllmAttentionWrapper:
         helix_is_inactive_rank: Optional[torch.Tensor] = None,
         quant_config: Optional[QuantConfig] = None,
         kv_cache_manager: Optional[KVCacheManager] = None,
+        max_total_draft_tokens: Optional[int] = None,
         **kwargs,
     ):
         """
@@ -356,6 +358,8 @@ class TrtllmAttentionWrapper:
         self.skip_softmax_threshold_scale_factor_decode = skip_softmax_threshold_scale_factor_decode
         self.quant_config = quant_config
         self.kv_cache_manager = kv_cache_manager
+        if max_total_draft_tokens is not None:
+            self.max_total_draft_tokens = max_total_draft_tokens
         self.kwargs.update(kwargs)
 
     def create_output(
@@ -2097,6 +2101,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
             use_spec_decoding=metadata.use_spec_decoding,
             is_spec_dec_tree=metadata.is_spec_dec_tree,
+            max_total_draft_tokens=getattr(metadata, 'max_total_draft_tokens',
+                                           None),
             spec_decoding_position_offsets=self.
             _reshape_position_offsets_for_cpp(metadata),
             spec_decoding_packed_mask=metadata.spec_decoding_packed_mask,
