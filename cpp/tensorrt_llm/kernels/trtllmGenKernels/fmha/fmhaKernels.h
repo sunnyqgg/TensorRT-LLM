@@ -774,14 +774,16 @@ private:
                 tileSizeQ = 16;
                 kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
             }
-            else if (numTokensHeadsQ <= 32)
+            else if (numTokensHeadsQ <= 64)
             {
+                // Q64 Custom KeepsMmaAb is not feasible (Mask.h requires .32dp32bit MMA
+                // but bf16/fp16 use .16dp32bit). Use SwapsMmaAb Q32 with 2 CTAs along Q
+                // instead — better parallelism and equivalent precision.
                 tileSizeQ = 32;
                 kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
             }
             else
             {
-                // No Q64 Custom cubin (trtllm-gen Mask.h limitation). Fall through to Q128.
                 tileSizeQ = 128;
                 kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
             }
