@@ -220,15 +220,15 @@ void launchComputeCustomMaskOffsetsKernel(
 
     int32_t batchSize = runnerParams.mBatchSize;
 
-    unsigned long long* d_globalCounter;
-    cudaMallocAsync(&d_globalCounter, sizeof(unsigned long long), stream);
+    // Use the extra slot at customMaskOffsetsPtr[batchSize] as the atomic counter.
+    // This avoids cudaMallocAsync/cudaFreeAsync which are not CUDA-graph-capturable.
+    unsigned long long* d_globalCounter
+        = reinterpret_cast<unsigned long long*>(&runnerParams.customMaskOffsetsPtr[batchSize]);
     cudaMemsetAsync(d_globalCounter, 0, sizeof(unsigned long long), stream);
 
     int blockSize = 128;
     int gridSize = (batchSize + blockSize - 1) / blockSize;
     computeCustomMaskOffsetsKernel<<<gridSize, blockSize, 0, stream>>>(kernelMeta, runnerParams, d_globalCounter);
-
-    cudaFreeAsync(d_globalCounter, stream);
 }
 
 // Post-processing kernel to write adjusted firstSparseMaskOffsetsKv after all work is done
@@ -406,22 +406,17 @@ __global__ void prepareCustomMaskBuffersKernelForSwapsMmaAb(
             int32_t const tokenIdxInTileQ = (customMaskTokenIdxQ % tileSizeQPerCta) % tileSizeQ;
 
             // Fmha.cpp:288-294: tile/inst offset (same for KeepsMmaAb and SwapsMmaAb)
-            int64_t const tileOffset
-                = static_cast<int64_t>(tileIdxQ) * numCustomMaskTilesKv + tileIdxKv;
-            int64_t const instOffset
-                = tileOffset * numInstsQ * numInstsKv + (instIdxQ * numInstsKv + instIdxKv);
+            int64_t const tileOffset = static_cast<int64_t>(tileIdxQ) * numCustomMaskTilesKv + tileIdxKv;
+            int64_t const instOffset = tileOffset * numInstsQ * numInstsKv + (instIdxQ * numInstsKv + instIdxKv);
             int64_t maskOffset = instOffset * tileSizeQ * tileSizeKv;
 
             // Fmha.cpp:297-316: SwapsMmaAb LDTM 16dp.256bit permutation
             int32_t const tokenIdxInTileKv = kvInTile;
             int32_t const threadIdxQ = (tokenIdxInTileQ % 8) / 2;
-            int32_t const threadIdxKv
-                = (tokenIdxInTileKv % 8) + (tokenIdxInTileKv / 32) * 8;
+            int32_t const threadIdxKv = (tokenIdxInTileKv % 8) + (tokenIdxInTileKv / 32) * 8;
             int32_t const tokenIdxInWarpTileKv = tokenIdxInTileKv % 32;
-            int32_t const eltIdxInThread = (tokenIdxInTileQ % 2)
-                + ((tokenIdxInWarpTileKv / 8) % 2) * 2
-                + (tokenIdxInTileQ / 8) * 4
-                + (tokenIdxInWarpTileKv / 16) * 4 * (tileSizeQRaw / 8);
+            int32_t const eltIdxInThread = (tokenIdxInTileQ % 2) + ((tokenIdxInWarpTileKv / 8) % 2) * 2
+                + (tokenIdxInTileQ / 8) * 4 + (tokenIdxInWarpTileKv / 16) * 4 * (tileSizeQRaw / 8);
             maskOffset += (threadIdxKv * 4 + threadIdxQ) * 32 + eltIdxInThread;
 
             // Fmha.cpp:318-322: set bit in uint32
@@ -525,16 +520,16 @@ void launchComputeCustomMaskOffsetsKernelForSwapsMmaAb(
 {
     int32_t batchSize = runnerParams.mBatchSize;
 
-    unsigned long long* d_globalCounter;
-    cudaMallocAsync(&d_globalCounter, sizeof(unsigned long long), stream);
+    // Use the extra slot at customMaskOffsetsPtr[batchSize] as the atomic counter.
+    // This avoids cudaMallocAsync/cudaFreeAsync which are not CUDA-graph-capturable.
+    unsigned long long* d_globalCounter
+        = reinterpret_cast<unsigned long long*>(&runnerParams.customMaskOffsetsPtr[batchSize]);
     cudaMemsetAsync(d_globalCounter, 0, sizeof(unsigned long long), stream);
 
     int blockSize = 128;
     int gridSize = (batchSize + blockSize - 1) / blockSize;
     computeCustomMaskOffsetsKernelForSwapsMmaAb<<<gridSize, blockSize, 0, stream>>>(
         kernelMeta, runnerParams, d_globalCounter);
-
-    cudaFreeAsync(d_globalCounter, stream);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

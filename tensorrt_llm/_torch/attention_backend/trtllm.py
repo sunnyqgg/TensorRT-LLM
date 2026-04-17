@@ -1470,8 +1470,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Uses persistent buffers (only allocate if None) for CUDA graph compatibility.
         """
         if self.spec_decoding_bl_tree_mask_offset is None:
+            # +1: extra slot at the end used as atomic counter in prepareCustomMask.cu
+            # (replaces cudaMallocAsync which is not CUDA-graph-capturable)
             self.spec_decoding_bl_tree_mask_offset = torch.zeros(
-                [self.max_num_requests],
+                [self.max_num_requests + 1],
                 dtype=torch.int64,
                 device='cuda',
             )
