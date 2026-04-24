@@ -612,7 +612,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             inputs, attn_metadata, spec_metadata, draft_model,
             draft_kv_cache_manager, num_contexts, num_gens, batch_size,
             num_accepted_tokens, original_all_rank_num_tokens, resource_manager)
-
         # restore attn_metadata to support cuda graph
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
         # restore all_rank_num_tokens for attention DP
@@ -691,6 +690,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     **inputs)
 
                 # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
+                # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,
+                # then the following step can use regular decoding mode to generate 1 tokens per step.
+                # Currently the spec-dec mask for chained tree is not implemented yet.
+                # When token tree is supported, this can be removed and all steps may use spec-dec mode as well.
                 attn_metadata.use_spec_decoding = False
 
                 logits = draft_model.logits_processor(hidden_states[gather_ids],
@@ -704,11 +707,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
                 new_draft_token = self.draft_decoder(logits, draft_model)
                 next_draft_tokens.append(new_draft_token)
-
                 # update inputs
                 hidden_states = hidden_states_to_save[gather_ids]
                 position_ids = inputs["position_ids"][gather_ids] + 1
-
                 # update attn_metadata
                 if i == 0:
                     attn_metadata._seq_lens[:batch_size].fill_(1)
@@ -727,7 +728,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         attn_metadata.kv_lens_cuda[:num_contexts] += 1
                 elif hasattr(attn_metadata, 'kv_lens_cuda'):
                     attn_metadata.kv_lens_cuda[:batch_size] += 1
-
                 # support attention dp
                 inputs = {
                     "input_ids": new_draft_token,
@@ -736,7 +736,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     "attn_metadata": attn_metadata,
                     "spec_metadata": spec_metadata,
                 }
-
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # Override with SA draft tokens after all draft layers have run,
