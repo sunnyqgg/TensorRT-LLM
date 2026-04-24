@@ -1692,13 +1692,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                        1).to(torch.int32)
 
                     total = mdl1 * batch_size
-                    self.spec_decoding_position_offsets.reshape(
-                        -1)[:total].copy_(
-                            self._drafter0_pos_pattern.repeat(batch_size),
-                            non_blocking=True)
-                    self.spec_decoding_packed_mask.reshape(-1)[:total].copy_(
-                        self._drafter0_mask_pattern.repeat(batch_size),
-                        non_blocking=True)
+                    pos_dst = self.spec_decoding_position_offsets.reshape(
+                        -1)[:total].view(batch_size, mdl1)
+                    pos_dst.copy_(
+                        self._drafter0_pos_pattern.unsqueeze(0).expand(
+                            batch_size, -1))
+                    mask_dst = self.spec_decoding_packed_mask.reshape(
+                        -1)[:total].view(batch_size, mdl1)
+                    mask_dst.copy_(
+                        self._drafter0_mask_pattern.unsqueeze(0).expand(
+                            batch_size, -1))
                     self.generate_spec_decoding_generation_length(
                         runtime_draft_len=max_draft_len)
                     if (self.spec_decoding_position_offsets is not None

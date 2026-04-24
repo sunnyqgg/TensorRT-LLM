@@ -44,12 +44,6 @@ class DynamicTreeSlotStorage:
         self.all_ids_buf = torch.zeros(num_slots,
                                        dtype=torch.long,
                                        device='cuda')
-        self._gen_ids_buf = torch.zeros(num_slots,
-                                        dtype=torch.long,
-                                        device='cuda')
-        self._pin_gen = torch.empty(num_slots,
-                                    dtype=torch.long,
-                                    pin_memory=prefer_pinned())
         self._pin_batch = torch.empty(num_slots,
                                       dtype=torch.long,
                                       pin_memory=prefer_pinned())
@@ -57,23 +51,9 @@ class DynamicTreeSlotStorage:
                                            dtype=torch.int32,
                                            device='cuda')
 
-    def fill_gen_slot_ids(self, gen_requests):
-        """Fill _gen_ids_buf; return (buf[:count], count)."""
-        dummy = self.dummy_slot_id
-        pin = self._pin_gen
-        count = 0
-        for r in gen_requests:
-            pin[count] = r.py_seq_slot if r.py_seq_slot is not None else dummy
-            count += 1
-        if count == 0:
-            return self._gen_ids_buf[:0], 0
-        buf = self._gen_ids_buf
-        buf[:count].copy_(pin[:count], non_blocking=True)
-        return buf[:count], count
-
-    def fill_all_slot_ids(self, context_requests, generation_requests,
-                          dummy_slot: int):
+    def fill_all_slot_ids(self, context_requests, generation_requests):
         """Fill all_ids_buf for full batch [ctx | gen] via one HtoD copy."""
+        dummy_slot = self.dummy_slot_id
         pin = self._pin_batch
         idx = 0
         for req in context_requests:

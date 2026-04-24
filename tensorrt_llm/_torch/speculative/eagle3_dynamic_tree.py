@@ -283,11 +283,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._target_predict_buf = torch.zeros(
             max_batch_size, tokens_per_gen_step, dtype=torch.int32, device="cuda"
         )
-        # Pre-allocated buffer for retrieve_packed (avoids torch.stack allocation per verify)
-        self._retrieve_packed_buf = torch.zeros(
-            max_batch_size, tokens_per_gen_step, 3, dtype=torch.int32, device="cuda"
-        )
-
         # Step 0 input buffers
         max_total_tokens = max_batch_size * tokens_per_gen_step
         self._step0_input_ids_buf = torch.zeros(max_total_tokens, dtype=torch.int32, device="cuda")
@@ -296,16 +291,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
         self._step0_hidden_states_buf = None
         self._gather_ids_buf = torch.zeros(max_total_tokens, dtype=torch.long, device="cuda")
-        self._current_mask_buf = torch.zeros(
-            max_batch_size,
-            loop_max_tokens,
-            loop_max_tokens,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        self._new_pos_offset_buf = torch.zeros(
-            max_batch_size, loop_max_tokens, dtype=torch.int32, device="cuda"
-        )
 
     def _get_compact_packed_mask_view(self, mask_buf, n_req, n_tok):
         """Return a compact view matching the backend's packed 1D layout."""
@@ -572,9 +557,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         # Step-0 causal spec-dec (None in prefill-only warmup).
         if attn_metadata.spec_decoding_generation_lengths is not None:
             total = num_gens * num_step0_tokens
-            attn_metadata.spec_decoding_position_offsets[:total] = self._causal_offs[
-                :num_step0_tokens
-            ].repeat(num_gens)
+            dst = attn_metadata.spec_decoding_position_offsets[:total].view(
+                num_gens, num_step0_tokens)
+            dst.copy_(self._causal_offs[:num_step0_tokens].unsqueeze(0).expand(
+                num_gens, -1))
             self._apply_spec_metadata(attn_metadata, num_gens, num_step0_tokens)
 
             compact_mask = self._get_compact_packed_mask_view(

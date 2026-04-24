@@ -3776,7 +3776,6 @@ class PyTorchModelEngine(ModelEngine):
                 spec_tree_manager.slot_storage.fill_all_slot_ids(
                     scheduled_requests.context_requests,
                     scheduled_requests.generation_requests,
-                    spec_tree_manager.slot_storage.dummy_slot_id,
                 )
 
             attn_metadata.update_spec_dec_param(
@@ -3842,7 +3841,6 @@ class PyTorchModelEngine(ModelEngine):
                 spec_tree_manager.slot_storage.fill_all_slot_ids(
                     padded_requests.context_requests,
                     padded_requests.generation_requests,
-                    spec_tree_manager.slot_storage.dummy_slot_id,
                 )
 
             inputs, gather_ids = self._prepare_inputs(
