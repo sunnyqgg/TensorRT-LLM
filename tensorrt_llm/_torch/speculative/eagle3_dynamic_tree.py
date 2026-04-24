@@ -81,13 +81,15 @@ def _build_mask_and_position(
     K: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused mask + position offset build for draft steps 1+."""
-    B, prev_n, _ = parent_mask.shape
-    cur_n = prev_n + K
-    parent_sel = torch.gather(
+    batch_size, num_tokens_previous_layer, _ = parent_mask.shape
+    num_tokens_current_layer = num_tokens_previous_layer + K
+    parent_mask_selected = torch.gather(
         parent_mask[:, -K:, :], 1,
-        selected_parents.unsqueeze(-1).expand(B, K, prev_n))
-    padding = parent_mask.new_zeros(B, prev_n, cur_n)
-    bottom = torch.cat([parent_sel, tree_mask_init], dim=2)
+        selected_parents.unsqueeze(-1).expand(
+            batch_size, K, num_tokens_previous_layer))
+    padding = parent_mask.new_zeros(
+        batch_size, num_tokens_previous_layer, num_tokens_current_layer)
+    bottom = torch.cat([parent_mask_selected, tree_mask_init], dim=2)
     current_mask = torch.cat([padding, bottom], dim=1)
     new_positions = torch.cat(
         [previous_position_offsets, previous_position_offsets[:, -K:] + 1],
@@ -312,9 +314,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             max_batch_size * buf_dim * mask_width, dtype=torch.int32, device="cuda"
         )
 
-        # Both Hopper XQA and Blackwell prepareCustomMask now consume the
-        # same packed 1D mask layout (indexed via cumSeqLens / cumSeqLensQ).
-        # _needs_mask_repack is kept True unconditionally.
         self._needs_mask_repack = True
 
     def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
@@ -331,10 +330,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             return
 
         total_elems = n_req * n_tok * actual_mask_width
-        # Copy valid rows and columns to pre-allocated scratch buffer
         scratch = self._mask_repack_buf[:total_elems].view(n_req, n_tok, actual_mask_width)
         scratch.copy_(mask_buf[:n_req, :n_tok, :actual_mask_width])
-        # Write packed data to beginning of flat buffer (no overlap)
         flat = mask_buf.view(-1)
         flat[:total_elems] = scratch.view(-1)
 
@@ -596,8 +593,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             # Gen kernel uses base data_ptr (no num_contexts offset); fill rows [:num_gens].
             attn_metadata.spec_decoding_generation_lengths[:num_gens].fill_(num_step0_tokens)
 
-            # C++ kernel indexes with stride = input_seq_length (= num_step0_tokens),
-            # NOT buf_dim. Write data flat/compact with actual token stride.
+            # C++ kernel uses stride = num_step0_tokens (not buf_dim): write data flat/compact.
             _buf_dim = (
                 attn_metadata.spec_decoding_position_offsets.numel()
                 // attn_metadata.max_num_requests
