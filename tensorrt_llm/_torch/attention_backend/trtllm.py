@@ -1905,16 +1905,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     @staticmethod
     def _reshape_position_offsets_for_cpp(metadata):
-        """Reshape 1D spec-dec position offsets to 2D for C++ kernel.
-
-        Packed layout: request ``i`` occupies ``[i * q, (i+1) * q)`` in the
-        flat buffer, where ``q = position_offsets_query_len`` (actual Q length:
-        ``n_dt`` for dynamic-tree verify, ``max_draft_len+1`` for drafter, etc.).
-
-        The underlying allocation may be ``max_num_requests * buf_dim`` with
-        ``q <= buf_dim``; viewing as ``(max_num_requests, buf_dim)`` misaligns
-        batch rows when ``q < buf_dim`` and must not be used for thop.
-        """
+        """Reshape 1D spec-dec position offsets to (num_requests, query_len) for C++."""
         offsets = metadata.spec_decoding_position_offsets
         if offsets is None or offsets.dim() != 1:
             return offsets
