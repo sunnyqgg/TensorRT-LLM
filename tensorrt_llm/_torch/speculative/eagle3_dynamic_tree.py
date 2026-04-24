@@ -80,60 +80,28 @@ def _build_mask_and_position(
     previous_position_offsets: torch.Tensor,
     K: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused mask building + position offset computation for draft steps 1+.
-
-    Replaces multiple small kernel launches (zero_, gather, copy_, add) with
-    a single compiled graph.
-    """
-    batch_size = parent_mask.shape[0]
-    num_tokens_previous_layer = parent_mask.shape[1]
-    num_tokens_current_layer = num_tokens_previous_layer + K
-
-    # Gather parent mask rows for selected parents
-    selected_parents_expanded = selected_parents.unsqueeze(-1).expand(
-        batch_size, K, num_tokens_previous_layer
-    )
-    parent_mask_selected = torch.gather(
-        parent_mask[:, -K:, :], dim=1, index=selected_parents_expanded
-    )
-
-    # Build current_mask: [batch, num_tokens_current_layer, num_tokens_current_layer]
-    # Top rows: zeros padding
-    padding = torch.zeros(
-        batch_size,
-        num_tokens_previous_layer,
-        num_tokens_current_layer,
-        dtype=parent_mask.dtype,
-        device=parent_mask.device,
-    )
-    # Bottom rows: [parent_mask_selected | tree_mask_init]
-    bottom = torch.cat([parent_mask_selected, tree_mask_init], dim=2)
+    """Fused mask + position offset build for draft steps 1+."""
+    B, prev_n, _ = parent_mask.shape
+    cur_n = prev_n + K
+    parent_sel = torch.gather(
+        parent_mask[:, -K:, :], 1,
+        selected_parents.unsqueeze(-1).expand(B, K, prev_n))
+    padding = parent_mask.new_zeros(B, prev_n, cur_n)
+    bottom = torch.cat([parent_sel, tree_mask_init], dim=2)
     current_mask = torch.cat([padding, bottom], dim=1)
-
-    # Position offsets: copy previous + append (parent_last_K + 1)
     new_positions = torch.cat(
         [previous_position_offsets, previous_position_offsets[:, -K:] + 1],
-        dim=1,
-    )
-
+        dim=1)
     return current_mask, new_positions
 
 
 @torch.compile(options={"max-autotune": True})
-def _gather_parent_hs(
-    hs_write_buffer: torch.Tensor,
-    read_idx: torch.Tensor,
-) -> torch.Tensor:
-    """Fused gather of parent hidden states.
-
-    Replaces gather(...unsqueeze...expand...) with a single compiled graph.
-    """
+def _gather_parent_hs(hs_write_buffer: torch.Tensor,
+                      read_idx: torch.Tensor) -> torch.Tensor:
+    """Fused gather of parent hidden states."""
     hs_dim = hs_write_buffer.shape[2]
-    return torch.gather(
-        hs_write_buffer,
-        1,
-        read_idx.unsqueeze(-1).expand(-1, -1, hs_dim),
-    )
+    return torch.gather(hs_write_buffer, 1,
+                        read_idx.unsqueeze(-1).expand(-1, -1, hs_dim))
 
 
 @triton.jit
