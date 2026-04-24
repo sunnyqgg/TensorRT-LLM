@@ -860,12 +860,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
     is_spec_dec_dynamic_tree: bool = False
 
-    # Row width (stride) of the 1D spec_decoding_position_offsets buffer.
-    # Set by each writer so readers can reshape without GPU→CPU sync.
+    # Row stride of the 1D spec_decoding_position_offsets buffer.
     position_offsets_stride: int = 0
-    # Per-request token count used when packing 1D offsets (n_dt, step0 length,
-    # K*(layer+1), etc.). C++ indexes as batch_idx * input_seq_length + token;
-    # input_seq_length must match this, not position_offsets_stride (buf_dim).
+    # Per-request token count used as C++ input_seq_length (may differ from stride).
     position_offsets_query_len: int = 0
 
     # parameters required for spec-dec mode
