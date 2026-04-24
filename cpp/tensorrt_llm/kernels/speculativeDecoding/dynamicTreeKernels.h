@@ -60,8 +60,8 @@ void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIn
     runtime::SizeType32 topK, runtime::SizeType32 depth, runtime::SizeType32 numDraftTokens, TreeMaskMode treeMaskMode,
     cudaStream_t stream, runtime::SizeType32 numInt32PerRow);
 
-void invokeVerifyDynamicTreeGreedyPacked(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
-    int64_t* acceptToken, int64_t const* candidates, int32_t const* retrievePacked, int64_t const* targetPredict,
+void invokeVerifyDynamicTreeGreedyPacked(int32_t* predicts, int32_t* acceptIndex, int32_t* acceptTokenNum,
+    int32_t* acceptToken, int32_t const* candidates, int32_t const* retrievePacked, int32_t const* targetPredict,
     bool const* treeValid, runtime::SizeType32 batchSize, runtime::SizeType32 numDraftTokens,
     runtime::SizeType32 numSpecStep, cudaStream_t stream);
 

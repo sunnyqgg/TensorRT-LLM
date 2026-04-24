@@ -266,8 +266,8 @@ void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIn
 
 //! retrievePacked layout [bs, numDraftTokens, 3] int32 row-major:
 //! [b,n,0]=retrieveIndex, [b,n,1]=retrieveNextToken, [b,n,2]=retrieveNextSibling
-__global__ void verifyDynamicTreeGreedyPackedKernel(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
-    int64_t* acceptToken, int64_t const* candidates, int32_t const* retrievePacked, int64_t const* targetPredict,
+__global__ void verifyDynamicTreeGreedyPackedKernel(int32_t* predicts, int32_t* acceptIndex, int32_t* acceptTokenNum,
+    int32_t* acceptToken, int32_t const* candidates, int32_t const* retrievePacked, int32_t const* targetPredict,
     bool const* treeValid, uint32_t batchSize, uint32_t numSpeculativeTokens, uint32_t numDraftTokens)
 {
     uint32_t bx = blockIdx.x;
@@ -297,8 +297,8 @@ __global__ void verifyDynamicTreeGreedyPackedKernel(int64_t* predicts, int64_t* 
         while (curIndex >= 0 && static_cast<uint32_t>(curIndex) < numDraftTokens)
         {
             int32_t draftLocalIdx = row[static_cast<size_t>(curIndex) * 3];
-            int64_t draftTokenId = candidates[batchOffset + curIndex];
-            int64_t targetTokenId = targetPredict[batchOffset + lastAcceptedLocalIdx];
+            int32_t draftTokenId = candidates[batchOffset + curIndex];
+            int32_t targetTokenId = targetPredict[batchOffset + lastAcceptedLocalIdx];
 
             if (draftTokenId == targetTokenId)
             {
@@ -323,8 +323,8 @@ __global__ void verifyDynamicTreeGreedyPackedKernel(int64_t* predicts, int64_t* 
     predicts[batchOffset + lastAcceptedLocalIdx] = targetPredict[batchOffset + lastAcceptedLocalIdx];
 }
 
-void invokeVerifyDynamicTreeGreedyPacked(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
-    int64_t* acceptToken, int64_t const* candidates, int32_t const* retrievePacked, int64_t const* targetPredict,
+void invokeVerifyDynamicTreeGreedyPacked(int32_t* predicts, int32_t* acceptIndex, int32_t* acceptTokenNum,
+    int32_t* acceptToken, int32_t const* candidates, int32_t const* retrievePacked, int32_t const* targetPredict,
     bool const* treeValid, SizeType32 batchSize, SizeType32 numDraftTokens, SizeType32 numSpecStep, cudaStream_t stream)
 {
     dim3 grid(batchSize);

@@ -242,7 +242,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
 
         self._accept_token = torch.zeros(
-            max_batch_size, max_draft_len + 1, dtype=torch.int64, device="cuda"
+            max_batch_size, max_draft_len + 1, dtype=torch.int32, device="cuda"
         )
         self._last_selected_parents = None
         self._kv_head_dim_bytes = None
@@ -278,10 +278,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             max_batch_size * tokens_per_gen_step, dtype=torch.int64, device="cuda"
         )
         self._candidates_buf = torch.zeros(
-            max_batch_size, tokens_per_gen_step, dtype=torch.int64, device="cuda"
+            max_batch_size, tokens_per_gen_step, dtype=torch.int32, device="cuda"
         )
         self._target_predict_buf = torch.zeros(
-            max_batch_size, tokens_per_gen_step, dtype=torch.int64, device="cuda"
+            max_batch_size, tokens_per_gen_step, dtype=torch.int32, device="cuda"
         )
         # Pre-allocated buffer for retrieve_packed (avoids torch.stack allocation per verify)
         self._retrieve_packed_buf = torch.zeros(
@@ -740,7 +740,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             gen_slots = ss.all_ids_buf[num_contexts:batch_size]
             spec_tree_manager.scatter_to_slot_storage(ss, gen_slots, num_gens)
 
-        return real_draft_tokens.to(torch.int32)
+        return real_draft_tokens
 
     def _sample_and_accept_dynamic_tree(
         self, logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
@@ -757,28 +757,29 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._accepted_draft_indices_tensor[:batch_size].fill_(-1)
 
         num_flat_tokens = logits.shape[0]
+        # torch.argmax writes LongTensor indices; token storage below remains int32.
         torch.argmax(logits, dim=-1, out=self._target_tokens_buf[:num_flat_tokens])
         target_tokens = self._target_tokens_buf[:num_flat_tokens]
 
         # Context requests: accept sampled token
-        accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts].to(torch.int32)
+        accepted_tokens[:num_contexts, 0].copy_(target_tokens[:num_contexts])
 
         # Generation requests: tree verification
         if num_gens > 0:
             spec_tree_manager = self.spec_tree_manager
 
             target_predict = self._target_predict_buf[:num_gens]
-            target_predict[:] = target_tokens[num_contexts:].reshape(num_gens, N)
+            target_predict.copy_(target_tokens[num_contexts:].reshape(num_gens, N))
 
             if spec_tree_manager is None:
                 # CUDA graph warmup: accept only the first token per request
                 num_accepted_tokens[num_contexts:batch_size] = 1
-                accepted_tokens[num_contexts:batch_size, 0] = target_predict[:, 0].to(torch.int32)
+                accepted_tokens[num_contexts:batch_size, 0] = target_predict[:, 0]
                 self._accepted_draft_indices_tensor[num_contexts:batch_size] = -1
                 return accepted_tokens, num_accepted_tokens
 
             candidates = self._candidates_buf[:num_gens]
-            candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, N - 1).to(torch.int64)
+            candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, N - 1)
             candidates[:, 0] = target_predict[:, 0]
 
             ss = spec_tree_manager.slot_storage
@@ -800,12 +801,12 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             self._accept_token = accept_token
             n_acc_draft = accept_token_num[:num_gens]
-            num_accepted_tokens[num_contexts:batch_size] = (n_acc_draft + 1).to(torch.int32)
-            accepted_tokens[num_contexts:batch_size] = accept_token[:num_gens].to(torch.int32)
+            num_accepted_tokens[num_contexts:batch_size] = n_acc_draft + 1
+            accepted_tokens[num_contexts:batch_size] = accept_token[:num_gens]
             # accept_index is 0-based from kernel; -1 converts padding (0) to sentinel (-1)
             self._accepted_draft_indices_tensor[num_contexts:batch_size] = (
                 accept_index[:num_gens, 1:max_path_len] - 1
-            ).to(torch.int32)
+            )
 
         num_accepted_tokens = self._apply_force_accepted_tokens(
             num_accepted_tokens, num_contexts, self.max_draft_len

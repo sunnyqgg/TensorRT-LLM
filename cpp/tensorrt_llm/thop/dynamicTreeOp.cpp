@@ -62,7 +62,7 @@ void build_dynamic_tree_op(th::Tensor& parentList, th::Tensor& selectedIndex, th
         static_cast<tk::TreeMaskMode>(treeMaskMode), stream, numInt32PerRow);
 }
 
-//! In-place verify with retrieve packed as [B, N, 3] int32 (index, next_token, next_sibling).
+//! In-place verify. Token tensors are int32; retrievePacked is [B, N, 3] int32 (index, next_token, next_sibling).
 void verify_dynamic_tree_greedy_out_packed_op(th::Tensor& candidates, th::Tensor& retrievePacked,
     th::Tensor& targetPredict, th::Tensor& predicts, th::Tensor& acceptIndex, th::Tensor& acceptTokenNum,
     th::Tensor& acceptToken, th::Tensor& treeValid, int64_t numSpecStep)
@@ -78,9 +78,9 @@ void verify_dynamic_tree_greedy_out_packed_op(th::Tensor& candidates, th::Tensor
     TORCH_CHECK(candidates.dim() == 2, "candidates must be 2D tensor");
     TORCH_CHECK(retrievePacked.dim() == 3, "retrievePacked must be 3D tensor");
     TORCH_CHECK(targetPredict.dim() == 2, "targetPredict must be 2D tensor");
-    TORCH_CHECK(candidates.scalar_type() == torch::kInt64, "candidates must be int64 tensor");
+    TORCH_CHECK(candidates.scalar_type() == torch::kInt32, "candidates must be int32 tensor");
     TORCH_CHECK(retrievePacked.scalar_type() == torch::kInt32, "retrievePacked must be int32 tensor");
-    TORCH_CHECK(targetPredict.scalar_type() == torch::kInt64, "targetPredict must be int64 tensor");
+    TORCH_CHECK(targetPredict.scalar_type() == torch::kInt32, "targetPredict must be int32 tensor");
 
     int64_t batchSize = candidates.size(0);
     int64_t numDraftTokens = candidates.size(1);
@@ -96,10 +96,10 @@ void verify_dynamic_tree_greedy_out_packed_op(th::Tensor& candidates, th::Tensor
     TORCH_CHECK(treeValid.size(0) >= batchSize, "treeValid buffer too small");
     TORCH_CHECK(treeValid.scalar_type() == torch::kBool, "treeValid must be bool tensor");
 
-    TORCH_CHECK(predicts.scalar_type() == torch::kInt64, "predicts must be int64 tensor");
-    TORCH_CHECK(acceptIndex.scalar_type() == torch::kInt64, "acceptIndex must be int64 tensor");
-    TORCH_CHECK(acceptTokenNum.scalar_type() == torch::kInt64, "acceptTokenNum must be int64 tensor");
-    TORCH_CHECK(acceptToken.scalar_type() == torch::kInt64, "acceptToken must be int64 tensor");
+    TORCH_CHECK(predicts.scalar_type() == torch::kInt32, "predicts must be int32 tensor");
+    TORCH_CHECK(acceptIndex.scalar_type() == torch::kInt32, "acceptIndex must be int32 tensor");
+    TORCH_CHECK(acceptTokenNum.scalar_type() == torch::kInt32, "acceptTokenNum must be int32 tensor");
+    TORCH_CHECK(acceptToken.scalar_type() == torch::kInt32, "acceptToken must be int32 tensor");
     TORCH_CHECK(predicts.size(0) >= batchSize * numDraftTokens, "predicts buffer too small");
     TORCH_CHECK(acceptIndex.size(0) >= batchSize && acceptIndex.size(1) >= numSpecStep, "acceptIndex buffer too small");
     TORCH_CHECK(acceptTokenNum.size(0) >= batchSize, "acceptTokenNum buffer too small");
@@ -112,9 +112,9 @@ void verify_dynamic_tree_greedy_out_packed_op(th::Tensor& candidates, th::Tensor
     acceptTokenNum.zero_();
     acceptToken.zero_();
 
-    tk::invokeVerifyDynamicTreeGreedyPacked(predicts.data_ptr<int64_t>(), acceptIndex.data_ptr<int64_t>(),
-        acceptTokenNum.data_ptr<int64_t>(), acceptToken.data_ptr<int64_t>(), candidates.data_ptr<int64_t>(),
-        retrievePacked.data_ptr<int32_t>(), targetPredict.data_ptr<int64_t>(), treeValid.data_ptr<bool>(), batchSize,
+    tk::invokeVerifyDynamicTreeGreedyPacked(predicts.data_ptr<int32_t>(), acceptIndex.data_ptr<int32_t>(),
+        acceptTokenNum.data_ptr<int32_t>(), acceptToken.data_ptr<int32_t>(), candidates.data_ptr<int32_t>(),
+        retrievePacked.data_ptr<int32_t>(), targetPredict.data_ptr<int32_t>(), treeValid.data_ptr<bool>(), batchSize,
         numDraftTokens, numSpecStep, stream);
 }
 

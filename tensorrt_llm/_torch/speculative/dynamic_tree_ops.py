@@ -58,16 +58,16 @@ class DynamicTreeOpsConverter:
         N = max_total_draft_tokens + 1  # tokens_per_gen_step (includes root)
         max_path_len = max_draft_len + 1
         self._verify_predicts_buf = torch.zeros(
-            max_batch_size * N, dtype=torch.int64, device=device
+            max_batch_size * N, dtype=torch.int32, device=device
         )
         self._verify_accept_index_buf = torch.zeros(
-            max_batch_size, max_path_len, dtype=torch.int64, device=device
+            max_batch_size, max_path_len, dtype=torch.int32, device=device
         )
         self._verify_accept_token_num_buf = torch.zeros(
-            max_batch_size, dtype=torch.int64, device=device
+            max_batch_size, dtype=torch.int32, device=device
         )
         self._verify_accept_token_buf = torch.zeros(
-            max_batch_size, max_path_len, dtype=torch.int64, device=device
+            max_batch_size, max_path_len, dtype=torch.int32, device=device
         )
 
     def build_dynamic_tree(
@@ -149,7 +149,7 @@ class DynamicTreeOpsConverter:
         num_spec_step: int,
         tree_valid: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """In-place verify with retrieve layout [num_gens, N, 3] int32 (packed)."""
+        """In-place verify with int32 token tensors and packed int32 retrieve layout."""
         N = candidates.size(1)
         predicts = self._verify_predicts_buf[: num_gens * N]
         accept_index = self._verify_accept_index_buf[:num_gens]
