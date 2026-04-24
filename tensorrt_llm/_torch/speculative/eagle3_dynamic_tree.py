@@ -318,22 +318,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._needs_mask_repack = True
 
     def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
-        """Repack mask from padded 3D layout to packed 1D layout.
-
-        The XQA precompiled kernel reads the tree attention mask in packed
-        layout using cumulative sequence lengths (cuQSeqLens), with row
-        stride ``divUp(qSeqLen, 32)`` int32s — i.e. ``math.ceil(n_tok/32)``.
-
-        But Python writes the mask into the 3D tensor
-        ``[max_num_requests, buf_dim, stored_mask_width]`` where
-        ``stored_mask_width = ceil(buf_dim / 32)``.  When ``n_tok < buf_dim``,
-        the stored row width can exceed what the C++ kernel expects.
-
-        This function extracts valid rows *and* valid columns (trimming
-        to ``actual_mask_width = ceil(n_tok / 32)``) and writes them
-        contiguously (packed) at the start of the buffer.
-        Uses a pre-allocated scratch buffer for CUDA graph compatibility.
-        """
+        """Repack padded 3D mask into packed 1D layout (row stride = ceil(n_tok/32)) for XQA."""
         buf_dim = mask_buf.shape[1]
         stored_mask_width = mask_buf.shape[2]
         # C++ XQA kernel reads divUp(n_tok, 32) int32s per mask row.
