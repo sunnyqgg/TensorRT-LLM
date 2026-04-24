@@ -21,6 +21,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._utils import nvtx_range
+
 from ..attention_backend import AttentionMetadata
 from .eagle3 import Eagle3OneModelWorker
 
@@ -389,6 +391,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         total_elems = n_req * n_tok * actual_mask_width
         return mask_buf.view(-1)[:total_elems].view(n_req, n_tok, actual_mask_width)
 
+    @nvtx_range("eagle3_dyn._ensure_spec_tree_manager")
     def _ensure_spec_tree_manager(self, resource_manager):
         """Lazily initialize spec_tree_manager and KV head metadata."""
         if self.spec_tree_manager is not None:
@@ -418,6 +421,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     cache_mgr.head_dim * _dtype_bytes.get(cache_mgr.dtype, 0.5)
                 )
 
+    @nvtx_range("eagle3_dyn.forward")
     def forward(
         self,
         input_ids,
@@ -449,6 +453,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         return output
 
+    @nvtx_range("eagle3_dyn._relocate_kv_eagerly")
     def _relocate_kv_eagerly(self, attn_metadata, batch_size):
         """Move accepted draft tokens' KV from tree to linear positions.
 
@@ -487,6 +492,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             None,
         )
 
+    @nvtx_range("eagle3_dyn.sample_and_accept_draft_tokens")
     def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
         """Override to handle dynamic tree verification."""
         batch_size = attn_metadata.num_seqs
@@ -500,6 +506,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             self._relocate_kv_eagerly(attn_metadata, batch_size)
         return accepted_tokens, num_accepted_tokens
 
+    @nvtx_range("eagle3_dyn.prepare_1st_drafter_inputs")
     def prepare_1st_drafter_inputs(
         self,
         input_ids,
@@ -857,6 +864,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         return accepted_tokens, num_accepted_tokens
 
+    @nvtx_range("eagle3_dyn.sample")
     def sample(
         self, logits: torch.Tensor, max_top_k: int, draft_model=None
     ) -> tuple[torch.Tensor, torch.Tensor]:
