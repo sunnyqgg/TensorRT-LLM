@@ -132,7 +132,9 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
     // The sequence length of tensor KV.
     int32_t const seqLenKv = seqLensKvPtr[batchIdx];
 
-    // Use batch-wide max seqLenQ for row width so every request reads the same stride.
+    // Row width (int32 blocks per row) derives from mPackedMaskMaxSeqLenQ.
+    // Row offset comes from cumSeqLensQPtr when non-null (compact/packed layout),
+    // else from padded batch stride (batchIdx * packedMaskMaxSeqLenQ).
     int32_t const packedMaskMaxSeqLenQ
         = runnerParams.mPackedMaskMaxSeqLenQ > 0 ? runnerParams.mPackedMaskMaxSeqLenQ : seqLenQ;
     int32_t const packedMaskNumBlocks = ceilDiv(packedMaskMaxSeqLenQ, 32);
@@ -176,7 +178,8 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
         int32_t const qPosInTree = tokenIdxKv - firstSparseMaskOffsetKv;
         if (qPosInTree < seqLenQ)
         {
-            // Packed layout (cumSeqLensQ): row = cumSeqLensQ[b] + tokenIdxQ; else padded 3D: b * maxSeqLenQ + tokenIdxQ.
+            // Row offset: compact (cumSeqLensQ[b] + tokenIdxQ) when cumSeqLensQPtr set,
+            // else padded (b * packedMaskMaxSeqLenQ + tokenIdxQ).
             int32_t const rowOffset = cumSeqLensQPtr != nullptr ? (cumSeqLensQPtr[batchIdx] + tokenIdxQ)
                                                                 : (batchIdx * packedMaskMaxSeqLenQ + tokenIdxQ);
             int32_t const qMaskBaseIdx = rowOffset * packedMaskNumBlocks;
