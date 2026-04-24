@@ -55,11 +55,7 @@ class DynamicTreeOpsConverter:
         self.depth = max_draft_len
 
         # Pre-allocated output buffers for verify_dynamic_tree_greedy_out_packed_op
-        N = max_total_draft_tokens + 1  # tokens_per_gen_step (includes root)
         max_path_len = max_draft_len + 1
-        self._verify_predicts_buf = torch.zeros(
-            max_batch_size * N, dtype=torch.int32, device=device
-        )
         self._verify_accept_index_buf = torch.zeros(
             max_batch_size, max_path_len, dtype=torch.int32, device=device
         )
@@ -148,10 +144,9 @@ class DynamicTreeOpsConverter:
         num_gens: int,
         num_spec_step: int,
         tree_valid: torch.Tensor = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """In-place verify with int32 token tensors and packed int32 retrieve layout."""
         N = candidates.size(1)
-        predicts = self._verify_predicts_buf[: num_gens * N]
         accept_index = self._verify_accept_index_buf[:num_gens]
         accept_token_num = self._verify_accept_token_num_buf[:num_gens]
         accept_token = self._verify_accept_token_buf[:num_gens]
@@ -159,15 +154,12 @@ class DynamicTreeOpsConverter:
         if tree_valid is None:
             tree_valid = torch.ones(num_gens, dtype=torch.bool, device=candidates.device)
 
-        # Slice retrieve_packed to match candidates dim1 (N = tokens_per_gen_step).
-        # The staging buffer may be wider (buf_dim > N) when padded for K*max_draft_len.
         rp = retrieve_packed[:, :N, :].contiguous()
         try:
             torch.ops.trtllm.verify_dynamic_tree_greedy_out_packed_op(
                 candidates,
                 rp,
                 target_predict,
-                predicts,
                 accept_index,
                 accept_token_num,
                 accept_token,
@@ -180,4 +172,4 @@ class DynamicTreeOpsConverter:
                 f"Inputs: num_gens={num_gens}, N={N}, num_spec_step={num_spec_step}"
             ) from e
 
-        return predicts, accept_index, accept_token_num, accept_token
+        return accept_index, accept_token_num, accept_token

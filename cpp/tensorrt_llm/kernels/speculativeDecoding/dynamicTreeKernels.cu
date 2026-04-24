@@ -266,9 +266,9 @@ void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIn
 
 //! retrievePacked layout [bs, numDraftTokens, 3] int32 row-major:
 //! [b,n,0]=retrieveIndex, [b,n,1]=retrieveNextToken, [b,n,2]=retrieveNextSibling
-__global__ void verifyDynamicTreeGreedyPackedKernel(int32_t* predicts, int32_t* acceptIndex, int32_t* acceptTokenNum,
-    int32_t* acceptToken, int32_t const* candidates, int32_t const* retrievePacked, int32_t const* targetPredict,
-    bool const* treeValid, uint32_t batchSize, uint32_t numSpeculativeTokens, uint32_t numDraftTokens)
+__global__ void verifyDynamicTreeGreedyPackedKernel(int32_t* acceptIndex, int32_t* acceptTokenNum, int32_t* acceptToken,
+    int32_t const* candidates, int32_t const* retrievePacked, int32_t const* targetPredict, bool const* treeValid,
+    uint32_t numSpeculativeTokens, uint32_t numDraftTokens)
 {
     uint32_t bx = blockIdx.x;
     uint32_t batchOffset = bx * numDraftTokens;
@@ -279,7 +279,6 @@ __global__ void verifyDynamicTreeGreedyPackedKernel(int32_t* predicts, int32_t* 
         acceptTokenNum[bx] = 0;
         acceptIndex[bx * numSpeculativeTokens] = 0;
         acceptToken[bx * numSpeculativeTokens] = targetPredict[batchOffset];
-        predicts[batchOffset] = targetPredict[batchOffset];
         return;
     }
 
@@ -302,7 +301,6 @@ __global__ void verifyDynamicTreeGreedyPackedKernel(int32_t* predicts, int32_t* 
 
             if (draftTokenId == targetTokenId)
             {
-                predicts[batchOffset + lastAcceptedLocalIdx] = targetTokenId;
                 ++numAcceptedTokens;
                 acceptIndex[bx * numSpeculativeTokens + numAcceptedTokens] = draftLocalIdx;
                 acceptToken[bx * numSpeculativeTokens + numAcceptedTokens] = targetPredict[batchOffset + draftLocalIdx];
@@ -320,18 +318,18 @@ __global__ void verifyDynamicTreeGreedyPackedKernel(int32_t* predicts, int32_t* 
     }
 
     acceptTokenNum[bx] = numAcceptedTokens;
-    predicts[batchOffset + lastAcceptedLocalIdx] = targetPredict[batchOffset + lastAcceptedLocalIdx];
 }
 
-void invokeVerifyDynamicTreeGreedyPacked(int32_t* predicts, int32_t* acceptIndex, int32_t* acceptTokenNum,
-    int32_t* acceptToken, int32_t const* candidates, int32_t const* retrievePacked, int32_t const* targetPredict,
-    bool const* treeValid, SizeType32 batchSize, SizeType32 numDraftTokens, SizeType32 numSpecStep, cudaStream_t stream)
+void invokeVerifyDynamicTreeGreedyPacked(int32_t* acceptIndex, int32_t* acceptTokenNum, int32_t* acceptToken,
+    int32_t const* candidates, int32_t const* retrievePacked, int32_t const* targetPredict, bool const* treeValid,
+    SizeType32 batchSize, SizeType32 numDraftTokens, SizeType32 numSpecStep, cudaStream_t stream)
 {
     dim3 grid(batchSize);
     dim3 block(1);
 
-    verifyDynamicTreeGreedyPackedKernel<<<grid, block, 0, stream>>>(predicts, acceptIndex, acceptTokenNum, acceptToken,
-        candidates, retrievePacked, targetPredict, treeValid, batchSize, numSpecStep, numDraftTokens);
+    verifyDynamicTreeGreedyPackedKernel<<<grid, block, 0, stream>>>(
+        acceptIndex, acceptTokenNum, acceptToken, candidates, retrievePacked, targetPredict, treeValid, numSpecStep,
+        numDraftTokens);
 
     sync_check_cuda_error(stream);
 }

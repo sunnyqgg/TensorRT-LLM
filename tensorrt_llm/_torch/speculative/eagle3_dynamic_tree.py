@@ -746,7 +746,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             retrieve_packed = ss.pack_retrieve_from_slots(gen_slot_ids, num_gens)
 
-            _, accept_index, accept_token_num, accept_token = (
+            accept_index, accept_token_num, accept_token = (
                 self.tree_ops_converter.verify_dynamic_tree_greedy_out_packed(
                     candidates,
                     retrieve_packed,
