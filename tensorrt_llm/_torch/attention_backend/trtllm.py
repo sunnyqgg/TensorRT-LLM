@@ -860,12 +860,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
     is_spec_dec_dynamic_tree: bool = False
 
-    # Row width (stride) of the 1D spec_decoding_position_offsets buffer.
-    # Set by each writer so readers can reshape without GPU→CPU sync.
+    # Row stride of the 1D spec_decoding_position_offsets buffer.
     position_offsets_stride: int = 0
-    # Per-request token count used when packing 1D offsets (n_dt, step0 length,
-    # K*(layer+1), etc.). C++ indexes as batch_idx * input_seq_length + token;
-    # input_seq_length must match this, not position_offsets_stride (buf_dim).
+    # Per-request token count used as C++ input_seq_length (may differ from stride).
     position_offsets_query_len: int = 0
 
     # parameters required for spec-dec mode
@@ -1550,6 +1547,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         model_is_wrapped: bool = False,
         spec_metadata: Optional['SpecMetadata'] = None,
         spec_tree_manager: Optional['SpecTreeManager'] = None,
+        num_contexts: int = 0,
     ) -> None:
         '''
         Update the spec-dec parameters for the TRTLLM attention layer.
@@ -1563,6 +1561,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             model_is_wrapped: Optional[bool] = False, whether the drafter model is wrapped (i.e, CDL).
             spec_metadata: Optional['SpecMetadata'] = None, the metadata of the spec-dec.
             spec_tree_manager: Optional['SpecTreeManager'] = None, the spec_tree_manager for draft token tree.
+            num_contexts: int = 0, the number of context (prefill) requests in the
+                batch.  The slot-storage layout is ``[ctx | gen]``; dynamic-tree
+                metadata only describes the gen rows, so we must source from
+                ``[num_contexts:batch_size]`` rather than ``[:batch_size]``.
         '''
 
         # Disable spec decoding on Blackwell (sm100+). The trtllmGen FMHA
@@ -1632,26 +1634,63 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 assert spec_tree_manager is not None, "spec_tree_manager is required for dynamic tree"
                 n_dt = spec_tree_manager.max_total_draft_tokens + 1
                 buf_dim = spec_tree_manager._internal_buf_dim
+
+                # buf_dim >= n_dt by spec_tree_manager construction
+                # (max(n_dt, K*max_draft_len)).  When buf_dim > n_dt the
+                # destination view strides on buf_dim columns/rows while only
+                # the first n_dt are valid; downstream reshape paths
+                # (_reshape_position_offsets_for_cpp,
+                # _adjust_position_ids_for_spec_dec) honor the stride explicitly
+                # and produce a contiguous [num_gens, n_dt] tensor for the C++
+                # kernel and Python RoPE respectively.
+                assert buf_dim >= n_dt, (
+                    f"Dynamic-tree copy requires buf_dim >= n_dt; got "
+                    f"buf_dim={buf_dim}, n_dt={n_dt}.")
+
                 ss = spec_tree_manager.slot_storage
-                slot_ids = ss.all_ids_buf[:batch_size]
 
-                # Position offsets
-                pos_src = torch.index_select(ss.position_offsets, 0,
-                                             slot_ids)[:, :n_dt]
-                total = batch_size * n_dt
-                self.spec_decoding_position_offsets[:total].copy_(
-                    pos_src.reshape(-1), non_blocking=True)
-                self.position_offsets_stride = buf_dim
-                self.position_offsets_query_len = n_dt
+                # The slot-storage layout is [ctx | gen]; dynamic-tree metadata
+                # only describes the gen rows.  Skip the leading context rows
+                # so row-i in the destination corresponds to gen-i, which is
+                # what the XQA kernel (and downstream packed_mask consumers)
+                # expect.  Rows [num_gens..max_num_requests) are left as
+                # padding; the kernel only reads [0..num_gens).
+                num_gens = batch_size - num_contexts
+                if num_gens > 0:
+                    slot_ids = ss.all_ids_buf[num_contexts:batch_size]
 
-                # Packed mask
-                actual_mask_width = math.ceil(n_dt / 32)
-                mask_src = torch.index_select(
-                    ss.packed_mask, 0, slot_ids)[:, :, :actual_mask_width]
-                total = batch_size * n_dt * actual_mask_width
-                self.spec_decoding_packed_mask.view(-1)[:total].copy_(
-                    mask_src.reshape(-1), non_blocking=True)
+                    # Position offsets — explicit 2-D destination view so the
+                    # per-row stride is buf_dim (matching the buffer layout)
+                    # while we only write the first n_dt columns.
+                    pos_src = torch.index_select(ss.position_offsets, 0,
+                                                 slot_ids)[:, :n_dt]
+                    pos_dst = self.spec_decoding_position_offsets.view(
+                        self.max_num_requests, -1)[:num_gens, :n_dt]
+                    pos_dst.copy_(pos_src, non_blocking=True)
+                    self.position_offsets_stride = buf_dim
+                    self.position_offsets_query_len = n_dt
 
+                    # Packed mask — flat write at stride n_dt × actual_mask_width
+                    # per request. The C++ FMHA kernel reads this buffer flat
+                    # using ``spec_decoding_max_generation_length = n_dt`` as
+                    # the per-request stride (see attentionOp.cpp:546-547);
+                    # writing via the natural [m, buf_dim, ceil(buf_dim/32)]
+                    # 3-D view would mis-align rows whenever buf_dim > n_dt
+                    # (dynamic-tree under-budget configs, e.g. draft30 with
+                    # K=10, max_draft_len=6 → buf_dim=60, n_dt=31).
+                    actual_mask_width = math.ceil(n_dt / 32)
+                    mask_src = torch.index_select(
+                        ss.packed_mask, 0, slot_ids)[:, :, :actual_mask_width]
+                    total = num_gens * n_dt * actual_mask_width
+                    self.spec_decoding_packed_mask.view(-1)[:total].copy_(
+                        mask_src.reshape(-1), non_blocking=True)
+                else:
+                    self.position_offsets_stride = buf_dim
+                    self.position_offsets_query_len = n_dt
+
+                # Keep the generation-lengths buffer filled to ``batch_size``
+                # for CUDA-graph shape stability; padded rows beyond num_gens
+                # are dummy-slot noise that the kernel never indexes into.
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
 
             # Case 2/3: static tree
@@ -1695,13 +1734,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                        1).to(torch.int32)
 
                     total = mdl1 * batch_size
-                    self.spec_decoding_position_offsets.reshape(
-                        -1)[:total].copy_(
-                            self._drafter0_pos_pattern.repeat(batch_size),
-                            non_blocking=True)
-                    self.spec_decoding_packed_mask.reshape(-1)[:total].copy_(
-                        self._drafter0_mask_pattern.repeat(batch_size),
-                        non_blocking=True)
+                    pos_dst = self.spec_decoding_position_offsets.reshape(
+                        -1)[:total].view(batch_size, mdl1)
+                    pos_dst.copy_(
+                        self._drafter0_pos_pattern.unsqueeze(0).expand(
+                            batch_size, -1))
+                    mask_dst = self.spec_decoding_packed_mask.reshape(
+                        -1)[:total].view(batch_size, mdl1)
+                    mask_dst.copy_(
+                        self._drafter0_mask_pattern.unsqueeze(0).expand(
+                            batch_size, -1))
                     self.generate_spec_decoding_generation_length(
                         runtime_draft_len=max_draft_len)
                     if (self.spec_decoding_position_offsets is not None
@@ -1908,26 +1950,27 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     @staticmethod
     def _reshape_position_offsets_for_cpp(metadata):
-        """Reshape 1D spec-dec position offsets to 2D for C++ kernel.
-
-        Packed layout: request ``i`` occupies ``[i * q, (i+1) * q)`` in the
-        flat buffer, where ``q = position_offsets_query_len`` (actual Q length:
-        ``n_dt`` for dynamic-tree verify, ``max_draft_len+1`` for drafter, etc.).
-
-        The underlying allocation may be ``max_num_requests * buf_dim`` with
-        ``q <= buf_dim``; viewing as ``(max_num_requests, buf_dim)`` misaligns
-        batch rows when ``q < buf_dim`` and must not be used for thop.
-        """
+        """Reshape 1D spec-dec position offsets to (num_requests, query_len) for C++."""
         offsets = metadata.spec_decoding_position_offsets
         if offsets is None or offsets.dim() != 1:
             return offsets
-        m = metadata.max_num_requests
-        q = metadata.position_offsets_query_len
-        if q > 0 and m > 0:
-            return offsets[:m * q].reshape(m, q)
+        num_requests = metadata.max_num_requests
+        query_len = metadata.position_offsets_query_len
         stride = metadata.position_offsets_stride
-        if stride > 0 and m > 0:
-            return offsets.view(m, stride)
+        if num_requests > 0 and stride > 0 and query_len > 0:
+            # Per-request data lives at indices [i*stride, i*stride + query_len).
+            # When stride > query_len, a flat [num_requests*query_len].reshape misaligns rows;
+            # take the [num_requests, stride] view first, then slice and contiguize so the
+            # C++ kernel sees a dense [num_requests, query_len] buffer.
+            view = offsets[:num_requests * stride].view(num_requests, stride)
+            if stride == query_len:
+                return view
+            return view[:, :query_len].contiguous()
+        if query_len > 0 and num_requests > 0:
+            return offsets[:num_requests * query_len].reshape(
+                num_requests, query_len)
+        if stride > 0 and num_requests > 0:
+            return offsets.view(num_requests, stride)
         return offsets
 
     def forward(

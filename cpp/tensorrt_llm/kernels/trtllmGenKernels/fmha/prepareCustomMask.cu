@@ -132,17 +132,12 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
     // The sequence length of tensor KV.
     int32_t const seqLenKv = seqLensKvPtr[batchIdx];
 
-    // Packed mask row width in int32 words.  mPackedMaskMaxSeqLenQ is the
-    // batch-wide max generation length; when > 0 use it for row width so
-    // every request reads the correct number of bits per mask row.
+    // Row width (int32 blocks per row) derives from mPackedMaskMaxSeqLenQ.
+    // Row offset comes from cumSeqLensQPtr when non-null (compact/packed layout),
+    // else from padded batch stride (batchIdx * packedMaskMaxSeqLenQ).
     int32_t const packedMaskMaxSeqLenQ
         = runnerParams.mPackedMaskMaxSeqLenQ > 0 ? runnerParams.mPackedMaskMaxSeqLenQ : seqLenQ;
     int32_t const packedMaskNumBlocks = ceilDiv(packedMaskMaxSeqLenQ, 32);
-    // Cumulative Q sequence lengths for packed mask batch indexing.
-    // When available, mask is in packed layout (like Hopper XQA):
-    //   mask row i of request b starts at (cumSeqLensQ[b] + i) * packedMaskNumBlocks
-    // When null, mask is in padded 3D layout:
-    //   mask row i of request b starts at (b * packedMaskMaxSeqLenQ + i) * packedMaskNumBlocks
     int32_t const* cumSeqLensQPtr = runnerParams.cumSeqLensQPtr;
 
     // Calculate global Q token index (flattened across heads)
@@ -183,8 +178,8 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
         int32_t const qPosInTree = tokenIdxKv - firstSparseMaskOffsetKv;
         if (qPosInTree < seqLenQ)
         {
-            // Packed layout (cumSeqLensQPtr != null): row offset = cumSeqLensQ[b] + tokenIdxQ
-            // Padded 3D layout (cumSeqLensQPtr == null): row offset = b * packedMaskMaxSeqLenQ + tokenIdxQ
+            // Row offset: compact (cumSeqLensQ[b] + tokenIdxQ) when cumSeqLensQPtr set,
+            // else padded (b * packedMaskMaxSeqLenQ + tokenIdxQ).
             int32_t const rowOffset = cumSeqLensQPtr != nullptr ? (cumSeqLensQPtr[batchIdx] + tokenIdxQ)
                                                                 : (batchIdx * packedMaskMaxSeqLenQ + tokenIdxQ);
             int32_t const qMaskBaseIdx = rowOffset * packedMaskNumBlocks;

@@ -976,10 +976,16 @@ class Attention(nn.Module):
         stride = getattr(attn_metadata, 'position_offsets_stride', 0)
         if stride <= 0:
             return position_ids
-        # Data is flat/compact with gen_len stride per request (matching
-        # C++ kernel's input_seq_length stride = num_tokens / num_seqs).
+        # Per-request data lives at indices [i*stride, i*stride + gen_len).
+        # When stride > gen_len (under-budget dynamic-tree configs),
+        # offsets_flat[:num_gens*gen_len].view(num_gens, gen_len) reads from
+        # the wrong rows; honor stride first, then slice to gen_len.
         total = num_gens * gen_len
-        offsets = offsets_flat[:total].view(num_gens, gen_len)
+        if stride == gen_len:
+            offsets = offsets_flat[:total].view(num_gens, gen_len)
+        else:
+            offsets = offsets_flat[:num_gens * stride].view(num_gens,
+                                                            stride)[:, :gen_len]
         start = attn_metadata.num_ctx_tokens
         end = start + total
         adjusted = (base_pos.unsqueeze(1) + offsets).reshape(-1)
