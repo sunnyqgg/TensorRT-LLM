@@ -362,13 +362,9 @@ class KVCacheManager(BaseResourceManager):
         self.max_total_draft_tokens = (spec_config.tokens_per_gen_step -
                                        1) if spec_config is not None else 0
 
-        # For dynamic-tree spec-dec, the *draft* model executes a tree-build
-        # loop that can write up to ``dynamic_tree_max_topK * max_draft_len``
-        # KV slots, even when ``max_total_draft_tokens`` (the size the target
-        # model verifies) is smaller.  Size the per-request KV reservation to
-        # the larger of the two so ``prepare_resources`` does not under-allocate
-        # for the draft loop.
-        # Target manager (is_draft=False) keeps the existing budget exactly.
+        # Dynamic-tree draft manager reserves K*max_draft_len KV slots (the draft
+        # loop can write that many even if max_total_draft_tokens is smaller).
+        # Target manager keeps max_total_draft_tokens exactly.
         self._kv_reserve_draft_tokens = self.max_total_draft_tokens
         if (self.is_draft and spec_config is not None
                 and getattr(spec_config, 'use_dynamic_tree', False)
@@ -706,14 +702,9 @@ class KVCacheManager(BaseResourceManager):
                 self.impl.add_token(req.py_request_id)
                 for _ in range(draft_len):
                     self.impl.add_token(req.py_request_id)
-                # Dynamic-tree draft model can write up to K*max_draft_len
-                # KV slots per generation step. Reserve that headroom now so
-                # the draft loop never under-allocates.
-                # Gate: ``_kv_reserve_draft_tokens > max_total_draft_tokens``
-                # only when (is_draft and use_dynamic_tree); otherwise the
-                # slack is bounded by ``max_total_draft_tokens - draft_len``,
-                # which is non-zero only when the schedule truncated
-                # ``py_draft_tokens`` below the static maximum.
+                # Top up to _kv_reserve_draft_tokens (see __init__): on
+                # dynamic-tree draft manager this exceeds draft_len; otherwise
+                # only nonzero when scheduler truncated py_draft_tokens.
                 reserve_slack = self._kv_reserve_draft_tokens - draft_len
                 for _ in range(max(0, reserve_slack)):
                     self.impl.add_token(req.py_request_id)
@@ -745,10 +736,8 @@ class KVCacheManager(BaseResourceManager):
         is_gen: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
-        # KV cache may need more reserved tokens than py_draft_tokens length.
-        # For dynamic tree: draft loop needs K*max_draft_len KV slots but
-        # target model only processes max_total_draft_tokens. If None, falls
-        # back to max_num_draft_tokens.
+        # Override of py_draft_tokens length for KV reserve (e.g. dynamic-tree
+        # draft loop). Falls back to max_num_draft_tokens when None.
         kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
@@ -1730,12 +1719,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
-        # Dynamic-tree draft model can write up to K*max_draft_len KV slots
-        # per generation step, which may exceed max_total_draft_tokens.  Mirror
-        # the V1 reservation so block-budget sizing and per-iteration
-        # ``_prepare_draft_resources`` resizes both account for the larger
-        # draft footprint.  Target manager (is_draft=False) keeps the existing
-        # budget exactly; non-dynamic-tree configs are unaffected.
+        # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
         self._kv_reserve_draft_tokens = self.max_total_draft_tokens
         if (self.is_draft and spec_config is not None
                 and getattr(spec_config, 'use_dynamic_tree', False)
@@ -1919,16 +1903,9 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             self.max_seq_len = max_num_tokens
 
-        # Pad max_blocks_per_seq to next multiple of 4 for copy_block_offsets kernel.
-        # Computed after max_seq_len clamping, but account for extra tokens
-        # (num_extra_kv_tokens + KV reserve) so the host page-index buffer is
-        # large enough for the maximum capacity a single sequence can reach
-        # during warmup or normal operation.  ``_kv_reserve_draft_tokens``
-        # equals ``max_total_draft_tokens`` for the target manager and grows
-        # to ``K*max_draft_len`` for a dynamic-tree draft manager so the draft
-        # model has the headroom its tree-build loop actually needs.
-        # The +1 accounts for the base decode token that
-        # _required_gen_capacity adds on top of draft tokens.
+        # Pad max_blocks_per_seq to next multiple of 4 (copy_block_offsets kernel).
+        # Account for max single-sequence capacity = seq_len + extra KV tokens +
+        # _kv_reserve_draft_tokens (see __init__) + 1 base decode token.
         max_seq_capacity = self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
         self.max_blocks_per_seq = (max_seq_capacity + tokens_per_block -
                                    1) // tokens_per_block
@@ -2395,13 +2372,8 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
                 new_cap = self._required_gen_capacity(req, kv_cache.capacity)
-                # Dynamic-tree draft loop can write up to K*max_draft_len KV
-                # slots, which may exceed the py_draft_tokens length the
-                # target schedule reserved.  Pad the resize so the draft
-                # model has enough room.  No-op when
-                # ``_kv_reserve_draft_tokens == get_draft_token_length(req)``
-                # (e.g. linear tree, static tree, or default dynamic-tree
-                # config where K*L == max_total_draft_tokens).
+                # Pad the resize up to _kv_reserve_draft_tokens (see __init__);
+                # no-op when reserve == draft_token_length.
                 reserve_slack = (self._kv_reserve_draft_tokens -
                                  get_draft_token_length(req))
                 if reserve_slack > 0:
