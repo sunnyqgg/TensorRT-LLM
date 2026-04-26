@@ -80,60 +80,28 @@ def _build_mask_and_position(
     previous_position_offsets: torch.Tensor,
     K: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused mask building + position offset computation for draft steps 1+.
-
-    Replaces multiple small kernel launches (zero_, gather, copy_, add) with
-    a single compiled graph.
-    """
-    batch_size = parent_mask.shape[0]
-    num_tokens_previous_layer = parent_mask.shape[1]
+    """Fused mask + position offset build for draft steps 1+."""
+    batch_size, num_tokens_previous_layer, _ = parent_mask.shape
     num_tokens_current_layer = num_tokens_previous_layer + K
-
-    # Gather parent mask rows for selected parents
-    selected_parents_expanded = selected_parents.unsqueeze(-1).expand(
-        batch_size, K, num_tokens_previous_layer
-    )
     parent_mask_selected = torch.gather(
-        parent_mask[:, -K:, :], dim=1, index=selected_parents_expanded
+        parent_mask[:, -K:, :],
+        1,
+        selected_parents.unsqueeze(-1).expand(batch_size, K, num_tokens_previous_layer),
     )
-
-    # Build current_mask: [batch, num_tokens_current_layer, num_tokens_current_layer]
-    # Top rows: zeros padding
-    padding = torch.zeros(
-        batch_size,
-        num_tokens_previous_layer,
-        num_tokens_current_layer,
-        dtype=parent_mask.dtype,
-        device=parent_mask.device,
-    )
-    # Bottom rows: [parent_mask_selected | tree_mask_init]
+    padding = parent_mask.new_zeros(batch_size, num_tokens_previous_layer, num_tokens_current_layer)
     bottom = torch.cat([parent_mask_selected, tree_mask_init], dim=2)
     current_mask = torch.cat([padding, bottom], dim=1)
-
-    # Position offsets: copy previous + append (parent_last_K + 1)
     new_positions = torch.cat(
-        [previous_position_offsets, previous_position_offsets[:, -K:] + 1],
-        dim=1,
+        [previous_position_offsets, previous_position_offsets[:, -K:] + 1], dim=1
     )
-
     return current_mask, new_positions
 
 
 @torch.compile(options={"max-autotune": True})
-def _gather_parent_hs(
-    hs_write_buffer: torch.Tensor,
-    read_idx: torch.Tensor,
-) -> torch.Tensor:
-    """Fused gather of parent hidden states.
-
-    Replaces gather(...unsqueeze...expand...) with a single compiled graph.
-    """
+def _gather_parent_hs(hs_write_buffer: torch.Tensor, read_idx: torch.Tensor) -> torch.Tensor:
+    """Fused gather of parent hidden states."""
     hs_dim = hs_write_buffer.shape[2]
-    return torch.gather(
-        hs_write_buffer,
-        1,
-        read_idx.unsqueeze(-1).expand(-1, -1, hs_dim),
-    )
+    return torch.gather(hs_write_buffer, 1, read_idx.unsqueeze(-1).expand(-1, -1, hs_dim))
 
 
 @triton.jit
@@ -235,13 +203,13 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         # Pre-allocated 2D buffers
         self.draft_tokens_buffer = torch.zeros(
-            max_batch_size, loop_max_tokens, dtype=torch.int64, device="cuda"
+            max_batch_size, loop_max_tokens, dtype=torch.int32, device="cuda"
         )
         self.position_ids_buffer = torch.zeros(
-            max_batch_size, loop_max_tokens, dtype=torch.int64, device="cuda"
+            max_batch_size, loop_max_tokens, dtype=torch.int32, device="cuda"
         )
         self.history_draft_tokens_buffer = torch.zeros(
-            (max_batch_size, (K + K * K * (max_draft_len - 1))), dtype=torch.int64, device="cuda"
+            (max_batch_size, (K + K * K * (max_draft_len - 1))), dtype=torch.int32, device="cuda"
         )
         self.history_score_buffer = torch.zeros(
             (max_batch_size, K + K * K * (max_draft_len - 1)), dtype=torch.float32, device="cuda"
@@ -272,7 +240,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
 
         self._accept_token = torch.zeros(
-            max_batch_size, max_draft_len + 1, dtype=torch.int64, device="cuda"
+            max_batch_size, max_draft_len + 1, dtype=torch.int32, device="cuda"
         )
         self._last_selected_parents = None
         self._kv_head_dim_bytes = None
@@ -308,82 +276,33 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             max_batch_size * tokens_per_gen_step, dtype=torch.int64, device="cuda"
         )
         self._candidates_buf = torch.zeros(
-            max_batch_size, tokens_per_gen_step, dtype=torch.int64, device="cuda"
+            max_batch_size, tokens_per_gen_step, dtype=torch.int32, device="cuda"
         )
         self._target_predict_buf = torch.zeros(
-            max_batch_size, tokens_per_gen_step, dtype=torch.int64, device="cuda"
+            max_batch_size, tokens_per_gen_step, dtype=torch.int32, device="cuda"
         )
-        # Pre-allocated buffer for retrieve_packed (avoids torch.stack allocation per verify)
-        self._retrieve_packed_buf = torch.zeros(
-            max_batch_size, tokens_per_gen_step, 3, dtype=torch.int32, device="cuda"
-        )
-
         # Step 0 input buffers
         max_total_tokens = max_batch_size * tokens_per_gen_step
-        self._step0_input_ids_buf = torch.zeros(max_total_tokens, dtype=torch.int64, device="cuda")
+        self._step0_input_ids_buf = torch.zeros(max_total_tokens, dtype=torch.int32, device="cuda")
         self._step0_position_ids_buf = torch.zeros(
-            max_total_tokens, dtype=torch.int64, device="cuda"
+            max_total_tokens, dtype=torch.int32, device="cuda"
         )
         self._step0_hidden_states_buf = None
         self._gather_ids_buf = torch.zeros(max_total_tokens, dtype=torch.long, device="cuda")
-        self._current_mask_buf = torch.zeros(
-            max_batch_size,
-            loop_max_tokens,
-            loop_max_tokens,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        self._new_pos_offset_buf = torch.zeros(
-            max_batch_size, loop_max_tokens, dtype=torch.int32, device="cuda"
-        )
 
-        # Mask repack scratch (graph-safe; avoids .contiguous() in the draft loop).
-        buf_dim = max(self.max_total_draft_tokens + 1, K * max_draft_len)
-        mask_width = (buf_dim + 31) // 32
-        self._mask_repack_buf = torch.zeros(
-            max_batch_size * buf_dim * mask_width, dtype=torch.int32, device="cuda"
-        )
-
-        # Both Hopper XQA and Blackwell prepareCustomMask now consume the
-        # same packed 1D mask layout (indexed via cumSeqLens / cumSeqLensQ).
-        # _needs_mask_repack is kept True unconditionally.
-        self._needs_mask_repack = True
-
-    def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
-        """Repack mask from padded 3D layout to packed 1D layout.
-
-        The XQA precompiled kernel reads the tree attention mask in packed
-        layout using cumulative sequence lengths (cuQSeqLens), with row
-        stride ``divUp(qSeqLen, 32)`` int32s — i.e. ``math.ceil(n_tok/32)``.
-
-        But Python writes the mask into the 3D tensor
-        ``[max_num_requests, buf_dim, stored_mask_width]`` where
-        ``stored_mask_width = ceil(buf_dim / 32)``.  When ``n_tok < buf_dim``,
-        the stored row width can exceed what the C++ kernel expects.
-
-        This function extracts valid rows *and* valid columns (trimming
-        to ``actual_mask_width = ceil(n_tok / 32)``) and writes them
-        contiguously (packed) at the start of the buffer.
-        Uses a pre-allocated scratch buffer for CUDA graph compatibility.
-        """
-        buf_dim = mask_buf.shape[1]
-        stored_mask_width = mask_buf.shape[2]
-        # C++ XQA kernel reads divUp(n_tok, 32) int32s per mask row.
+    def _get_compact_packed_mask_view(self, mask_buf, n_req, n_tok):
+        """Return a compact view matching the backend's packed 1D layout."""
         actual_mask_width = math.ceil(n_tok / 32)
-
-        needs_batch_repack = n_tok < buf_dim and n_req > 1
-        needs_width_repack = actual_mask_width < stored_mask_width
-
-        if not needs_batch_repack and not needs_width_repack:
-            return
-
         total_elems = n_req * n_tok * actual_mask_width
-        # Copy valid rows and columns to pre-allocated scratch buffer
-        scratch = self._mask_repack_buf[:total_elems].view(n_req, n_tok, actual_mask_width)
-        scratch.copy_(mask_buf[:n_req, :n_tok, :actual_mask_width])
-        # Write packed data to beginning of flat buffer (no overlap)
-        flat = mask_buf.view(-1)
-        flat[:total_elems] = scratch.view(-1)
+        return mask_buf.view(-1)[:total_elems].view(n_req, n_tok, actual_mask_width)
+
+    def _apply_spec_metadata(self, attn_metadata, batch_size, query_len):
+        """Set spec-dec gen lengths + position offset stride/query_len in one place."""
+        attn_metadata.spec_decoding_generation_lengths[:batch_size] = query_len
+        attn_metadata.position_offsets_stride = (
+            attn_metadata.spec_decoding_position_offsets.numel() // attn_metadata.max_num_requests
+        )
+        attn_metadata.position_offsets_query_len = query_len
 
     @nvtx_range("eagle3_dyn._ensure_spec_tree_manager")
     def _ensure_spec_tree_manager(self, resource_manager):
@@ -622,43 +541,30 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
 
         # === Step 0: Initial forward ===
-        with nvtx_range("eagle3_dyn.draft_step_0.setup_mask"):
-            num_step0_tokens = self._max_path_len
+        num_step0_tokens = self._max_path_len
 
-            # Triton kernel already wrote gen gather_ids into _gather_ids_buf;
-            # just prepend context gather_ids.
-            self._gather_ids_buf[:num_contexts].copy_(spec_metadata.gather_ids[:num_contexts])
-            gather_ids = self._gather_ids_buf[:batch_size]
+        # Triton kernel already wrote gen gather_ids into _gather_ids_buf;
+        # just prepend context gather_ids.
+        self._gather_ids_buf[:num_contexts].copy_(spec_metadata.gather_ids[:num_contexts])
+        gather_ids = self._gather_ids_buf[:batch_size]
 
-            if original_all_rank_num_tokens is not None:
-                attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+        if original_all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
         # Step-0 causal spec-dec (None in prefill-only warmup).
         if attn_metadata.spec_decoding_generation_lengths is not None:
-            # Gen kernel uses base data_ptr (no num_contexts offset); fill rows [:num_gens].
-            attn_metadata.spec_decoding_generation_lengths[:num_gens].fill_(num_step0_tokens)
-
-            # C++ kernel indexes with stride = input_seq_length (= num_step0_tokens),
-            # NOT buf_dim. Write data flat/compact with actual token stride.
-            _buf_dim = (
-                attn_metadata.spec_decoding_position_offsets.numel()
-                // attn_metadata.max_num_requests
-            )
             total = num_gens * num_step0_tokens
-            attn_metadata.spec_decoding_position_offsets[:total] = self._causal_offs[
-                :num_step0_tokens
-            ].repeat(num_gens)
-            attn_metadata.position_offsets_stride = _buf_dim
-            attn_metadata.position_offsets_query_len = num_step0_tokens
-
-            attn_metadata.spec_decoding_packed_mask[:num_gens].fill_(0)
-            attn_metadata.spec_decoding_packed_mask[:num_gens, :num_step0_tokens, 0] = (
-                self._step0_causal_mask[:num_step0_tokens]
+            dst = attn_metadata.spec_decoding_position_offsets[:total].view(
+                num_gens, num_step0_tokens
             )
-            # Repack mask from padded 3D to packed 1D layout.
-            self._repack_mask_padded_to_packed(
+            dst.copy_(self._causal_offs[:num_step0_tokens].unsqueeze(0).expand(num_gens, -1))
+            self._apply_spec_metadata(attn_metadata, num_gens, num_step0_tokens)
+
+            compact_mask = self._get_compact_packed_mask_view(
                 attn_metadata.spec_decoding_packed_mask, num_gens, num_step0_tokens
             )
+            compact_mask.zero_()
+            compact_mask[:, :, 0] = self._step0_causal_mask[:num_step0_tokens]
 
         attn_metadata.use_spec_decoding = num_gens > 0
 
@@ -668,148 +574,126 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= self._kv_correction
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-            with nvtx_range("eagle3_dyn.draft_step_0"):
-                with nvtx_range("eagle3_dyn.draft_step_0.draft_model_fwd"):
-                    hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+            hidden_states, hidden_states_to_save = draft_model.model(**inputs)
 
-                with nvtx_range("eagle3_dyn.draft_step_0.logits_and_sample"):
-                    step0_hs = hidden_states_to_save[gather_ids]
+            step0_hs = hidden_states_to_save[gather_ids]
 
-                    logits = draft_model.logits_processor(
-                        hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
-                    )
+            logits = draft_model.logits_processor(
+                hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
+            )
 
-                    new_draft_tokens, new_draft_scores = self.sample(
-                        logits, self.K, draft_model=draft_model
-                    )
+            new_draft_tokens, new_draft_scores = self.sample(
+                logits, self.K, draft_model=draft_model
+            )
 
-                with nvtx_range("eagle3_dyn.draft_step_0.update_tokens_scores"):
-                    previous_draft_scores = self.update_draft_tokens_and_scores(
-                        cur_draft_idx=0,
-                        new_draft_tokens=new_draft_tokens,
-                        new_draft_scores=new_draft_scores,
-                        previous_draft_scores=None,
-                        batch_size=batch_size,
-                        attn_metadata=attn_metadata,
-                    )
+            previous_draft_scores = self.update_draft_tokens_and_scores(
+                cur_draft_idx=0,
+                new_draft_tokens=new_draft_tokens,
+                new_draft_scores=new_draft_scores,
+                previous_draft_scores=None,
+                batch_size=batch_size,
+                attn_metadata=attn_metadata,
+            )
 
-                with nvtx_range("eagle3_dyn.draft_step_0.update_hidden_states"):
-                    self.update_hidden_states(
-                        cur_draft_idx=0,
-                        batch_size=batch_size,
-                        step0_hs=step0_hs,
-                    )
+            self.update_hidden_states(
+                cur_draft_idx=0,
+                batch_size=batch_size,
+                step0_hs=step0_hs,
+            )
 
-                with nvtx_range("eagle3_dyn.draft_step_0.prepare_for_gen"):
-                    self.prepare_for_generation(
-                        0,
-                        attn_metadata,
-                        batch_size,
-                        inputs=inputs,
-                        gather_ids=gather_ids,
-                        num_contexts=num_contexts,
-                        num_gens=num_gens,
-                        num_accepted_tokens=num_accepted_tokens,
-                    )
+            self.prepare_for_generation(
+                0,
+                attn_metadata,
+                batch_size,
+                inputs=inputs,
+                gather_ids=gather_ids,
+                num_contexts=num_contexts,
+                num_gens=num_gens,
+                num_accepted_tokens=num_accepted_tokens,
+            )
 
             for layer_idx in range(1, self.max_draft_len):
-                with nvtx_range(f"eagle3_dyn.draft_step_{layer_idx}"):
-                    num_tokens_per_req = layer_idx * self.K
+                num_tokens_per_req = layer_idx * self.K
 
-                    if original_all_rank_num_tokens is not None:
-                        if spec_metadata.all_rank_num_seqs is not None:
-                            attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
+                if original_all_rank_num_tokens is not None:
+                    if spec_metadata.all_rank_num_seqs is not None:
+                        attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
 
-                    with nvtx_range(f"eagle3_dyn.draft_step_{layer_idx}.prepare_inputs"):
-                        # Growing context: process ALL accumulated tokens
-                        num_infer_tokens = batch_size * num_tokens_per_req
+                # Growing context: process ALL accumulated tokens
+                num_infer_tokens = batch_size * num_tokens_per_req
 
-                        inp_hs = self._accumulated_hs[:batch_size, :num_tokens_per_req, :].reshape(
-                            num_infer_tokens, -1
-                        )
-                        inp_ids = (
-                            self.draft_tokens_buffer[:batch_size, :num_tokens_per_req]
-                            .reshape(-1)
-                            .to(torch.int32)
-                        )
-                        inp_pos = self.position_ids_buffer[
-                            :batch_size, :num_tokens_per_req
-                        ].reshape(-1)
-                        inputs = {
-                            "input_ids": inp_ids,
-                            "position_ids": inp_pos,
-                            "hidden_states": inp_hs,
-                            "attn_metadata": attn_metadata,
-                            "spec_metadata": spec_metadata,
-                        }
+                inp_hs = self._accumulated_hs[:batch_size, :num_tokens_per_req, :].reshape(
+                    num_infer_tokens, -1
+                )
+                inp_ids = self.draft_tokens_buffer[:batch_size, :num_tokens_per_req].reshape(-1)
+                inp_pos = self.position_ids_buffer[:batch_size, :num_tokens_per_req].reshape(-1)
+                inputs = {
+                    "input_ids": inp_ids,
+                    "position_ids": inp_pos,
+                    "hidden_states": inp_hs,
+                    "attn_metadata": attn_metadata,
+                    "spec_metadata": spec_metadata,
+                }
 
-                    with nvtx_range(f"eagle3_dyn.draft_step_{layer_idx}.draft_model_fwd"):
-                        hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+                hidden_states, hidden_states_to_save = draft_model.model(**inputs)
 
-                    with nvtx_range(f"eagle3_dyn.draft_step_{layer_idx}.logits_and_sample"):
-                        # Take last K logits per request
-                        hs_reshaped = hidden_states.reshape(batch_size, num_tokens_per_req, -1)
-                        selected_hs = hs_reshaped[:, -self.K :, :].reshape(batch_size * self.K, -1)
-                        logits = draft_model.logits_processor(
-                            selected_hs, draft_model.lm_head, attn_metadata, True
-                        )
-
-                        new_draft_tokens, new_draft_scores = self.sample(
-                            logits, self.K, draft_model=draft_model
-                        )
-
-                        # Reshape for update: [batch_size, K, K]
-                        new_draft_tokens = new_draft_tokens.reshape(batch_size, self.K, self.K)
-                        new_draft_scores = new_draft_scores.reshape(batch_size, self.K, self.K)
-
-                    with nvtx_range(f"eagle3_dyn.draft_step_{layer_idx}.update_tokens_scores"):
-                        previous_draft_scores = self.update_draft_tokens_and_scores(
-                            cur_draft_idx=layer_idx,
-                            new_draft_tokens=new_draft_tokens,
-                            new_draft_scores=new_draft_scores,
-                            previous_draft_scores=previous_draft_scores,
-                            batch_size=batch_size,
-                            attn_metadata=attn_metadata,
-                        )
-
-                    with nvtx_range(f"eagle3_dyn.draft_step_{layer_idx}.update_hidden_states"):
-                        self.update_hidden_states(
-                            cur_draft_idx=layer_idx,
-                            batch_size=batch_size,
-                            hidden_states_to_save=hidden_states_to_save,
-                            selected_parents=self._last_selected_parents,
-                        )
-
-                    with nvtx_range(f"eagle3_dyn.draft_step_{layer_idx}.prepare_for_gen"):
-                        self.prepare_for_generation(layer_idx, attn_metadata, batch_size)
-
-        # Resample final tokens and build tree
-        with nvtx_range("eagle3_dyn.resample_final"):
-            real_draft_tokens, topk_score_indices = self.resampling_final_draft_tokens(batch_size)
-
-        if spec_tree_manager is not None:
-            with nvtx_range("eagle3_dyn.build_dynamic_tree"):
-                # Build into contiguous work buffers indexed by bid (0..num_gens-1).
-                # Cannot use slotIds because padded dummies share dummy_slot_id.
-                self.tree_ops_converter.build_dynamic_tree(
-                    history_draft_tokens_parent_buffer=self.history_draft_tokens_parent_buffer[
-                        num_contexts:batch_size
-                    ],
-                    topk_score_indices=topk_score_indices[num_contexts:],
-                    tree_mask=spec_tree_manager.spec_dec_packed_mask[:num_gens],
-                    positions=spec_tree_manager.spec_dec_position_offsets[:num_gens],
-                    retrieve_index=spec_tree_manager.retrieve_index[:num_gens],
-                    retrieve_next_token=spec_tree_manager.retrieve_next_token[:num_gens],
-                    retrieve_next_sibling=spec_tree_manager.retrieve_next_sibling[:num_gens],
-                    use_packed_mask=True,
+                # Take last K logits per request
+                hs_reshaped = hidden_states.reshape(batch_size, num_tokens_per_req, -1)
+                selected_hs = hs_reshaped[:, -self.K :, :].reshape(batch_size * self.K, -1)
+                logits = draft_model.logits_processor(
+                    selected_hs, draft_model.lm_head, attn_metadata, True
                 )
 
-            with nvtx_range("eagle3_dyn.scatter_trees"):
-                ss = spec_tree_manager.slot_storage
-                gen_slots = ss.all_ids_buf[num_contexts:batch_size]
-                spec_tree_manager.scatter_to_slot_storage(ss, gen_slots, num_gens)
+                new_draft_tokens, new_draft_scores = self.sample(
+                    logits, self.K, draft_model=draft_model
+                )
 
-        return real_draft_tokens.to(torch.int32)
+                # Reshape for update: [batch_size, K, K]
+                new_draft_tokens = new_draft_tokens.reshape(batch_size, self.K, self.K)
+                new_draft_scores = new_draft_scores.reshape(batch_size, self.K, self.K)
+
+                previous_draft_scores = self.update_draft_tokens_and_scores(
+                    cur_draft_idx=layer_idx,
+                    new_draft_tokens=new_draft_tokens,
+                    new_draft_scores=new_draft_scores,
+                    previous_draft_scores=previous_draft_scores,
+                    batch_size=batch_size,
+                    attn_metadata=attn_metadata,
+                )
+
+                self.update_hidden_states(
+                    cur_draft_idx=layer_idx,
+                    batch_size=batch_size,
+                    hidden_states_to_save=hidden_states_to_save,
+                    selected_parents=self._last_selected_parents,
+                )
+
+                self.prepare_for_generation(layer_idx, attn_metadata, batch_size)
+
+        # Resample final tokens and build tree
+        real_draft_tokens, topk_score_indices = self.resampling_final_draft_tokens(batch_size)
+
+        if spec_tree_manager is not None:
+            # Build into contiguous work buffers indexed by bid (0..num_gens-1).
+            # Cannot use slotIds because padded dummies share dummy_slot_id.
+            self.tree_ops_converter.build_dynamic_tree(
+                history_draft_tokens_parent_buffer=self.history_draft_tokens_parent_buffer[
+                    num_contexts:batch_size
+                ],
+                topk_score_indices=topk_score_indices[num_contexts:],
+                tree_mask=spec_tree_manager.spec_dec_packed_mask[:num_gens],
+                positions=spec_tree_manager.spec_dec_position_offsets[:num_gens],
+                retrieve_index=spec_tree_manager.retrieve_index[:num_gens],
+                retrieve_next_token=spec_tree_manager.retrieve_next_token[:num_gens],
+                retrieve_next_sibling=spec_tree_manager.retrieve_next_sibling[:num_gens],
+                use_packed_mask=True,
+            )
+
+            slot_storage = spec_tree_manager.slot_storage
+            gen_slots = slot_storage.all_ids_buf[num_contexts:batch_size]
+            spec_tree_manager.scatter_to_slot_storage(slot_storage, gen_slots, num_gens)
+
+        return real_draft_tokens
 
     def _sample_and_accept_dynamic_tree(
         self, logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
@@ -818,73 +702,64 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         N = self.tokens_per_gen_step
         max_path_len = self._max_path_len
 
-        with nvtx_range("eagle3_dyn.verify.reset_buffers"):
-            # Reset output buffers
-            self._accepted_tokens_buf[:batch_size].zero_()
-            accepted_tokens = self._accepted_tokens_buf[:batch_size, :max_path_len]
-            self._num_accepted_tokens_buf[:batch_size].fill_(1)
-            num_accepted_tokens = self._num_accepted_tokens_buf[:batch_size]
-            self._accepted_draft_indices_tensor[:batch_size].fill_(-1)
+        # Reset output buffers
+        self._accepted_tokens_buf[:batch_size].zero_()
+        accepted_tokens = self._accepted_tokens_buf[:batch_size, :max_path_len]
+        self._num_accepted_tokens_buf[:batch_size].fill_(1)
+        num_accepted_tokens = self._num_accepted_tokens_buf[:batch_size]
+        self._accepted_draft_indices_tensor[:batch_size].fill_(-1)
 
-        with nvtx_range("eagle3_dyn.verify.argmax"):
-            num_flat_tokens = logits.shape[0]
-            torch.argmax(logits, dim=-1, out=self._target_tokens_buf[:num_flat_tokens])
-            target_tokens = self._target_tokens_buf[:num_flat_tokens]
+        num_flat_tokens = logits.shape[0]
+        # torch.argmax writes LongTensor indices; token storage below remains int32.
+        torch.argmax(logits, dim=-1, out=self._target_tokens_buf[:num_flat_tokens])
+        target_tokens = self._target_tokens_buf[:num_flat_tokens]
 
         # Context requests: accept sampled token
-        accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts].to(torch.int32)
+        accepted_tokens[:num_contexts, 0].copy_(target_tokens[:num_contexts])
 
         # Generation requests: tree verification
         if num_gens > 0:
             spec_tree_manager = self.spec_tree_manager
 
-            with nvtx_range("eagle3_dyn.verify.prepare_candidates"):
-                target_predict = self._target_predict_buf[:num_gens]
-                target_predict[:] = target_tokens[num_contexts:].reshape(num_gens, N)
+            target_predict = self._target_predict_buf[:num_gens]
+            target_predict.copy_(target_tokens[num_contexts:].reshape(num_gens, N))
 
-                if spec_tree_manager is None:
-                    # CUDA graph warmup: accept only the first token per request
-                    num_accepted_tokens[num_contexts:batch_size] = 1
-                    accepted_tokens[num_contexts:batch_size, 0] = target_predict[:, 0].to(
-                        torch.int32
-                    )
-                    self._accepted_draft_indices_tensor[num_contexts:batch_size] = -1
-                    return accepted_tokens, num_accepted_tokens
+            if spec_tree_manager is None:
+                # CUDA graph warmup: accept only the first token per request
+                num_accepted_tokens[num_contexts:batch_size] = 1
+                accepted_tokens[num_contexts:batch_size, 0] = target_predict[:, 0]
+                self._accepted_draft_indices_tensor[num_contexts:batch_size] = -1
+                return accepted_tokens, num_accepted_tokens
 
-                candidates = self._candidates_buf[:num_gens]
-                candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, N - 1).to(
-                    torch.int64
+            candidates = self._candidates_buf[:num_gens]
+            candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, N - 1)
+            candidates[:, 0] = target_predict[:, 0]
+
+            slot_storage = spec_tree_manager.slot_storage
+            gen_slot_ids = slot_storage.all_ids_buf[num_contexts : num_contexts + num_gens]
+            tree_valid = slot_storage.has_tree[gen_slot_ids]
+
+            retrieve_packed = slot_storage.pack_retrieve_from_slots(gen_slot_ids, num_gens)
+
+            accept_index, accept_token_num, accept_token = (
+                self.tree_ops_converter.verify_dynamic_tree_greedy_out_packed(
+                    candidates,
+                    retrieve_packed,
+                    target_predict,
+                    num_gens,
+                    self._max_path_len,
+                    tree_valid=tree_valid,
                 )
-                candidates[:, 0] = target_predict[:, 0]
-
-            with nvtx_range("eagle3_dyn.verify.tree_validity"):
-                ss = spec_tree_manager.slot_storage
-                gen_slot_ids = ss.all_ids_buf[num_contexts : num_contexts + num_gens]
-                tree_valid = ss.has_tree[gen_slot_ids]
-
-            with nvtx_range("eagle3_dyn.verify.pack_retrieve"):
-                retrieve_packed = ss.pack_retrieve_from_slots(gen_slot_ids, num_gens)
-
-            with nvtx_range("eagle3_dyn.verify.verify_tree_greedy"):
-                _, accept_index, accept_token_num, accept_token = (
-                    self.tree_ops_converter.verify_dynamic_tree_greedy_out_packed(
-                        candidates,
-                        retrieve_packed,
-                        target_predict,
-                        num_gens,
-                        self._max_path_len,
-                        tree_valid=tree_valid,
-                    )
-                )
+            )
 
             self._accept_token = accept_token
             n_acc_draft = accept_token_num[:num_gens]
-            num_accepted_tokens[num_contexts:batch_size] = (n_acc_draft + 1).to(torch.int32)
-            accepted_tokens[num_contexts:batch_size] = accept_token[:num_gens].to(torch.int32)
+            num_accepted_tokens[num_contexts:batch_size] = n_acc_draft + 1
+            accepted_tokens[num_contexts:batch_size] = accept_token[:num_gens]
             # accept_index is 0-based from kernel; -1 converts padding (0) to sentinel (-1)
             self._accepted_draft_indices_tensor[num_contexts:batch_size] = (
                 accept_index[:num_gens, 1:max_path_len] - 1
-            ).to(torch.int32)
+            )
 
         num_accepted_tokens = self._apply_force_accepted_tokens(
             num_accepted_tokens, num_contexts, self.max_draft_len
@@ -995,33 +870,25 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         batch_size = attn_metadata.num_seqs
         num_tokens_current_layer = self.K * (cur_draft_idx + 1)
         num_tokens_previous_layer = self.K * cur_draft_idx
+        compact_mask = self._get_compact_packed_mask_view(
+            attn_metadata.spec_decoding_packed_mask, batch_size, num_tokens_current_layer
+        )
         if cur_draft_idx == 0:
-            attn_metadata.spec_decoding_packed_mask.fill_(0)
             spec_tree_manager.compute_spec_dec_packed_mask(
                 self.tree_mask_init_buffer[:batch_size],
-                attn_metadata.spec_decoding_packed_mask[:batch_size],
+                compact_mask,
             )
             self.tree_mask_buffer[
                 : batch_size * num_tokens_current_layer * num_tokens_current_layer
             ].copy_(self.tree_mask_init_buffer[:batch_size].view(-1))
             attn_metadata.spec_decoding_position_offsets.fill_(0)
-            attn_metadata.spec_decoding_generation_lengths[:batch_size] = num_tokens_current_layer
-            _buf_dim = (
-                attn_metadata.spec_decoding_position_offsets.numel()
-                // attn_metadata.max_num_requests
-            )
-            attn_metadata.position_offsets_stride = _buf_dim
-            attn_metadata.position_offsets_query_len = num_tokens_current_layer
+            self._apply_spec_metadata(attn_metadata, batch_size, num_tokens_current_layer)
         else:
             num_parent_mask = batch_size * cur_draft_idx * self.K * cur_draft_idx * self.K
             parent_mask = self.tree_mask_buffer[:num_parent_mask].reshape(
                 batch_size, cur_draft_idx * self.K, cur_draft_idx * self.K
             )
 
-            _buf_dim = (
-                attn_metadata.spec_decoding_position_offsets.numel()
-                // attn_metadata.max_num_requests
-            )
             prev_total = batch_size * num_tokens_previous_layer
             previous_position_offsets = attn_metadata.spec_decoding_position_offsets[
                 :prev_total
@@ -1036,26 +903,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 self.K,
             )
 
-            spec_tree_manager.compute_spec_dec_packed_mask(
-                current_mask, attn_metadata.spec_decoding_packed_mask[:batch_size]
-            )
+            spec_tree_manager.compute_spec_dec_packed_mask(current_mask, compact_mask)
             self.tree_mask_buffer[
                 : batch_size * num_tokens_current_layer * num_tokens_current_layer
             ].copy_(current_mask.reshape(-1))
 
-            attn_metadata.spec_decoding_generation_lengths[:batch_size] = num_tokens_current_layer
-
             cur_total = batch_size * num_tokens_current_layer
             attn_metadata.spec_decoding_position_offsets[:cur_total] = new_positions.reshape(-1)
-            attn_metadata.position_offsets_stride = _buf_dim
-            attn_metadata.position_offsets_query_len = num_tokens_current_layer
-
-        # Repack mask from padded 3D to packed 1D layout.  Both Hopper
-        # XQA (cuQSeqLens) and Blackwell prepareCustomMask (cumSeqLensQ)
-        # now consume the same packed layout.
-        self._repack_mask_padded_to_packed(
-            attn_metadata.spec_decoding_packed_mask, batch_size, num_tokens_current_layer
-        )
+            self._apply_spec_metadata(attn_metadata, batch_size, num_tokens_current_layer)
 
     def prepare_for_generation(
         self,

@@ -3776,7 +3776,6 @@ class PyTorchModelEngine(ModelEngine):
                 spec_tree_manager.slot_storage.fill_all_slot_ids(
                     scheduled_requests.context_requests,
                     scheduled_requests.generation_requests,
-                    spec_tree_manager.slot_storage.dummy_slot_id,
                 )
 
             attn_metadata.update_spec_dec_param(
@@ -3788,7 +3787,8 @@ class PyTorchModelEngine(ModelEngine):
                 max_total_draft_tokens=sd_max_total,
                 model_is_wrapped=self.model_is_wrapped,
                 spec_metadata=spec_metadata,
-                spec_tree_manager=spec_tree_manager)
+                spec_tree_manager=spec_tree_manager,
+                num_contexts=scheduled_requests.num_context_requests)
         else:
             spec_resource_manager = None
             spec_metadata = None
@@ -3842,7 +3842,6 @@ class PyTorchModelEngine(ModelEngine):
                 spec_tree_manager.slot_storage.fill_all_slot_ids(
                     padded_requests.context_requests,
                     padded_requests.generation_requests,
-                    spec_tree_manager.slot_storage.dummy_slot_id,
                 )
 
             inputs, gather_ids = self._prepare_inputs(
