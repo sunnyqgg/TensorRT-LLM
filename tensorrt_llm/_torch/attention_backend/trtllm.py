@@ -1635,52 +1635,40 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 n_dt = spec_tree_manager.max_total_draft_tokens + 1
                 buf_dim = spec_tree_manager._internal_buf_dim
 
-                # buf_dim >= n_dt by spec_tree_manager construction
-                # (max(n_dt, K*max_draft_len)).  When buf_dim > n_dt the
-                # destination view strides on buf_dim columns/rows while only
-                # the first n_dt are valid; downstream reshape paths
-                # (_reshape_position_offsets_for_cpp,
-                # _adjust_position_ids_for_spec_dec) honor the stride explicitly
-                # and produce a contiguous [num_gens, n_dt] tensor for the C++
-                # kernel and Python RoPE respectively.
+                # buf_dim >= n_dt by construction (max(n_dt, K*max_draft_len)).
+                # When buf_dim > n_dt, downstream reshape paths
+                # (_reshape_position_offsets_for_cpp, _adjust_position_ids_for_spec_dec)
+                # honor the stride and produce a contiguous [num_gens, n_dt] tensor.
                 assert buf_dim >= n_dt, (
                     f"Dynamic-tree copy requires buf_dim >= n_dt; got "
                     f"buf_dim={buf_dim}, n_dt={n_dt}.")
 
-                ss = spec_tree_manager.slot_storage
+                slot_storage = spec_tree_manager.slot_storage
 
-                # The slot-storage layout is [ctx | gen]; dynamic-tree metadata
-                # only describes the gen rows.  Skip the leading context rows
-                # so row-i in the destination corresponds to gen-i, which is
-                # what the XQA kernel (and downstream packed_mask consumers)
-                # expect.  Rows [num_gens..max_num_requests) are left as
-                # padding; the kernel only reads [0..num_gens).
+                # all_ids_buf is laid out as [ctx | gen]; skip ctx so dest row-i
+                # is gen-i (the XQA kernel reads only [0..num_gens)).
                 num_gens = batch_size - num_contexts
                 if num_gens > 0:
-                    slot_ids = ss.all_ids_buf[num_contexts:batch_size]
+                    slot_ids = slot_storage.all_ids_buf[num_contexts:batch_size]
 
-                    # Position offsets — explicit 2-D destination view so the
-                    # per-row stride is buf_dim (matching the buffer layout)
-                    # while we only write the first n_dt columns.
-                    pos_src = torch.index_select(ss.position_offsets, 0,
-                                                 slot_ids)[:, :n_dt]
+                    # 2-D dest view: per-row stride = buf_dim, written cols = n_dt.
+                    pos_src = torch.index_select(slot_storage.position_offsets,
+                                                 0, slot_ids)[:, :n_dt]
                     pos_dst = self.spec_decoding_position_offsets.view(
                         self.max_num_requests, -1)[:num_gens, :n_dt]
                     pos_dst.copy_(pos_src, non_blocking=True)
                     self.position_offsets_stride = buf_dim
                     self.position_offsets_query_len = n_dt
 
-                    # Packed mask — flat write at stride n_dt × actual_mask_width
-                    # per request. The C++ FMHA kernel reads this buffer flat
-                    # using ``spec_decoding_max_generation_length = n_dt`` as
-                    # the per-request stride (see attentionOp.cpp:546-547);
-                    # writing via the natural [m, buf_dim, ceil(buf_dim/32)]
-                    # 3-D view would mis-align rows whenever buf_dim > n_dt
-                    # (dynamic-tree under-budget configs, e.g. draft30 with
-                    # K=10, max_draft_len=6 → buf_dim=60, n_dt=31).
+                    # Flat write: C++ FMHA reads this using
+                    # spec_decoding_max_generation_length = n_dt as per-request stride
+                    # (attentionOp.cpp:546-547). A 3-D [m, buf_dim, ceil(buf_dim/32)]
+                    # write would mis-align rows when buf_dim > n_dt (under-budget
+                    # configs, e.g. draft30 K=10 L=6 -> buf_dim=60, n_dt=31).
                     actual_mask_width = math.ceil(n_dt / 32)
                     mask_src = torch.index_select(
-                        ss.packed_mask, 0, slot_ids)[:, :, :actual_mask_width]
+                        slot_storage.packed_mask, 0,
+                        slot_ids)[:, :, :actual_mask_width]
                     total = num_gens * n_dt * actual_mask_width
                     self.spec_decoding_packed_mask.view(-1)[:total].copy_(
                         mask_src.reshape(-1), non_blocking=True)
