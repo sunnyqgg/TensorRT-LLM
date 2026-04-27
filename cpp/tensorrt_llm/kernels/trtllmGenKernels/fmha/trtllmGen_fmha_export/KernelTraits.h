@@ -1,19 +1,19 @@
-/*
- * Copyright (c) 2011-2026, NVIDIA CORPORATION.  All rights reserved.
+/***************************************************************************************************
+ * Copyright (c) 2011-2024, NVIDIA CORPORATION.  All rights reserved.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Redistribution and use in source and binary forms, with or without modification, are not permit-
+ * ted.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+ * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
+ **************************************************************************************************/
 #pragma once
 
 #ifdef TLLM_FMHA_TRTLLM_COMPAT
@@ -134,13 +134,9 @@ struct KernelConfig : public KernelConfigBase {
     }
 
     // Set numStagesQ for headDim > 128 kernels.
-    bool const isGenerationSkipSoftmax =
-      options.mSkipsSoftmaxWhenPossible && !isContextKernel(options.mFmhaKernelType);
-    if (mNumInstsQ * mNumInstsKv == 1 && !isGenerationSkipSoftmax) {
+    if (mNumInstsQ * mNumInstsKv == 1) {
       TLLM_CHECK_INFO(mTileSizeQ == 64 || (mHeadDimQk > 128 && mHeadDimV > 128),
                       "Consider using numInstsQ = 2 for better performance.");
-    }
-    if (mNumInstsQ * mNumInstsKv == 1) {
       // There is no enough shared memory for 2 stages when the headDim is not split into multiple
       // stages.
       if (mHeadDimPerStageKv == 0 && keepsMmaAbForDsMlaGen) {
@@ -197,16 +193,34 @@ struct KernelConfig : public KernelConfigBase {
       mNumStagesKv = mNumStagesK + mNumStagesV;
     } else {
 
+      // {$nv-internal-release begin}
+      // TODO (perkzz): Rubin has more smem size, which might need to fine-tune numStagesKv for all
+      // kernels.
+      // {$nv-internal-release end}
 
       // If dtypeQ != dtypeKv, the kv elements will be converted to dtypeQ in smemTransformedKv,
       // so the number of stages will be computed based on dtypeQ.
       mNumStagesKv = 3;
+// {$nv-internal-release begin}
+// Set numStagesKv for rubin numInstsQ = 2 kernels.
+#ifdef TLLM_RUBIN_FEATURES
+      if (isArchRubin(options.mCudaArch) && mNumInstsQ == 2) {
+        // Assume maximum 96KB of smemKv can be used.
+        mNumStagesKv = calculateNumStagesKv(96);
+      }
+#endif // TLLM_RUBIN_FEATURES
+       // {$nv-internal-release end}
 
       // When the headDim is not split into multiple stages, we can use at most 4 stages for e4m3
       // data type.
       if (mHeadDimPerStageKv == 0 && keepsMmaAbForDsMlaGen) {
         TLLM_CHECK_ERROR(options.mSeparateSmemKv, "Not supported");
         mNumStagesKv = int32_t{4 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
+#ifdef TLLM_RUBIN_FEATURES
+        if (tg::isArchRubin(options.mCudaArch)) {
+          mNumStagesKv = int32_t{6 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
+        }
+#endif // TLLM_RUBIN_FEATURES
       } else if (keepsMmaAbForDsMlaGen) {
         // For DS MLA-generation kernels with keepsMmaAb, we can only have at most 8 stages for e4m3
         // data type.
@@ -223,6 +237,12 @@ struct KernelConfig : public KernelConfigBase {
         int32_t totalNumKBSmemQ = numHeadDimBytes * mTileSizeQ / 1024;
         // The maximum buffer size for smemKv (at most 144KB for KV, and at most 218KB for Qkv).
         int32_t maxBufferSizeKBForSmemKv = std::min(144, 218 - totalNumKBSmemQ * mNumStagesQ);
+        // SwapsMmaAb CGA-reduction kernels allocate the reduction buffer in addition to smemKv.
+        // For DS MLA Q32, the generic 144KB KV budget exceeds the Blackwell 228KB smem cap.
+        if (mSwapsMmaAb && isCgaSmemReduction(mMultiCtasKvMode) && mIsMlaGen && mHeadDimQk == 576 &&
+            mHeadDimV == 512 && mTileSizeQ == 32) {
+          maxBufferSizeKBForSmemKv = std::min(maxBufferSizeKBForSmemKv, 136);
+        }
         // Calculate the number of stages for smemKv.
         mNumStagesKv = calculateNumStagesKv(maxBufferSizeKBForSmemKv);
       }
@@ -240,6 +260,13 @@ struct KernelConfig : public KernelConfigBase {
 
     // Set the number of tmem cols we will allocate once.
     mNumTmemCols = 512;
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+    if (isArchRubin(options.mCudaArch)) {
+      mNumTmemCols = 576;
+    }
+#endif // TLLM_RUBIN_FEATURES
+    // {$nv-internal-release end}
     // Set the softmax statistics tile size.
     mTileSizeStats = 32;
     // Set epilogue tile sizes for each instance in the M dimension.
@@ -425,6 +452,14 @@ struct MmaTraits {
     // The Atom Mma for Q * K^T.
     mAtomQkM = options.mSwapsMmaAb ? options.mTileSizeKv : options.mTileSizeQ;
     mAtomQkN = options.mSwapsMmaAb ? options.mTileSizeQ : options.mTileSizeKv;
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+    // For QMMAs with K=64, the M dimension must be 128 for 1cta mode and 256 for 2cta mode.
+    if (tg::isArchRubin(options.mCudaArch) && mAtomQkM == 128) {
+      mAtomQkK = isMma8BitBmm1 ? 64 : 16;
+    } else
+#endif // TLLM_RUBIN_FEATURES
+    // {$nv-internal-release end}
     {
       mAtomQkK = isMma8BitBmm1 ? 32 : 16;
     }
@@ -465,6 +500,13 @@ struct MmaTraits {
     }
 
     // The K dimension.
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+    if (tg::isArchRubin(options.mCudaArch) && mAtomPvM == 128) {
+      mAtomPvK = isMma8BitBmm2 ? 64 : 16;
+    } else
+#endif // TLLM_RUBIN_FEATURES
+    // {$nv-internal-release end}
     {
       mAtomPvK = isMma8BitBmm2 ? 32 : 16;
     }
@@ -608,6 +650,15 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
     // Make sure the two MMAs consume the same K width in bits.
     int32_t bmm1KBits = mAtomQkK * tg::dtypeGetNumBits(mDtypeBmm1);
     int32_t bmm2KBits = mAtomPvK * tg::dtypeGetNumBits(mDtypeBmm2);
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+    // For Rubin, the K dimension of BMM1 and BMM2 can be different.
+    if (tg::isArchRubin(options.mCudaArch)) {
+      TLLM_CHECK_ERROR(bmm1KBits == bmm2KBits || (mAtomQkK == 64 || mAtomPvK == 64),
+                       "BMM1-K and BMM2-K must have equal K width in bits or one of them is 64.");
+    } else
+#endif // TLLM_RUBIN_FEATURES
+       // {$nv-internal-release end}
     {
       // For other architectures, the K width in bits of BMM1 and BMM2 must be the same.
       TLLM_CHECK_ERROR(bmm1KBits == bmm2KBits,
@@ -650,6 +701,13 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
 
     // The HW is designed to have NumEltsIn128B elements consumed by 4 UTC?Mmas in the K
     // dimension.
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+    if (tg::isArchRubin(options.mCudaArch) && mAtomQkK == 64) {
+      TLLM_CHECK_ERROR(numEltsIn128BQ == mAtomQkK * 2, "Internal error");
+    } else
+#endif // TLLM_RUBIN_FEATURES
+    // {$nv-internal-release end}
     {
       TLLM_CHECK_ERROR(numEltsIn128BQ == mAtomQkK * 4, "Internal error");
     }

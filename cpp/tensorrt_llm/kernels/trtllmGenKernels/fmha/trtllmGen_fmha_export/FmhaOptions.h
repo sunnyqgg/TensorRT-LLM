@@ -1,19 +1,19 @@
-/*
+/***************************************************************************************************
  * Copyright (c) 2011-2026, NVIDIA CORPORATION.  All rights reserved.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Redistribution and use in source and binary forms, with or without modification, are not permit-
+ * ted.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+ * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
+ **************************************************************************************************/
 #pragma once
 
 #include "KernelTraits.h"
@@ -83,6 +83,14 @@ struct FmhaOptions : public KernelConfigBase {
   int mNumPagesInMemPool{0};
   // The number of causal-mask spec-decoding tokens (it is fixed in the batch).
   int mNumSpecDecodingTokens{0};
+  // True for tree-based speculative decoding (Eagle3 dynamic tree, MTP tree, etc.).
+  // When set, FmhaAutoTuner takes the spec-dec tree kernel selection path which uses
+  // numTokensHeadsQ = mNumHeadsQPerKv * mSpecDecodingTargetMaxGenLen as the heuristic.
+  bool mIsSpecDecTree{false};
+  // For spec-dec tree only: equals max_total_draft_tokens + 1, fixed at config time.
+  // Used as a deterministic upper bound for kernel selection (does NOT depend on
+  // per-iteration tensor shapes, so kernel selection is reproducible across calls).
+  int mSpecDecodingTargetMaxGenLen{0};
   // Warmup steps.
   int mNumWarmUpSteps{0};
   // The maximum number of waves for the multiCtasKvMode.
@@ -137,6 +145,8 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mNumLoopItersForPrint);
     TO_JSON(mNumPagesInMemPool);
     TO_JSON(mNumSpecDecodingTokens);
+    TO_JSON(mIsSpecDecTree);
+    TO_JSON(mSpecDecodingTargetMaxGenLen);
     TO_JSON(mNumWarmUpSteps);
     TO_JSON(mMaxNumWavesForCtasKvMode);
     TO_JSON(mOutputScale);
@@ -470,7 +480,51 @@ inline void checkFmhaOptions(FmhaOptions const& options,
                      "MLA gen kernels haven't supported mGroupsTokensHeadsQ yet.");
   }
 
+  // {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+  if (options.mLamportForceValid) {
+    TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
+                     "lamportForceValid is only supported with fuseEpilogueIntoCorr");
+    TLLM_CHECK_ERROR(!tg::dtypeIsBlockFmt(options.mDtypeOut),
+                     "lamportForceValid does not support block scaling outputs");
+    TLLM_CHECK_ERROR(isDisabled(options.mMultiCtasKvMode),
+                     "lamportForceValid does not support multi-CTA mode");
+    TLLM_CHECK_ERROR(
+      isSwapsMmaAbForGenerationKernel(options.mFmhaKernelType) ||
+        isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType),
+      "lamportForceValid has not been tested with context or generation kernel types.");
 
+    TLLM_CHECK_ERROR(options.mClusterDimX == 1,
+                     "Lamport producer is not compatible with 2 CTA mode");
+
+    TLLM_CHECK_ERROR(
+      options.mHeadDimPerStageKv == 0,
+      "Lamport producer is only compatible with a single iteration of the head dim loop");
+
+    // TODO Are there more features that are not compatible?
+  }
+  if (options.mLamportProducer) {
+    TLLM_CHECK_ERROR(options.mLamportForceValid, "lamportProducer requires lamportForceValid");
+  }
+#endif // TLLM_RUBIN_FEATURES
+  // {$nv-internal-release end}
+
+  // {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+  if (options.mUsesSpcompress) {
+    TLLM_CHECK_ERROR(options.mCudaArch == tg::CudaArch::Sm107a,
+                     "Sparse attention is only supported on sm_107a.");
+    TLLM_CHECK_ERROR(options.mFmhaKernelType == FmhaKernelType::Context,
+                     "Sparse attention is only supported with context kernel.");
+    TLLM_CHECK_ERROR(options.mDtypeQ == tg::Dtype::E4m3 || options.mDtypeQ == tg::Dtype::E4m3,
+                     "Sparse attention is only supported with e4m3.");
+    TLLM_CHECK_ERROR(options.mClusterDimX == 1,
+                     "Sparse attention is not compatible with 2 CTA mode.");
+    TLLM_CHECK_ERROR(options.mMaskType != AttentionMaskType::Custom,
+                     "Sparse attention is not compatible with custom mask.");
+  }
+#endif // TLLM_RUBIN_FEATURES
+  // {$nv-internal-release end}
 
   // For transformed K/V, MmaOrder must be Pv0_Qk0_Pv1_Qk1.
   if (options.mDtypeQ != options.mDtypeKv) {

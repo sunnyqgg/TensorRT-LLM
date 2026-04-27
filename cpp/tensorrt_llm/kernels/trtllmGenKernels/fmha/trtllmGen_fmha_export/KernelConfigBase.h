@@ -1,19 +1,19 @@
-/*
+/***************************************************************************************************
  * Copyright (c) 2011-2026, NVIDIA CORPORATION.  All rights reserved.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Redistribution and use in source and binary forms, with or without modification, are not permit-
+ * ted.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+ * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
+ **************************************************************************************************/
 #pragma once
 
 #include <trtllm/gen/CudaArchDecl.h>
@@ -471,7 +471,8 @@ template <> inline std::string toString(MmaOrder e) {
   X(bool, mBalancesWorkloadForCausalMask, false, bool)                                             \
   /* The cluster dimension in the X dimension. */                                                  \
   X(int, mClusterDimX, 1, int)                                                                     \
-  X(bool, mKnob1, true, bool)                                                             \
+  /* Annotate the masking code path with ColdBlock to indicate less traversed path. */             \
+  X(bool, mColdBlockTmemS, true, bool)                                                             \
   /* The CUDA arch. */                                                                             \
   X(tg::CudaArch, mCudaArch, tg::CudaArch::Sm100a, int)                                            \
   /* The data type of MMA accumulators. */                                                         \
@@ -535,6 +536,7 @@ template <> inline std::string toString(MmaOrder e) {
   X(MmaOrder, mMmaOrder, MmaOrder::Pv0_Qk0_Pv1_Qk1, int)                                           \
   /* The multiCtasKvMode. */                                                                       \
   X(MultiCtasKvMode, mMultiCtasKvMode, MultiCtasKvMode::Disabled, int)                             \
+  /* Delay downcast until N-th exps to hide exp latency (17 clks); must be a multiple of 4. */     \
   X(int, mNumDelayedCvtElts, 12, int)                                                              \
   /* The number of elements per block for Sage Attention (for K). */                               \
   /* 0 => we don't use Sage Attention. */                                                          \
@@ -566,7 +568,9 @@ template <> inline std::string toString(MmaOrder e) {
   /* Beneficial only when BMM1 cycles == softmax cycles where neither dominates. */                \
   X(int, mNumKPartitionsMmaPv, 2, int)                                                             \
   /* Signal at the last N remaining exps to cover the */                                           \
+  /* OrderedSequenceBarriers latency (~40 clks). */                                                \
   X(int, mNumLeadingExpElts, 6, int)                                                               \
+  /* Delay exp until N-th FMAs to hide FMA latency (7 clks); must be a multiple of 2. */           \
   X(int, mNumPrefetchedFmas, 4, int)                                                               \
   /* The paged-kv configurations. The number of tokens in one pageKv. */                           \
   X(int32_t, mNumTokensPerPage, 32, int32_t)                                                       \
@@ -629,13 +633,50 @@ template <> inline std::string toString(MmaOrder e) {
   X(bool, mUsesOrderedSequence, true, bool)                                                        \
   /* Whether to use CGA reduction (deprecated, kept for benchmarking). */                          \
   X(bool, mUsesCgaReduction, false, bool)                                                          \
-  X(bool, mKnob2, true, bool)                                                      \
-  X(bool, mKnob3, true, bool)                                                         \
-  X(bool, mKnob4, true, bool)
+  /* Switch warps opportunistically during rowsum to unblock softmax sequence. */                  \
+  X(bool, mWarpSwitchTmemSoftmax, true, bool)                                                      \
+  /* Switch warps opportunistically during correction to unblock softmax sequence. */              \
+  X(bool, mWarpSwitchTmemCorr, true, bool)                                                         \
+  /* Switch warps opportunistically during max reduction to unblock softmax sequence. */           \
+  X(bool, mWarpSwitchTmemS, true, bool)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// {$nv-internal-release begin}
+#ifdef TLLM_PUBLIC_RELEASE
+// {$nv-internal-release end}
 #define KERNEL_CONFIG_BASE_FIELDS_EXTRA(X)
+// {$nv-internal-release begin}
+#else
+
+#ifdef TLLM_RUBIN_FEATURES
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA_RUBIN(X)                                                   \
+  /* Whether the kernel forces the output to be valid values */                                    \
+  /* (not -0.0 for FP and NAN for UE8m0). */                                                       \
+  X(bool, mLamportForceValid, false, bool)                                                         \
+  /* Whether the kernel is a Lamport producer */                                                   \
+  /* (invalidates output buffer prior to writing results). */                                      \
+  X(bool, mLamportProducer, false, bool)                                                           \
+  /* Whether to use tcgen05.ld.spcompress to compress S before softmax (and thus P). */            \
+  X(bool, mUsesSpcompress, false, bool)
+#else
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA_RUBIN(X)
+#endif // TLLM_RUBIN_FEATURES
+
+#if defined(TLLM_RUBIN_FEATURES) && defined(TLLM_TEST)
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA_LAMPORT_TEST(X)                                            \
+  /* Whether the Lamport Producer kernel invalidates a separate buffer (used for testing only). */ \
+  X(bool, mLamportSeparateInvalidation, false, bool)
+#else
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA_LAMPORT_TEST(X)
+#endif // defined(TLLM_RUBIN_FEATURES) && defined(TLLM_TEST)
+
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA(X)                                                         \
+  KERNEL_CONFIG_BASE_FIELDS_EXTRA_RUBIN(X)                                                         \
+  KERNEL_CONFIG_BASE_FIELDS_EXTRA_LAMPORT_TEST(X)
+
+#endif // TLLM_PUBLIC_RELEASE
+// {$nv-internal-release end}
 
 #define KERNEL_CONFIG_BASE_FIELDS(X)                                                               \
   KERNEL_CONFIG_BASE_FIELDS_BASE(X)                                                                \
@@ -700,3 +741,8 @@ template <> struct hash<fmha::KernelConfigBase> {
 #undef KERNEL_CONFIG_BASE_FIELDS
 #undef KERNEL_CONFIG_BASE_FIELDS_BASE
 #undef KERNEL_CONFIG_BASE_FIELDS_EXTRA
+// {$nv-internal-release begin}
+// It's ok to undefine a macro that is not defined.
+#undef KERNEL_CONFIG_BASE_FIELDS_EXTRA_RUBIN
+#undef KERNEL_CONFIG_BASE_FIELDS_EXTRA_LAMPORT_TEST
+// {$nv-internal-release end}

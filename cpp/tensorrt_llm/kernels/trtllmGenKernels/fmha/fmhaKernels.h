@@ -301,7 +301,8 @@ public:
 
         bool shouldUseNvrtc = options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && !options.mIsMlaGen
             && options.mDtypeK != tg::Dtype::E2m1 && options.mHeadDimQk != 64 && !isLlama70bFp4Tp4
-            && !isTokenSparse(options.mSparseType);
+            && !isTokenSparse(options.mSparseType)
+            && !options.mIsSpecDecTree;
 
         if (shouldUseNvrtc)
         {
@@ -793,6 +794,12 @@ private:
         options.mIsCustomSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && params.mIsSpecDecTree;
         options.mIsCausalSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && !params.mIsSpecDecTree;
         options.mNumSpecDecodingTokens = !isContext && params.mMaxSeqLenQ > 1 ? params.mMaxSeqLenQ : 0;
+        // Propagate spec-dec tree fields so FmhaAutoTuner::selectSpecDecTreeKernel()
+        // picks tileSizeQ + kernelType from numTokensHeadsQ deterministically.
+        // mSpecDecodingTargetMaxGenLen is set config-time from
+        // AttentionOp::mSpecDecodingTargetMaxGenLen (= max_total_draft_tokens + 1).
+        options.mIsSpecDecTree = !isContext && params.mIsSpecDecTree;
+        options.mSpecDecodingTargetMaxGenLen = params.mSpecDecodingTargetMaxGenLen;
 
         options.mIsTrtllmLayout = true;
     }
