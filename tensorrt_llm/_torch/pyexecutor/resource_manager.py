@@ -883,6 +883,17 @@ class KVCacheManager(BaseResourceManager):
                 continue
             if request.py_rewind_len > 0:
                 self.rewind_kv_cache(request, request.py_rewind_len)
+            # Symmetric companion to prepare_resources's reserve_slack
+            # add_token loop: when _kv_reserve_draft_tokens (e.g. dynamic
+            # tree's K*max_draft_len) exceeds the runtime draft length,
+            # those extra slots must also be rewound, otherwise the draft
+            # KV cache leaks reserve_slack tokens per generation iteration
+            # and eventually overflows mCacheBlockIndices.
+            runtime_draft_len = (request.py_rewind_len +
+                                 request.py_num_accepted_draft_tokens)
+            extra_rewind = self._kv_reserve_draft_tokens - runtime_draft_len
+            if extra_rewind > 0:
+                self.rewind_kv_cache(request, extra_rewind)
 
         # For context requests, store completed context blocks for KV cache reuse.
         # We wait until context_remaining_length == 0 (all chunks processed) before
