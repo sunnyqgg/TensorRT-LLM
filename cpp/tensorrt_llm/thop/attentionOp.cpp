@@ -771,11 +771,11 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mUseSpecDecoding = spec_decoding_bool_params[1];       // use_spec_decoding
     op->mIsSpecDecTree = spec_decoding_bool_params[2];         // is_spec_dec_tree
     // Set config-time max gen length for FmhaAutoTuner spec-dec tree kernel selection.
-    // Only set once (when 0) so the heuristic is deterministic across calls.
+    // Must be set before the cache key is computed below, since mSpecDecodingTargetMaxGenLen
+    // participates in op->data() and distinguishes ops compiled for different tree shapes.
     if (spec_decoding_target_max_draft_tokens.has_value() && op->mSpecDecodingTargetMaxGenLen == 0)
     {
         op->mSpecDecodingTargetMaxGenLen = static_cast<int32_t>(spec_decoding_target_max_draft_tokens.value()) + 1;
-        op->initialize();
     }
 
     op->mUseSparseAttention = false;

@@ -28,6 +28,16 @@ namespace kernels
 {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Pre-allocated device counter for the custom-mask offsets prefix-sum.
+// A static __device__ symbol (zeroed via cudaMemsetAsync before each launch) keeps the
+// custom-mask preparation path CUDA-graph-capture-safe; per-iteration async allocation
+// would not be capturable. The offset kernels for KeepsMmaAb and SwapsMmaAb are mutually
+// exclusive per layer-0 invocation, so a single shared counter is sufficient.
+namespace
+{
+__device__ unsigned long long gCustomMaskOffsetsCounter;
+} // namespace
+
 __device__ __host__ inline int32_t ceilDiv(int32_t a, int32_t b)
 {
     return (a + b - 1) / b;
@@ -81,15 +91,13 @@ void launchComputeCustomMaskOffsetsKernel(
 {
     int32_t batchSize = runnerParams.mBatchSize;
 
-    unsigned long long* d_globalCounter;
-    cudaMallocAsync(&d_globalCounter, sizeof(unsigned long long), stream);
+    unsigned long long* d_globalCounter = nullptr;
+    TLLM_CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&d_globalCounter), gCustomMaskOffsetsCounter));
     cudaMemsetAsync(d_globalCounter, 0, sizeof(unsigned long long), stream);
 
     int blockSize = 128;
     int gridSize = (batchSize + blockSize - 1) / blockSize;
     computeCustomMaskOffsetsKernel<<<gridSize, blockSize, 0, stream>>>(runnerParams, stepQ, stepKv, d_globalCounter);
-
-    cudaFreeAsync(d_globalCounter, stream);
 }
 
 // Input: customMaskInput (generalPackedCustoMaskPtr) shape: [batch_size, seqLenQ, ceilDiv(seqLenKv-firstSparse, 32)]
@@ -493,16 +501,14 @@ void launchComputeCustomMaskOffsetsKernelForSwapsMmaAb(TllmGenFmhaRunnerParams c
 {
     int32_t batchSize = runnerParams.mBatchSize;
 
-    unsigned long long* d_globalCounter;
-    cudaMallocAsync(&d_globalCounter, sizeof(unsigned long long), stream);
+    unsigned long long* d_globalCounter = nullptr;
+    TLLM_CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&d_globalCounter), gCustomMaskOffsetsCounter));
     cudaMemsetAsync(d_globalCounter, 0, sizeof(unsigned long long), stream);
 
     int blockSize = 128;
     int gridSize = (batchSize + blockSize - 1) / blockSize;
     computeCustomMaskOffsetsKernelForSwapsMmaAb<<<gridSize, blockSize, 0, stream>>>(
         runnerParams, stepQ, stepKv, tileSizeQ, tileSizeKv, d_globalCounter);
-
-    cudaFreeAsync(d_globalCounter, stream);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
