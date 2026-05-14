@@ -301,8 +301,7 @@ public:
 
         bool shouldUseNvrtc = options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && !options.mIsMlaGen
             && options.mDtypeK != tg::Dtype::E2m1 && options.mHeadDimQk != 64 && !isLlama70bFp4Tp4
-            && !isTokenSparse(options.mSparseType)
-            && !options.mIsSpecDecTree;
+            && !isTokenSparse(options.mSparseType) && !options.mIsCustomSpecDecodingGen;
 
         if (shouldUseNvrtc)
         {
@@ -338,21 +337,29 @@ public:
             options.mGroupsHeadsQ = kernelMeta.mGroupsHeadsQ;
             options.mGroupsTokensHeadsQ = kernelMeta.mGroupsTokensHeadsQ;
 
+            // Rebased trtllm-gen KernelParamsSetup::setKernelParams gained two
+            // new pointer parameters since the prior vendoring: a sliding-window
+            // KV pool base pointer (after vSfBasePtr) and a sparse-MLA top-K
+            // lengths pointer (after firstSparseMaskOffsetsKvPtrD). Neither
+            // feature is exercised by the EAGLE3 NVFP4 custom-mask spec-dec tree
+            // path, so we pass nullptr for both.
             KernelParams kernelParams = fmha::KernelParamsSetup::setKernelParams(options, grid[0], grid[1], grid[2],
                 fmhaData.mMetaData.cumSeqLensQPtrD, fmhaData.mMetaData.cumSeqLensKvPtrD, fmhaData.mMetaData.seqLensKvD,
                 fmhaData.mInputBuffers.qBasePtr, fmhaData.mInputBuffers.kBasePtr, fmhaData.mInputBuffers.vBasePtr,
-                fmhaData.mScales.kSfBasePtr, fmhaData.mScales.vSfBasePtr, fmhaData.mMetaData.kvPageIdxD,
-                fmhaData.mScales.outputScaleD, fmhaData.mScales.scaleSoftmaxLog2D, fmhaData.mScales.kvSfScaleD,
-                fmhaData.mScales.oSfScaleD, fmhaData.mInputBuffers.customMaskPtrD,
-                fmhaData.mInputBuffers.customMaskOffsetsPtrD, fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD,
-                fmhaData.mScales.sageAttnSfsQPtrD, fmhaData.mScales.sageAttnSfsKPtrD, fmhaData.mScales.sageAttnSfsPPtrD,
-                fmhaData.mScales.sageAttnSfsVPtrD, fmhaData.mInputBuffers.attentionSinksPtrD,
-                fmhaData.mOutputBuffers.oPtrD, fmhaData.mScales.oSfPtrD, fmhaData.mOutputBuffers.multiCtasKvCounterPtrD,
-                fmhaData.mOutputBuffers.partialOPtrD, fmhaData.mOutputBuffers.partialStatsPtrD,
-                fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD, fmhaData.mOutputBuffers.softmaxStatsD,
-                fmhaData.mOutputBuffers.oDebugPtrD, fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax,
-                fmhaData.mScales.kvSfScale, fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO,
-                options.mUseBlockSparseAttention, options.mUsesSharedPagedKvIdx);
+                fmhaData.mScales.kSfBasePtr, fmhaData.mScales.vSfBasePtr,
+                /* slidingWindowKvPoolBasePtr */ nullptr, fmhaData.mMetaData.kvPageIdxD, fmhaData.mScales.outputScaleD,
+                fmhaData.mScales.scaleSoftmaxLog2D, fmhaData.mScales.kvSfScaleD, fmhaData.mScales.oSfScaleD,
+                fmhaData.mInputBuffers.customMaskPtrD, fmhaData.mInputBuffers.customMaskOffsetsPtrD,
+                fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD,
+                /* sparseMlaTopKLensPtrD */ nullptr, fmhaData.mScales.sageAttnSfsQPtrD,
+                fmhaData.mScales.sageAttnSfsKPtrD, fmhaData.mScales.sageAttnSfsPPtrD, fmhaData.mScales.sageAttnSfsVPtrD,
+                fmhaData.mInputBuffers.attentionSinksPtrD, fmhaData.mOutputBuffers.oPtrD, fmhaData.mScales.oSfPtrD,
+                fmhaData.mOutputBuffers.multiCtasKvCounterPtrD, fmhaData.mOutputBuffers.partialOPtrD,
+                fmhaData.mOutputBuffers.partialStatsPtrD, fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD,
+                fmhaData.mOutputBuffers.softmaxStatsD, fmhaData.mOutputBuffers.oDebugPtrD,
+                fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax, fmhaData.mScales.kvSfScale,
+                fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO, options.mUseBlockSparseAttention,
+                options.mUsesSharedPagedKvIdx);
 
             launchFmhaKernel(kernelParams, kernelMeta, func, grid, options, params.stream);
             // Run the separate reduction kernel if needed.
@@ -794,11 +801,13 @@ private:
         options.mIsCustomSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && params.mIsSpecDecTree;
         options.mIsCausalSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && !params.mIsSpecDecTree;
         options.mNumSpecDecodingTokens = !isContext && params.mMaxSeqLenQ > 1 ? params.mMaxSeqLenQ : 0;
-        // Propagate spec-dec tree fields so FmhaAutoTuner::selectSpecDecTreeKernel()
-        // picks tileSizeQ + kernelType from numTokensHeadsQ deterministically.
-        // mSpecDecodingTargetMaxGenLen is set config-time from
-        // AttentionOp::mSpecDecodingTargetMaxGenLen (= max_total_draft_tokens + 1).
-        options.mIsSpecDecTree = !isContext && params.mIsSpecDecTree;
+        // Propagate the config-time spec-dec tree upper bound so FmhaAutoTuner::
+        // selectSpecDecTreeKernel() picks tileSizeQ + kernelType from
+        // numTokensHeadsQ deterministically.
+        // mSpecDecodingTargetMaxGenLen = max_total_draft_tokens + 1 (from
+        // AttentionOp). The rebased FmhaOptions drops the old mIsSpecDecTree
+        // gate: mIsCustomSpecDecodingGen + (mSpecDecodingTargetMaxGenLen > 0)
+        // together carry the same intent.
         options.mSpecDecodingTargetMaxGenLen = params.mSpecDecodingTargetMaxGenLen;
 
         options.mIsTrtllmLayout = true;

@@ -1,19 +1,19 @@
-/***************************************************************************************************
+/*
  * Copyright (c) 2011-2026, NVIDIA CORPORATION.  All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without modification, are not permit-
- * ted.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- **************************************************************************************************/
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #pragma once
 
 #include <cuda.h>
@@ -31,6 +31,8 @@ struct KernelParams {
   CUtensorMap tmaQ_;
   // TMA descriptor for K.
   CUtensorMap tmaK_;
+  // TMA descriptor for DSv4 sparse MLA sliding-window KV pool. Same format as tmaK_.
+  CUtensorMap tmaKSlidingWindowKvPool_;
   // TMA descriptor for V.
   CUtensorMap tmaV_;
   // The descriptor for O.
@@ -66,15 +68,6 @@ struct KernelParams {
   float* ptrDebugO;
   // The first sparseMask offsets in the Kv sequence dimension.
   int32_t const* ptrFirstSparseMaskOffsetsKv;
-  // {$nv-internal-release begin}
-#ifdef TLLM_RUBIN_FEATURES
-#ifdef TLLM_TEST
-  // The output pointer for invalidation used only to test the Lamport producer feature. This has
-  // the same data type and shape as ptrO and will be filled with the invalid sentinel value.
-  void* ptrInvalidate;
-#endif // TLLM_TEST
-#endif // TLLM_RUBIN_FEATURES
-  // {$nv-internal-release end}
   // The counter for the multiCtasKv mode.
   int32_t* ptrMultiCtasKvCounter;
   // The device output scale for FP8 quantization. Only needed by trt-llm fp8 kernels as the sca-
@@ -113,6 +106,9 @@ struct KernelParams {
   int32_t* ptrSkipSoftmaxStats;
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
+  // The variable sparseMla topK lengths with shape of [numTokensQ]
+  //  where each tokenQ has a corresponding topK length.
+  int32_t const* ptrSparseMlaTopKLens;
 
   // The attention window size for sliding window attention.
   int32_t mAttentionWindowSize;
@@ -155,6 +151,8 @@ struct KernelParams {
   int32_t mNumTokensPerCtaQ;
   // The number of tokens per page (used if dynamic numTokensPerPage is enabled).
   int32_t mNumTokensPerPageLog2;
+  // The runtime K/V TMA box reshape factor selected by host descriptor setup.
+  int32_t mReshapeFactorKv;
   // The output scale for FP8 quantization.
   float mOutputScale;
   // The scaling factor for softmax (multiplied by log2 to use faster exp2).

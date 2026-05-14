@@ -1,19 +1,19 @@
-/***************************************************************************************************
+/*
  * Copyright (c) 2011-2026, NVIDIA CORPORATION.  All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without modification, are not permit-
- * ted.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- **************************************************************************************************/
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #pragma once
 
 #include "KernelTraits.h"
@@ -72,6 +72,8 @@ struct FmhaOptions : public KernelConfigBase {
   int mMinSeqLenQ{INT_MAX};
   // The minimum sequence length (used to generate variable Kv sequence length).
   int mMinSeqLenKv{INT_MAX};
+  // The minimum sparse MLA topK length.
+  int mMinSparseMlaTopK{1};
   // Benchmark steps.
   int mNumBenchmarkSteps{1};
   // The number of Ctas per sequenceKv from the arguments.
@@ -83,13 +85,9 @@ struct FmhaOptions : public KernelConfigBase {
   int mNumPagesInMemPool{0};
   // The number of causal-mask spec-decoding tokens (it is fixed in the batch).
   int mNumSpecDecodingTokens{0};
-  // True for tree-based speculative decoding (Eagle3 dynamic tree, MTP tree, etc.).
-  // When set, FmhaAutoTuner takes the spec-dec tree kernel selection path which uses
-  // numTokensHeadsQ = mNumHeadsQPerKv * mSpecDecodingTargetMaxGenLen as the heuristic.
-  bool mIsSpecDecTree{false};
-  // For spec-dec tree only: equals max_total_draft_tokens + 1, fixed at config time.
-  // Used as a deterministic upper bound for kernel selection (does NOT depend on
-  // per-iteration tensor shapes, so kernel selection is reproducible across calls).
+  // For tree-based custom spec-decoding only: equals max_total_draft_tokens + 1,
+  // fixed at config time. When set with mIsCustomSpecDecodingGen, FmhaAutoTuner
+  // uses it as a deterministic upper bound for kernel selection.
   int mSpecDecodingTargetMaxGenLen{0};
   // Warmup steps.
   int mNumWarmUpSteps{0};
@@ -140,12 +138,12 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mMinFirstSparseMaskOffsetKv);
     TO_JSON(mMinSeqLenQ);
     TO_JSON(mMinSeqLenKv);
+    TO_JSON(mMinSparseMlaTopK);
     TO_JSON(mNumBenchmarkSteps);
     TO_JSON(mNumCtasPerSeqKv);
     TO_JSON(mNumLoopItersForPrint);
     TO_JSON(mNumPagesInMemPool);
     TO_JSON(mNumSpecDecodingTokens);
-    TO_JSON(mIsSpecDecTree);
     TO_JSON(mSpecDecodingTargetMaxGenLen);
     TO_JSON(mNumWarmUpSteps);
     TO_JSON(mMaxNumWavesForCtasKvMode);
@@ -165,6 +163,8 @@ struct FmhaOptions : public KernelConfigBase {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 struct FmhaOptionsFromArgs {
+  // Attention window size.
+  bool mIsAttentionWindowSizeSet{false};
   // Relative error tolerance.
   bool mIsAtolSet{false};
   // The head dimension per stage for Kv.
@@ -244,6 +244,9 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   TLLM_CHECK_ERROR(optionsFromArgs.mIsNumInstsQSet == optionsFromArgs.mIsNumInstsKvSet,
                    "The number of instances for Q and Kv must be set together");
 
+  TLLM_CHECK_ERROR(options.mNumStagesKv >= 0, "numStagesKv must be >= 0");
+  TLLM_CHECK_ERROR(options.mNumStagesQ >= 0, "numStagesQ must be >= 0");
+
   // Do we swap A/B for the generation kernel.
   bool const swapsMmaAb{isSwapsMmaAbForGenerationKernel(options.mFmhaKernelType)};
   // Check if tileSizeQ is valid.
@@ -268,8 +271,9 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   // Check if head dim is valid.
   auto headDimQk{options.mHeadDimQk}, headDimV{options.mHeadDimV};
   if (swapsMmaAb && headDimQk == headDimV) {
-    TLLM_CHECK_ERROR(headDimQk == 64 || headDimQk == 128 || headDimQk == 256 || headDimQk == 512,
-                     "The headDim must be 64, 128, 256 or 512");
+    TLLM_CHECK_ERROR(headDimQk == 64 || headDimQk == 80 || headDimQk == 128 || headDimQk == 256 ||
+                       headDimQk == 512,
+                     "The headDim must be 64, 80, 128, 256 or 512");
   }
   // MLA kernels.
   if (headDimQk != headDimV) {
@@ -449,6 +453,16 @@ inline void checkFmhaOptions(FmhaOptions const& options,
       options.mSparseAttnTopK % 4 == 0,
       "SparseAttnTopK must be a multiple of 4 in order to use 16bytes cpAsync loads");
   }
+  if (options.mHasSlidingWindowKvPool) {
+    TLLM_CHECK_ERROR(
+      supportsVarSparseMlaTopKLens(options),
+      "The sliding-window KV pool is only supported by dynamic-token sparse MLA kernels.");
+    TLLM_CHECK_ERROR(options.mSingleTokenQPerCta,
+                     "mSingleTokenQPerCta must be true when sliding-window KV pool is enabled.");
+    TLLM_CHECK_ERROR(options.mAttentionWindowSize == options.mTileSizeKv,
+                     "attentionWindowSize must equal tileSizeKv when sliding-window KV pool is "
+                     "enabled.");
+  }
 
   // Always enable skipsSoftmaxWhenPossible for outputSkipSoftmaxStats.
   if (options.mOutputSkipSoftmaxStats) {
@@ -474,57 +488,11 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   if (options.mGroupsTokensHeadsQ) {
     TLLM_CHECK_ERROR(!isContextKernel(options.mFmhaKernelType),
                      "mGroupsTokensHeadsQ should only be enabled for generation kernels.");
-    TLLM_CHECK_ERROR(options.mDtypeKv != tg::Dtype::E2m1,
-                     "mGroupsTokensHeadsQ doesn't work with E2m1 dtypeKv.");
     TLLM_CHECK_ERROR(!options.mIsMlaGen,
                      "MLA gen kernels haven't supported mGroupsTokensHeadsQ yet.");
   }
 
-  // {$nv-internal-release begin}
-#ifdef TLLM_RUBIN_FEATURES
-  if (options.mLamportForceValid) {
-    TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
-                     "lamportForceValid is only supported with fuseEpilogueIntoCorr");
-    TLLM_CHECK_ERROR(!tg::dtypeIsBlockFmt(options.mDtypeOut),
-                     "lamportForceValid does not support block scaling outputs");
-    TLLM_CHECK_ERROR(isDisabled(options.mMultiCtasKvMode),
-                     "lamportForceValid does not support multi-CTA mode");
-    TLLM_CHECK_ERROR(
-      isSwapsMmaAbForGenerationKernel(options.mFmhaKernelType) ||
-        isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType),
-      "lamportForceValid has not been tested with context or generation kernel types.");
 
-    TLLM_CHECK_ERROR(options.mClusterDimX == 1,
-                     "Lamport producer is not compatible with 2 CTA mode");
-
-    TLLM_CHECK_ERROR(
-      options.mHeadDimPerStageKv == 0,
-      "Lamport producer is only compatible with a single iteration of the head dim loop");
-
-    // TODO Are there more features that are not compatible?
-  }
-  if (options.mLamportProducer) {
-    TLLM_CHECK_ERROR(options.mLamportForceValid, "lamportProducer requires lamportForceValid");
-  }
-#endif // TLLM_RUBIN_FEATURES
-  // {$nv-internal-release end}
-
-  // {$nv-internal-release begin}
-#ifdef TLLM_RUBIN_FEATURES
-  if (options.mUsesSpcompress) {
-    TLLM_CHECK_ERROR(options.mCudaArch == tg::CudaArch::Sm107a,
-                     "Sparse attention is only supported on sm_107a.");
-    TLLM_CHECK_ERROR(options.mFmhaKernelType == FmhaKernelType::Context,
-                     "Sparse attention is only supported with context kernel.");
-    TLLM_CHECK_ERROR(options.mDtypeQ == tg::Dtype::E4m3 || options.mDtypeQ == tg::Dtype::E4m3,
-                     "Sparse attention is only supported with e4m3.");
-    TLLM_CHECK_ERROR(options.mClusterDimX == 1,
-                     "Sparse attention is not compatible with 2 CTA mode.");
-    TLLM_CHECK_ERROR(options.mMaskType != AttentionMaskType::Custom,
-                     "Sparse attention is not compatible with custom mask.");
-  }
-#endif // TLLM_RUBIN_FEATURES
-  // {$nv-internal-release end}
 
   // For transformed K/V, MmaOrder must be Pv0_Qk0_Pv1_Qk1.
   if (options.mDtypeQ != options.mDtypeKv) {

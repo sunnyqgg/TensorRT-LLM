@@ -1,19 +1,19 @@
-/***************************************************************************************************
+/*
  * Copyright (c) 2011-2026, NVIDIA CORPORATION.  All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without modification, are not permit-
- * ted.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- **************************************************************************************************/
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #pragma once
 #include "KernelParamsDecl.h"
 #include <trtllm/gen/DtypeDecl.h>
@@ -447,6 +447,21 @@ static auto makeTmaShapeStrideKv(FmhaOptions const& options,
   return std::make_tuple(shape, stride);
 }
 
+// Check whether reshaping the K/V TMA box can merge consecutive token rows without changing which
+// elements are loaded. This requires the token stride, in descriptor element units, to be exactly
+// one descriptor head row. NHD paged-cache views fail this check because the next contiguous row is
+// the next head at the same token, not the next token for the same head.
+template <class FmhaOptions>
+static bool canUseTmaKvReshape(FmhaOptions const& options, bool isK) {
+  int32_t const strideKeys = std::get<0>(makeStrideKv(options, isK));
+  // For K the headDim may include extra RoPE coefficients.
+  int32_t const headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
+  // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
+  int32_t const colIdxDivisor = options.mDtypeKv == tg::Dtype::E2m1 ? 2 : 1;
+  int32_t const physicalHeadDim = headDim / colIdxDivisor;
+  return strideKeys / colIdxDivisor == physicalHeadDim;
+}
+
 // Create the TMA shape/stride for KV scaling factors.
 template <class FmhaOptions, class KernelTraits_>
 static auto makeTmaShapeStrideKvSf(FmhaOptions const& options,
@@ -494,7 +509,8 @@ static KernelParams updateKernelParams(FmhaOptions_ const& options,
                                        void const* vBasePtr,
                                        void* oBasePtr,
                                        void const* kSfBasePtr,
-                                       void const* vSfBasePtr) {
+                                       void const* vSfBasePtr,
+                                       void const* slidingWindowKvPoolBasePtr = nullptr) {
   return setKernelParams(options,
                          params.logicalGridDimX,
                          params.logicalGridDimY,
@@ -507,6 +523,7 @@ static KernelParams updateKernelParams(FmhaOptions_ const& options,
                          vBasePtr,
                          kSfBasePtr,
                          vSfBasePtr,
+                         slidingWindowKvPoolBasePtr,
                          params.ptrPageIdxKv,
                          params.ptrOutputScale,
                          params.ptrScaleSoftmaxLog2,
@@ -515,6 +532,7 @@ static KernelParams updateKernelParams(FmhaOptions_ const& options,
                          params.ptrCustomMask,
                          params.ptrCustomMaskOffsets,
                          params.ptrFirstSparseMaskOffsetsKv,
+                         params.ptrSparseMlaTopKLens,
                          params.ptrSageAttnSfsQ,
                          params.ptrSageAttnSfsK,
                          params.ptrSageAttnSfsP,
@@ -528,13 +546,6 @@ static KernelParams updateKernelParams(FmhaOptions_ const& options,
                          params.ptrSkipSoftmaxStats,
                          params.ptrSoftmaxStats,
                          params.ptrDebugO,
-// {$nv-internal-release begin}
-#ifdef TLLM_RUBIN_FEATURES
-#ifdef TLLM_TEST
-                         params.ptrInvalidate,
-#endif // TLLM_TEST
-#endif // TLLM_RUBIN_FEATURES
-       // {$nv-internal-release end}
                          params.mScaleSoftmaxLog2,
                          params.mInflateMax,
                          params.mScaleSfKv,
@@ -558,6 +569,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                     void const* vBasePtr,
                                     void const* kSfBasePtr,
                                     void const* vSfBasePtr,
+                                    void const* slidingWindowKvPoolBasePtr,
                                     int const* kvPageIdxD,
                                     float const* outputScaleD,
                                     float const* scaleSoftmaxLog2D,
@@ -566,6 +578,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                     uint32_t const* customMaskPtrD,
                                     int64_t const* customMaskOffsetsPtrD,
                                     int32_t const* firstSparseMaskOffsetsKvPtrD,
+                                    int32_t const* sparseMlaTopKLensPtrD,
                                     float const* ptrSageAttnSfsQ,
                                     float const* ptrSageAttnSfsK,
                                     float const* ptrSageAttnSfsP,
@@ -579,13 +592,6 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                     int* skipSoftmaxStatsPtrD,
                                     float2* softmaxStatsD,
                                     void* oDebugPtrD,
-// {$nv-internal-release begin}
-#ifdef TLLM_RUBIN_FEATURES
-#ifdef TLLM_TEST
-                                    void* ptrInvalidate,
-#endif // TLLM_TEST
-#endif // TLLM_RUBIN_FEATURES
-       // {$nv-internal-release end}
                                     float softmaxScale,
                                     float inflateMax,
                                     float kvSfScale,
@@ -623,19 +629,27 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
   auto const numEltsDivisor =
     options.mDtypeKv == tg::Dtype::E2m1 && !storeTransformedKvInTmem ? 2 : 1;
+  // Use the compile-time factor as an upper bound. Descriptor setup lowers the launch-time factor
+  // when the input strides do not make consecutive token rows contiguous for a widened TMA box.
+  int32_t reshapeFactorKv{kernelTraits.mReshapeFactorKv};
+  if (reshapeFactorKv > 1 &&
+      (!canUseTmaKvReshape(options, /*isK*/ true) ||
+       !canUseTmaKvReshape(options, /*isK*/ false))) {
+    reshapeFactorKv = 1;
+  }
+  params.mReshapeFactorKv = reshapeFactorKv;
 
   // Shape/stride for gmem tensor Kv.
   auto [shapeK, strideK] = makeTmaShapeStrideKv(options,
                                                 params,
                                                 /*isK*/ true,
                                                 storeTransformedKvInTmem,
-                                                kernelTraits.mReshapeFactorKv);
+                                                reshapeFactorKv);
 
   // The tileShapes for K/V.
   std::vector<uint32_t> tileShapeKv(shapeK.size(), 1);
-  tileShapeKv[0] =
-    kernelTraits.mNumEltsInClampedHeadDimKv / numEltsDivisor * kernelTraits.mReshapeFactorKv;
-  tileShapeKv[1] = kernelTraits.mNumKeysPerTile / kernelTraits.mReshapeFactorKv;
+  tileShapeKv[0] = kernelTraits.mNumEltsInClampedHeadDimKv / numEltsDivisor * reshapeFactorKv;
+  tileShapeKv[1] = kernelTraits.mNumKeysPerTile / reshapeFactorKv;
   // K and V might use different tileShapes.
   std::vector<uint32_t> tileShapeK(tileShapeKv);
   std::vector<uint32_t> tileShapeV(tileShapeKv);
@@ -670,12 +684,26 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                       /*swizzled=*/kernelTraits.mSwizzleKv,
                                       /*unpack4b=*/storeTransformedKvInTmem);
 
+  // Build the TMA descriptor for the DSv4 sparse MLA sliding-window KV pool.
+  // Same shape/stride and dtype as tmaK_, but with a different base pointer.
+  if (options.mHasSlidingWindowKvPool && isTokenSparse(options.mSparseType) &&
+      slidingWindowKvPoolBasePtr != nullptr) {
+    params.tmaKSlidingWindowKvPool_ =
+      buildNdTmaDescriptor(options.mDtypeK,
+                           shapeK,
+                           strideK,
+                           tileShapeK,
+                           const_cast<void*>(slidingWindowKvPoolBasePtr),
+                           /*swizzled = */ kernelTraits.mSwizzleKv,
+                           /*unpack4b=*/storeTransformedKvInTmem);
+  }
+
   // Shape/stride for gmem tensor V.
   auto [shapeV, strideV] = makeTmaShapeStrideKv(options,
                                                 params,
                                                 /*isK*/ false,
                                                 storeTransformedKvInTmem,
-                                                kernelTraits.mReshapeFactorKv);
+                                                reshapeFactorKv);
   // For sparse MQA/GQA (not MLA), V also needs 2D flattened descriptor with separate base pointer.
   if (isTokenSparse(options.mSparseType) && !options.mIsMlaGen) {
     shapeV = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimV),
@@ -767,6 +795,9 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   // The softmax stats buffer.
   params.ptrSoftmaxStats = options.mStoresSoftmaxStats ? softmaxStatsD : nullptr;
 
+  // The variable sparseMla topK lengths.
+  params.ptrSparseMlaTopKLens = sparseMlaTopKLensPtrD;
+
   // The output buffer.
   params.ptrO = oPtrD;
   params.ptrSfO = oSfPtrD;
@@ -791,13 +822,6 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   // The sequence lengths for K/V.
   params.ptrSeqLensKv = seqLensKvPtrD;
 
-  // {$nv-internal-release begin}
-#ifdef TLLM_RUBIN_FEATURES
-#ifdef TLLM_TEST
-  params.ptrInvalidate = ptrInvalidate;
-#endif // TLLM_TEST
-#endif // TLLM_RUBIN_FEATURES
-  // {$nv-internal-release end}
 
   params.mAttentionWindowSize = options.mAttentionWindowSize;
   if (options.mChunkedAttentionSize > 0) {
@@ -888,6 +912,7 @@ static KernelParams updateKernelParams(FmhaOptions_ const&,
                                        void const*,
                                        void*,
                                        void const*,
+                                       void const*,
                                        void const*) {
   return KernelParams{};
 }
@@ -904,15 +929,24 @@ static KernelParams setKernelParams(FmhaOptions_ const&,
                                     void const*,
                                     void const*,
                                     void const*,
+                                    void const*,
+                                    void const*,
+                                    void const*,
                                     int const*,
+                                    float const*,
+                                    float const*,
+                                    float const*,
                                     float const*,
                                     uint32_t const*,
                                     int64_t const*,
+                                    int32_t const*,
                                     int32_t const*,
                                     float const*,
                                     float const*,
                                     float const*,
                                     float const*,
+                                    float const*,
+                                    void*,
                                     void*,
                                     int*,
                                     void*,
@@ -925,7 +959,8 @@ static KernelParams setKernelParams(FmhaOptions_ const&,
                                     float,
                                     int32_t,
                                     bool,
-                                    bool) {
+                                    bool,
+                                    void const* = nullptr) {
   return KernelParams{};
 }
 #endif
